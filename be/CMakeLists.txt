@@ -193,6 +193,7 @@ set (IMPALA_LINK_LIBS
   Util
   Webserver
   -Wl,--end-group
+  kudu_client
 )
 
 # If using dynamic linking, -Wl does not have any effect (it's only for .a files). So we
