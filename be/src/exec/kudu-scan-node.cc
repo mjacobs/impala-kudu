@@ -17,6 +17,7 @@
 #include <boost/foreach.hpp>
 #include <thrift/protocol/TDebugProtocol.h>
 #include <vector>
+#include <kudu/client/row_result.h>
 
 #include "exec/kudu-util.h"
 #include "exprs/expr.h"
@@ -32,6 +33,12 @@
 
 using namespace std;
 using apache::thrift::ThriftDebugString;
+using kudu::client::KuduColumnSchema;
+using kudu::client::KuduSchema;
+using kudu::client::KuduClient;
+using kudu::client::KuduRowResult;
+using kudu::client::KuduTable;
+using kudu::client::KuduScanner;
 
 namespace impala {
 
@@ -60,9 +67,6 @@ KuduScanNode::KuduScanNode(ObjectPool* pool, const TPlanNode& tnode,
     : ScanNode(pool, tnode, descs),
       tuple_id_(tnode.kudu_scan_node.tuple_id),
       tuple_idx_(0),
-      schema_(NULL),
-      table_schema_(NULL),
-      client_(NULL),
       table_(NULL),
       scanner_(NULL),
       cur_scan_range_idx_(0),
@@ -74,30 +78,22 @@ KuduScanNode::KuduScanNode(ObjectPool* pool, const TPlanNode& tnode,
 KuduScanNode::~KuduScanNode() {
 }
 
-Status KuduScanNode::BuildKuduSchema(kudu_schema_t** schema) {
+Status KuduScanNode::BuildKuduSchema(KuduSchema* schema) {
   const KuduTableDescriptor* table_desc = static_cast<const KuduTableDescriptor*>(tuple_desc_->table_desc());
   LOG(INFO) << "Table desc for schema: " << table_desc->DebugString();
-  kudu_schema_builder_t* sb = kudu_new_schema_builder();
-  if (sb == NULL) return Status("Could not create schema builder.");
+
+  vector<KuduColumnSchema> kudu_cols;
   const std::vector<SlotDescriptor*>& slots = tuple_desc_->slots();
   for (int i = 0; i < slots.size(); ++i) {
     if (!slots[i]->is_materialized()) continue;
     int col_idx = slots[i]->col_pos();
     const string& col_name = table_desc->col_names()[col_idx];
-    kudu_type_t kt = KUDU_INT8;
+    KuduColumnSchema::DataType kt = KuduColumnSchema::INT8;
     RETURN_IF_ERROR(ImpalaToKuduType(slots[i]->type(), &kt));
     // TODO: apparently all Impala columns are nullable?
-    kudu_schema_builder_add(sb, col_name.c_str(), kt, 0);//i > 1 && slots[i]->is_nullable());
+    kudu_cols.push_back(KuduColumnSchema(col_name, kt, /* is_nullable = */ false));
   }
-
-  kudu_schema_builder_set_num_key_columns(sb, 0);
-
-  char* err = NULL;
-  int rc;
-  if ((rc = kudu_schema_builder_build(sb, schema, &err)) != KUDU_OK) {
-    return Status(string("Could not create schema: ") + err);
-  }
-  CHECK(*schema);
+  schema->Reset(kudu_cols, /* key_cols = */ 0);
   return Status::OK;
 }
 
@@ -143,6 +139,7 @@ Status KuduScanNode::Prepare(RuntimeState* state) {
   return Status::OK;
 }
 
+#if 0
 static Status AddBound(kudu_range_predicate_t* pred, kudu_predicate_field_t field,
                        Expr* expr) {
   void* val_ptr = CHECK_NOTNULL(expr->GetValue(NULL));
@@ -165,6 +162,7 @@ static Status AddBound(kudu_range_predicate_t* pred, kudu_predicate_field_t fiel
   */
   return Status::OK;
 }
+#endif
 
 Status KuduScanNode::Open(RuntimeState* state) {
   const KuduTableDescriptor* table_desc = static_cast<const KuduTableDescriptor*>(tuple_desc_->table_desc());
@@ -173,25 +171,19 @@ Status KuduScanNode::Open(RuntimeState* state) {
   RETURN_IF_CANCELLED(state);
   SCOPED_TIMER(runtime_profile_->total_time_counter());
 
-  char* err = NULL;
-  kudu_err_t rc;
-  kudu_client_opts_t* opts = kudu_new_client_opts();
-  string master_addr = table_desc->kudu_master_address();
-  kudu_client_set_master_address(opts, master_addr.c_str());
-  rc = kudu_client_open(opts, &client_, &err);
-  kudu_free_client_opts(opts);
-  if (rc != KUDU_OK) {
-    return MakeStatusAndFree(err);
+  kudu::Status s = kudu::client::KuduClientBuilder()
+    .master_server_addr(table_desc->kudu_master_address())
+    .Build(&client_);
+  if (!s.ok()){
+    return Status(s.ToString());
   }
 
-  if ((rc = kudu_client_open_table(client_, table_desc->table_name().c_str(),
-                                   &table_, &err)) != KUDU_OK) {
-    return MakeStatusAndFree(err);
+  s = client_->OpenTable(table_desc->table_name(), &table_);
+  if (!s.ok()) {
+    return Status(s.ToString());
   }
 
-  if ((rc = kudu_table_get_schema(table_, &table_schema_, &err)) != KUDU_OK) {
-    return MakeStatusAndFree(err);
-  }
+  table_schema_ = table_->schema();
 
   CacheMaterializedSlots();
 
@@ -248,6 +240,7 @@ Status KuduScanNode::Open(RuntimeState* state) {
   return Status::OK;
 }
 
+/*
 Status KuduScanNode::AddScanRangePredicate(kudu_predicate_field_t bound_type,
                                            const string& encoded_key,
                                            kudu_range_predicate_t* pred) {
@@ -274,6 +267,7 @@ Status KuduScanNode::AddScanRangePredicate(kudu_predicate_field_t bound_type,
 
   return Status::OK;
 }
+*/
 
 namespace {
 
@@ -297,6 +291,7 @@ Status ImmediatePredecessor(string* s) {
 
 } // anonymous namespace
 
+#if 0
 Status KuduScanNode::SetupScanRangePredicate(const TKuduKeyRange& key_range,
                                              kudu_scanner_t* scanner) {
   if (key_range.startKey.empty() && key_range.stopKey.empty()) {
@@ -329,13 +324,13 @@ Status KuduScanNode::SetupScanRangePredicate(const TKuduKeyRange& key_range,
   if ((rc = kudu_scanner_add_range_predicate(scanner, pred, &err)) != KUDU_OK) {
     return MakeStatusAndFree(err);
   }
-
   return Status::OK;
 }
+#endif
 
 Status KuduScanNode::CloseCurrentScanner() {
   if (scanner_) {
-    kudu_scanner_free(scanner_);
+    delete scanner_;
     scanner_ = NULL;
     cur_scan_range_idx_++;
   }
@@ -349,29 +344,23 @@ bool KuduScanNode::HasMoreScanners() {
 Status KuduScanNode::OpenNextScanner()  {
   CHECK(scanner_ == NULL);
   CHECK_LT(cur_scan_range_idx_, scan_ranges_.size());
-  const TKuduKeyRange& key_range = scan_ranges_[cur_scan_range_idx_];
+//  const TKuduKeyRange& key_range = scan_ranges_[cur_scan_range_idx_];
 
   VLOG(1) << "Starting scanner " << (cur_scan_range_idx_ + 1)
           << "/" << scan_ranges_.size();
 
-  kudu_err_t rc;
-  char* err = NULL;
-  if ((rc = kudu_table_create_scanner(table_, &scanner_, &err)) != KUDU_OK) {
-    return MakeStatusAndFree(err);
+  kudu::Status s;
+  scanner_ = new KuduScanner(table_.get());
+  s = scanner_->SetProjection(&schema_);
+  if (!s.ok()) {
+    return Status(s.ToString());
   }
 
-  if ((rc = kudu_scanner_set_projection(scanner_, schema_, &err)) != KUDU_OK) {
-    return MakeStatusAndFree(err);
+  s = scanner_->Open();
+  if (!s.ok()) {
+    return Status(s.ToString());
   }
 
-  RETURN_IF_ERROR(SetupScanRangePredicate(key_range, scanner_));
-  
-
-  if ((rc = kudu_scanner_open(scanner_, &err)) != KUDU_OK) {
-    return MakeStatusAndFree(err);
-  }
-
-  if (scanner_ == NULL) return Status("Could not create tablet iterator.");
   return Status::OK;
 }
 
@@ -383,47 +372,44 @@ void KuduScanNode::CacheMaterializedSlots() {
   for (int i = 0; i < slots.size(); i++) {
     if (!slots[i]->is_materialized()) continue;
 
-    int materialized_idx = materialized_slots_.size();
-
     MaterializedSlotInfo info;
     info.slot_idx = i;
     info.slot_desc = slots[i];
-    info.kudu_col_offset = kudu_schema_get_column_offset(schema_, materialized_idx);
 
     materialized_slots_.push_back(info);
     kudu_projection_idx++;
   }
 }
 
-void KuduScanNode::KuduRowToImpalaRow(kudu_rowptr_t row,
+void KuduScanNode::KuduRowToImpalaRow(const KuduRowResult& row,
                                       RowBatch* row_batch,
                                       Tuple* tuple) {
   for (int i = 0; i < materialized_slots_.size(); ++i) {
     const MaterializedSlotInfo& info = materialized_slots_[i];
 
     void* slot = tuple->GetSlot(info.slot_desc->tuple_offset());
-    const uint8_t* kudu_val = row + info.kudu_col_offset;
 
     switch (info.slot_desc->type().type) {
       case TYPE_STRING: {
-        const kudu_slice_t* slice = reinterpret_cast<const kudu_slice_t*>(kudu_val);
-        char* buffer = (char*)row_batch->tuple_data_pool()->Allocate(slice->size);
-        memcpy(buffer, slice->data, slice->size);
+        kudu::Slice slice;
+        KUDU_CHECK_OK(row.GetString(i, &slice));
+        char* buffer = (char*)row_batch->tuple_data_pool()->Allocate(slice.size());
+        memcpy(buffer, slice.data(), slice.size());
         reinterpret_cast<StringValue*>(slot)->ptr = buffer;
-        reinterpret_cast<StringValue*>(slot)->len = slice->size;
+        reinterpret_cast<StringValue*>(slot)->len = slice.size();
         break;
       }
       case TYPE_TINYINT:
-        *reinterpret_cast<int8_t*>(slot) = *reinterpret_cast<const int8_t*>(kudu_val);
+        KUDU_CHECK_OK(row.GetInt8(i, reinterpret_cast<int8_t*>(slot)));
         break;
       case TYPE_SMALLINT:
-        *reinterpret_cast<int16_t*>(slot) = *reinterpret_cast<const int16_t*>(kudu_val);
+        KUDU_CHECK_OK(row.GetInt16(i, reinterpret_cast<int16_t*>(slot)));
         break;
       case TYPE_INT:
-        *reinterpret_cast<int32_t*>(slot) = *reinterpret_cast<const int32_t*>(kudu_val);
+        KUDU_CHECK_OK(row.GetInt32(i, reinterpret_cast<int32_t*>(slot)));
         break;
       case TYPE_BIGINT:
-        *reinterpret_cast<int64_t*>(slot) = *reinterpret_cast<const int64_t*>(kudu_val);
+        KUDU_CHECK_OK(row.GetInt64(i, reinterpret_cast<int64_t*>(slot)));
         break;
       default:
         DCHECK(false);
@@ -438,7 +424,7 @@ Status KuduScanNode::FetchNextBlockIfEmpty(bool* end_of_scanner) {
     return Status::OK;
   }
 
-  if (!kudu_scanner_has_more_rows(scanner_)) {
+  if (!scanner_->HasMoreRows()) {
     VLOG(1) << "Scanner ended";
     *end_of_scanner = true;
     return Status::OK;
@@ -447,13 +433,13 @@ Status KuduScanNode::FetchNextBlockIfEmpty(bool* end_of_scanner) {
   SCOPED_TIMER(kudu_read_timer_);
 
   VLOG(1) << "Fetching next block from kudu";
-  char* err = NULL;
-  if (kudu_scanner_next_batch(scanner_, &cur_rows_, &num_rows_current_block_, &err)) {
+  kudu::Status s = scanner_->NextBatch(&cur_rows_);
+  if (!s.ok()) {
     stringstream ss;
-    ss << "Could not advance iterator: " << err;
+    ss << "Could not advance iterator: " << s.ToString();
     return Status(ss.str());
   }
-  kudu_round_trips_->Update(1);
+  kudu_round_trips_->Add(1);
   rows_scanned_current_block_ = 0;
   return Status::OK;
 }
@@ -472,12 +458,12 @@ Status KuduScanNode::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple, 
   (*tuple)->Init(tuple_desc_->num_null_bytes());
 
   for (int krow_idx = rows_scanned_current_block_; krow_idx < num_rows_current_block_; ++krow_idx) {
-    kudu_rowptr_t krow = cur_rows_[krow_idx];
+    const KuduRowResult& krow = cur_rows_[krow_idx];
     KuduRowToImpalaRow(krow, row_batch, *tuple);
     ++rows_scanned_current_block_;
 
-    if (conjuncts_.size() == 0 ||
-        EvalConjuncts(&conjuncts_[0], conjuncts_.size(), row)) {
+    if (conjunct_ctxs_.empty() ||
+        EvalConjuncts(&conjunct_ctxs_[0], conjunct_ctxs_.size(), row)) {
       row_batch->CommitLastRow();
       ++num_rows_returned_;
       COUNTER_SET(rows_returned_counter_, num_rows_returned_);
@@ -556,11 +542,8 @@ void KuduScanNode::Close(RuntimeState* state) {
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   PeriodicCounterUpdater::StopRateCounter(total_throughput_counter());
   PeriodicCounterUpdater::StopTimeSeriesCounter(bytes_read_timeseries_counter_);
-  if (cur_rows_ != NULL) free(cur_rows_);
-  if (scanner_ != NULL) kudu_scanner_free(scanner_);
-  if (table_ != NULL) kudu_table_free(table_);
-  if (client_ != NULL) kudu_client_free(client_);
-  if (schema_ != NULL) kudu_schema_free(schema_);
+  cur_rows_.clear();
+  if (scanner_ != NULL) delete scanner_;
   ExecNode::Close(state);
 }
 

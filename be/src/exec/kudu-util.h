@@ -19,22 +19,25 @@
 
 namespace impala {
 
-static Status ImpalaToKuduType(const ColumnType& impala_type, kudu_type_t* kudu_type) {
+static Status ImpalaToKuduType(const ColumnType& impala_type,
+                               kudu::client::KuduColumnSchema::DataType* kudu_type) {
+  using kudu::client::KuduColumnSchema;
+
   switch (impala_type.type) {
     case TYPE_STRING:
-      *kudu_type = KUDU_STRING;
+      *kudu_type = KuduColumnSchema::STRING;
       break;
     case TYPE_TINYINT:
-      *kudu_type = KUDU_UINT8;
+      *kudu_type = KuduColumnSchema::UINT8;
       break;
     case TYPE_SMALLINT:
-      *kudu_type = KUDU_UINT16;
+      *kudu_type = KuduColumnSchema::UINT16;
       break;
     case TYPE_INT:
-      *kudu_type = KUDU_UINT32;
+      *kudu_type = KuduColumnSchema::UINT32;
       break;
     case TYPE_BIGINT:
-      *kudu_type = KUDU_UINT64;
+      *kudu_type = KuduColumnSchema::UINT64;
       break;
     default:
       return Status("Unsupported column type.");

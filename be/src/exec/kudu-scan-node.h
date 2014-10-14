@@ -17,7 +17,8 @@
 #define IMPALA_EXEC_KUDU_SCAN_NODE_H_
 
 #include <boost/scoped_ptr.hpp>
-#include <libkudu/libkudu.h>
+
+#include <kudu/client/client.h>
 
 #include "exec/scan-node.h"
 #include "runtime/descriptors.h"
@@ -53,13 +54,15 @@ class KuduScanNode : public ScanNode {
 
  private:
   void CacheMaterializedSlots();
-  Status BuildKuduSchema(kudu_schema_t** schema);
+  Status BuildKuduSchema(kudu::client::KuduSchema* schema);
 
+/*
   Status SetupScanRangePredicate(const TKuduKeyRange& key_range,
-                                 kudu_scanner_t* scanner);
+                                 kudu::client::KuduScanner* scanner);
   Status AddScanRangePredicate(kudu_predicate_field_t bound_type,
                                const std::string& encoded_key,
                                kudu_range_predicate_t* pred);
+*/
 
   Status CloseCurrentScanner();
   bool HasMoreScanners();
@@ -68,7 +71,7 @@ class KuduScanNode : public ScanNode {
 
   Status FetchNextBlockIfEmpty(bool* end_of_scanner);
   Status DecodeRowsIntoRowBatch(RowBatch* batch, Tuple** tuple, bool* batch_done);
-  void KuduRowToImpalaRow(kudu_rowptr_t row,
+  void KuduRowToImpalaRow(const kudu::client::KuduRowResult& row,
                           RowBatch* row_batch,
                           Tuple* tuple);
   void AdvanceOneTuple(Tuple** tuple) const;
@@ -85,12 +88,12 @@ class KuduScanNode : public ScanNode {
   int tuple_idx_;
 
   // The schema of the materialized slots (i.e projection)
-  kudu_schema_t* schema_;
+  kudu::client::KuduSchema schema_;
   // The schema of the whole table
-  kudu_schema_t* table_schema_;
-  kudu_client_t* client_;
-  kudu_table_t* table_;
-  kudu_scanner_t* scanner_;
+  kudu::client::KuduSchema table_schema_;
+  std::tr1::shared_ptr<kudu::client::KuduClient> client_;
+  scoped_refptr<kudu::client::KuduTable> table_;
+  kudu::client::KuduScanner* scanner_;
 
   std::vector<TKuduKeyRange> scan_ranges_;
   // The index into scan_range_params_ for the range currently being
@@ -107,13 +110,10 @@ class KuduScanNode : public ScanNode {
     int slot_idx;
     int tuple_offset;
     SlotDescriptor* slot_desc;
-
-    // the offset of the slot in the kudu row
-    int kudu_col_offset;
   };
   std::vector<MaterializedSlotInfo> materialized_slots_;
 
-  kudu_rowptr_t* cur_rows_;
+  std::vector<kudu::client::KuduRowResult> cur_rows_;
   size_t num_rows_current_block_;
   size_t rows_scanned_current_block_;
 

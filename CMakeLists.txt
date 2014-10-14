@@ -189,8 +189,14 @@ message(STATUS "Avro static library: " ${AVRO_STATIC_LIB})
 
 # Find Kudu client
 find_package(kuduClient REQUIRED
-	     PATHS ${KUDU_CLIENT_ROOT})
+	     PATHS ${KUDU_CLIENT_ROOT}
+                   $ENV{KUDU_CLIENT_ROOT})
 include_directories(${KUDU_CLIENT_INCLUDE_DIR})
+# Kudu client can use glog
+add_definitions(-DKUDU_HEADERS_USE_GLOG)
+
+# remove LLVM's dynamic annotations support
+add_definitions(-DLLVM_SYSTEM_VALGRIND_H)
 
 # Treat gutil just like an Impala native library (i.e., one built with CMake), so no need
 # for find_package()
