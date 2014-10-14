@@ -52,7 +52,7 @@ using std::pair;
 using std::vector;
 
 #include "gutil/integral_types.h"
-#include <glog/logging.h>
+#include "gutil/logging.h"
 #include "gutil/logging-inl.h"
 #include "gutil/strings/charset.h"
 #include "gutil/strings/split_internal.h"
@@ -853,11 +853,11 @@ bool SplitRange(const char* rangestr, int* from, int* to);
 // The following variants of SplitCSVLine() are not recommended for new code.
 // Please consider the CSV parser in //util/csv as an alternative.  Examples:
 // To parse a single line:
-//     #include "util/csv/parser.h"
+//     #include "kudu/util/csv/parser.h"
 //     vector<string> fields = util::csv::ParseLine(line).fields();
 //
 // To parse an entire file:
-//     #include "util/csv/parser.h"
+//     #include "kudu/util/csv/parser.h"
 //     for (Record rec : Parser(source)) {
 //       vector<string> fields = rec.fields();
 //     }
