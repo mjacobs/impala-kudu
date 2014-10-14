@@ -19,7 +19,8 @@
 #define UTIL_GTL_FIXEDARRAY_H__
 
 #include <stddef.h>
-#include <glog/logging.h>
+
+#include "gutil/logging.h"
 #include "gutil/logging-inl.h"
 #include "gutil/macros.h"
 #include "gutil/manual_constructor.h"

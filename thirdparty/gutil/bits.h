@@ -4,7 +4,7 @@
 
 #include "gutil/basictypes.h"
 #include "gutil/integral_types.h"
-#include <glog/logging.h>
+#include "gutil/logging.h"
 #include "gutil/logging-inl.h"
 #include "gutil/macros.h"
 

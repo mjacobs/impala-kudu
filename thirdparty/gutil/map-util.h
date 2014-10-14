@@ -71,7 +71,7 @@ using std::pair;
 #include <vector>
 using std::vector;
 
-#include <glog/logging.h>
+#include "gutil/logging.h"
 #include "gutil/logging-inl.h"
 
 //
@@ -176,6 +176,31 @@ FindOrNull(Collection& collection,  // NOLINT
     return 0;
   }
   return &it->second;
+}
+
+// Returns a pointer to the const value associated with the greatest key
+// that's less than or equal to the given key, or NULL if no such key exists.
+template <class Collection>
+const typename Collection::value_type::second_type*
+FindFloorOrNull(const Collection& collection,
+                const typename Collection::value_type::first_type& key) {
+  typename Collection::const_iterator it = collection.upper_bound(key);
+  if (it == collection.begin()) {
+    return 0;
+  }
+  return &(--it)->second;
+}
+
+// Same as above but returns a pointer to the non-const value.
+template <class Collection>
+typename Collection::value_type::second_type*
+FindFloorOrNull(Collection& collection,  // NOLINT
+                const typename Collection::value_type::first_type& key) {
+  typename Collection::iterator it = collection.upper_bound(key);
+  if (it == collection.begin()) {
+    return 0;
+  }
+  return &(--it)->second;
 }
 
 // Returns the pointer value associated with the given key. If none is found,
@@ -349,7 +374,6 @@ template <class Collection>
 void InsertOrDie(Collection* const collection,
                  const typename Collection::value_type::first_type& key,
                  const typename Collection::value_type::second_type& data) {
-  typedef typename Collection::value_type value_type;
   CHECK(InsertIfNotPresent(collection, key, data))
       << "duplicate key: " << key;
 }
@@ -360,7 +384,6 @@ void InsertOrDieNoPrint(
     Collection* const collection,
     const typename Collection::value_type::first_type& key,
     const typename Collection::value_type::second_type& data) {
-  typedef typename Collection::value_type value_type;
   CHECK(InsertIfNotPresent(collection, key, data)) << "duplicate key.";
 }
 
