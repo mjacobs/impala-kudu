@@ -146,6 +146,7 @@ set(CLANG_INCLUDE_FLAGS
   "-I${GFLAGS_INCLUDE_DIR}"
   "-I${RAPIDJSON_INCLUDE_DIR}"
   "-I${AVRO_INCLUDE_DIR}"
+  -isystem "${Boost_INCLUDE_DIRS}"
   # Required so that jni.h can be found during Clang compilation
   "-I${JAVA_INCLUDE_PATH}"
   "-I${JAVA_INCLUDE_PATH2}"
