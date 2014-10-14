@@ -186,6 +186,11 @@ set_target_properties(avro PROPERTIES IMPORTED_LOCATION "${AVRO_STATIC_LIB}")
 message(STATUS "Avro include dir: " ${AVRO_INCLUDE_DIR})
 message(STATUS "Avro static library: " ${AVRO_STATIC_LIB})
 
+# Find Kudu client
+find_package(kuduClient REQUIRED
+	     PATHS ${KUDU_CLIENT_ROOT})
+include_directories(${KUDU_CLIENT_INCLUDE_DIR})
+
 # Treat gutil just like an Impala native library (i.e., one built with CMake), so no need
 # for find_package()
 add_subdirectory($ENV{IMPALA_HOME}/thirdparty/gutil/)
