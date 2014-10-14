@@ -69,7 +69,7 @@ export NUM_CONCURRENT_TESTS=${NUM_CONCURRENT_TESTS-${CORES}}
 
 export IMPALA_GFLAGS_VERSION=2.0
 export IMPALA_GPERFTOOLS_VERSION=2.0
-export IMPALA_GLOG_VERSION=0.3.2
+export IMPALA_GLOG_VERSION=0.3.3
 export IMPALA_GTEST_VERSION=1.6.0
 export IMPALA_SNAPPY_VERSION=1.0.5
 export IMPALA_CYRUS_SASL_VERSION=2.1.23
@@ -113,6 +113,8 @@ export SENTRY_CONF_DIR=$IMPALA_HOME/fe/src/test/resources
 export HIVE_HOME=$IMPALA_HOME/thirdparty/hive-${IMPALA_HIVE_VERSION}/
 export PATH=$HIVE_HOME/bin:$PATH
 export HIVE_CONF_DIR=$IMPALA_FE_DIR/src/test/resources
+
+export KUDU_HOME=$IMPALA_HOME/../kudu
 
 ### Hive looks for jar files in a single directory from HIVE_AUX_JARS_PATH plus
 ### any jars in AUX_CLASSPATH. (Or a list of jars in HIVE_AUX_JARS_PATH.)

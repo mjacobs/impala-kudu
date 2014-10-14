@@ -213,6 +213,23 @@ string HBaseTableDescriptor::DebugString() const {
   return out.str();
 }
 
+KuduTableDescriptor::KuduTableDescriptor(const TTableDescriptor& tdesc)
+  : TableDescriptor(tdesc),
+    table_name_(tdesc.kuduTable.tableName),
+    master_address_(tdesc.kuduTable.masterAddress),
+    col_names_(tdesc.kuduTable.colNames) {
+}
+
+string KuduTableDescriptor::DebugString() const {
+  stringstream out;
+  out << "KuduTable(" << TableDescriptor::DebugString() << " table=" << table_name_;
+  out << " master_addr=" << master_address_;
+  out << " col_names=[";
+  out << join(col_names_, ":");
+  out << "]";
+  return out.str();
+}
+
 TupleDescriptor::TupleDescriptor(const TTupleDescriptor& tdesc)
   : id_(tdesc.id),
     table_desc_(NULL),
@@ -375,6 +392,9 @@ Status DescriptorTbl::Create(ObjectPool* pool, const TDescriptorTable& thrift_tb
         break;
       case TTableType::DATA_SOURCE_TABLE:
         desc = pool->Add(new DataSourceTableDescriptor(tdesc));
+        break;
+      case TTableType::KUDU_TABLE:
+        desc = pool->Add(new KuduTableDescriptor(tdesc));
         break;
       default:
         DCHECK(false) << "invalid table type: " << tdesc.tableType;

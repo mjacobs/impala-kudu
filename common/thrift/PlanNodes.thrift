@@ -30,6 +30,7 @@ include "ExternalDataSource.thrift"
 enum TPlanNodeType {
   HDFS_SCAN_NODE,
   HBASE_SCAN_NODE,
+  KUDU_SCAN_NODE,
   HASH_JOIN_NODE,
   AGGREGATION_NODE,
   SORT_NODE,
@@ -97,12 +98,18 @@ struct THBaseKeyRange {
   2: optional string stopKey
 }
 
+struct TKuduKeyRange {
+  1: optional binary startKey
+  2: optional binary stopKey
+}
+
 // Specification of an individual data range which is held in its entirety
 // by a storage server
 struct TScanRange {
   // one of these must be set for every TScanRange2
   1: optional THdfsFileSplit hdfs_file_split
   2: optional THBaseKeyRange hbase_key_range
+  3: optional TKuduKeyRange kudu_key_range
 }
 
 struct THdfsScanNode {
@@ -142,6 +149,10 @@ struct THBaseScanNode {
 
   // Suggested max value for "hbase.client.scan.setCaching"
   4: optional i32 suggested_max_caching
+}
+
+struct TKuduScanNode {
+  1: required Types.TTupleId tuple_id
 }
 
 struct TEqJoinCondition {
@@ -357,6 +368,7 @@ struct TPlanNode {
   14: optional TUnionNode union_node
   15: optional TExchangeNode exchange_node
   20: optional TAnalyticNode analytic_node
+  21: optional TKuduScanNode kudu_scan_node
 
   // Label that should be used to print this node to the user.
   17: optional string label

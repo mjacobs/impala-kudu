@@ -39,6 +39,7 @@
     <impala.extdatasrc.api.version>1.0-SNAPSHOT</impala.extdatasrc.api.version>
     <!-- Impala does not currently support the Hive .13 JDBC driver -->
     <hive-jdbc.version>0.13.1-cdh5.2.0-SNAPSHOT</hive-jdbc.version>
+    <kudu.version>0.1.0-SNAPSHOT</kudu.version>
   </properties>
 
   <dependencies>
@@ -257,7 +258,11 @@
       <artifactId>hive-exec</artifactId>
       <version>${hive.version}</version>
     </dependency>
-
+    <dependency>
+      <groupId>kudu</groupId>
+      <artifactId>kudu-client</artifactId>
+      <version>${kudu.version}</version>
+    </dependency>
     <!-- This driver supports PostgreSQL 7.2 and newer -->
     <dependency>
       <groupId>postgresql</groupId>
@@ -308,6 +313,7 @@
       <artifactId>guava</artifactId>
       <version>11.0.2</version>
     </dependency>
+
 
     <dependency>
       <groupId>junit</groupId>

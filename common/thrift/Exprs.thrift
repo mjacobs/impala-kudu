@@ -33,7 +33,7 @@ enum TExprNodeType {
   TUPLE_IS_NULL_PRED,
   FUNCTION_CALL,
   AGGREGATE_EXPR,
-  DECIMAL_LITERAL,
+  DECIMAL_LITERAL
 }
 
 struct TBoolLiteral {

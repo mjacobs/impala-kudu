@@ -144,6 +144,10 @@ class RowBatch {
     return reinterpret_cast<TupleRow*>(tuple_ptrs_ + row_idx * num_tuples_per_row_);
   }
 
+  TupleRow* AdvanceRow(TupleRow* old_row) {
+    return reinterpret_cast<TupleRow*>(reinterpret_cast<Tuple**>(old_row) + num_tuples_per_row_);
+  }
+
   int row_byte_size() { return num_tuples_per_row_ * sizeof(Tuple*); }
   MemPool* tuple_data_pool() { return tuple_data_pool_.get(); }
   int num_io_buffers() const { return io_buffers_.size(); }

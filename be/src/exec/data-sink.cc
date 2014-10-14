@@ -20,6 +20,7 @@
 #include "common/logging.h"
 #include "exec/hdfs-table-sink.h"
 #include "exec/hbase-table-sink.h"
+#include "exec/kudu-table-sink.h"
 #include "exec/exec-node.h"
 #include "exprs/expr.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
@@ -59,6 +60,10 @@ Status DataSink::CreateDataSink(ObjectPool* pool,
           break;
         case TTableSinkType::HBASE:
           tmp_sink = new HBaseTableSink(row_desc, output_exprs, thrift_sink);
+          sink->reset(tmp_sink);
+          break;
+        case TTableSinkType::KUDU:
+          tmp_sink = new KuduTableSink(row_desc, output_exprs, thrift_sink);
           sink->reset(tmp_sink);
           break;
         default:

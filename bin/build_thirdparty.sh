@@ -158,9 +158,9 @@ if [ $BUILD_ALL -eq 1 ] || [ $BUILD_THRIFT -eq 1 ]; then
 fi
 
 # build gflags
+GFLAGS_INSTALL=`pwd`/third-party-install
 if [ $BUILD_ALL -eq 1 ] || [ $BUILD_GFLAGS -eq 1 ]; then
   build_preamble $IMPALA_HOME/thirdparty/gflags-${IMPALA_GFLAGS_VERSION} GFlags
-  GFLAGS_INSTALL=`pwd`/third-party-install
   ./configure --with-pic --prefix=${GFLAGS_INSTALL}
   make -j4 install
 fi
