@@ -42,7 +42,8 @@ enum TTableType {
   HDFS_TABLE,
   HBASE_TABLE,
   VIEW,
-  DATA_SOURCE_TABLE
+  DATA_SOURCE_TABLE,
+  KUDU_TABLE
 }
 
 enum THdfsFileFormat {
@@ -265,6 +266,18 @@ struct TDataSourceTable {
   2: required string init_string
 }
 
+// Represents a table in Kudu.
+struct TKuduTable {
+  1: required string tableName
+
+  2: required string masterAddress
+
+  // Names of the columns, including clustering columns.  As in other
+  // places, the clustering columns come before the non-clustering
+  // columns.  This includes non-materialized columns.
+  3: required list<string> colNames;
+}
+
 // Represents a table or view.
 struct TTable {
   // Name of the parent database. Case insensitive, expected to be stored as lowercase.
@@ -309,6 +322,9 @@ struct TTable {
 
   // Set iff this is a table from an external data source
   13: optional TDataSourceTable data_source_table
+
+  // Set iff this is a Kudu table
+  14: optional TKuduTable kudu_table
 }
 
 // Represents a database.

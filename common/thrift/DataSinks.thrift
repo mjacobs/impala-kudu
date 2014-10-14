@@ -27,7 +27,8 @@ enum TDataSinkType {
 
 enum TTableSinkType {
   HDFS,
-  HBASE
+  HBASE,
+  KUDU
 }
 
 // Sink which forwards data to a remote plan fragment,

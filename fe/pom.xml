@@ -36,6 +36,7 @@
     <sentry.version>${env.IMPALA_SENTRY_VERSION}</sentry.version>
     <hbase.version>${env.IMPALA_HBASE_VERSION}</hbase.version>
     <impala.extdatasrc.api.version>1.0-SNAPSHOT</impala.extdatasrc.api.version>
+    <kudu.version>0.1.0-SNAPSHOT</kudu.version>
   </properties>
 
   <dependencies>
@@ -206,7 +207,11 @@
       <artifactId>hive-jdbc</artifactId>
       <version>${hive.version}</version>
     </dependency>
-
+    <dependency>
+      <groupId>kudu</groupId>
+      <artifactId>kudu-client</artifactId>
+      <version>${kudu.version}</version>
+    </dependency>
     <!-- This driver supports PostgreSQL 7.2 and newer -->
     <dependency>
       <groupId>postgresql</groupId>
@@ -241,6 +246,7 @@
       <artifactId>guava</artifactId>
       <version>11.0.2</version>
     </dependency>
+
 
     <dependency>
       <groupId>junit</groupId>

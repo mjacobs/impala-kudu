@@ -64,6 +64,8 @@ add_library(Exec
   partitioned-aggregation-node-ir.cc
   partitioned-hash-join-node.cc
   partitioned-hash-join-node-ir.cc
+  kudu-scan-node.cc
+  kudu-table-sink.cc
   read-write-util.cc
   scan-node.cc
   scanner-context.cc

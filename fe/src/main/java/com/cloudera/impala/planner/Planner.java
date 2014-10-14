@@ -51,6 +51,7 @@ import com.cloudera.impala.catalog.ColumnStats;
 import com.cloudera.impala.catalog.DataSourceTable;
 import com.cloudera.impala.catalog.HBaseTable;
 import com.cloudera.impala.catalog.HdfsTable;
+import com.cloudera.impala.catalog.KuduTable;
 import com.cloudera.impala.catalog.Type;
 import com.cloudera.impala.common.IdGenerator;
 import com.cloudera.impala.common.ImpalaException;
@@ -1747,6 +1748,10 @@ public class Planner {
     } else if (tblRef.getTable() instanceof HBaseTable) {
       // HBase table
       scanNode = new HBaseScanNode(nodeIdGenerator_.getNextId(), tblRef.getDesc());
+    } else if (tblRef.getTable() instanceof KuduTable) {
+      scanNode = new KuduScanNode(nodeIdGenerator_.getNextId(), tblRef.getDesc());
+      scanNode.init(analyzer);
+      return scanNode;
     } else {
       throw new InternalException("Invalid table ref class: " + tblRef.getClass());
     }
