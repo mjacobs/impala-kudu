@@ -44,6 +44,7 @@ import com.cloudera.impala.catalog.DatabaseNotFoundException;
 import com.cloudera.impala.catalog.Db;
 import com.cloudera.impala.catalog.HBaseTable;
 import com.cloudera.impala.catalog.HdfsTable;
+import com.cloudera.impala.catalog.KuduTable;
 import com.cloudera.impala.catalog.ImpaladCatalog;
 import com.cloudera.impala.catalog.Table;
 import com.cloudera.impala.catalog.TableLoadingException;
@@ -471,7 +472,8 @@ public class Analyzer {
     } else {
       // The table must be a base table.
       Preconditions.checkState(table instanceof HdfsTable ||
-          table instanceof HBaseTable || table instanceof DataSourceTable);
+          table instanceof HBaseTable || table instanceof DataSourceTable ||
+          table instanceof KuduTable);
       return new BaseTableRef(tableRef, table);
     }
   }

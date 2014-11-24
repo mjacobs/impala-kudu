@@ -35,12 +35,10 @@ utf/rune.c
 )
 
 target_link_libraries(gutil
-  glog
-  protobuf
   rt) # clock_gettime() requires -lrt
 
 # Disable warnings which trigger a lot in the Google code:
 set_target_properties(gutil PROPERTIES
-  COMPILE_FLAGS "-funsigned-char -Wno-deprecated -Wno-char-subscripts")
+  COMPILE_FLAGS "-funsigned-char -Wno-deprecated -Wno-char-subscripts -fPIC")
 
 set(GUTIL_LIBS gutil)
