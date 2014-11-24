@@ -108,13 +108,11 @@ class KuduScanNode : public ScanNode {
   struct MaterializedSlotInfo {
     // the index of the slot in the overall tuple
     int slot_idx;
-    int tuple_offset;
     SlotDescriptor* slot_desc;
   };
   std::vector<MaterializedSlotInfo> materialized_slots_;
 
   std::vector<kudu::client::KuduRowResult> cur_rows_;
-  size_t num_rows_current_block_;
   size_t rows_scanned_current_block_;
 
   RuntimeProfile::Counter* kudu_read_timer_;

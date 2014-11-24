@@ -27,6 +27,7 @@
 #include "runtime/string-value.h"
 #include "runtime/tuple-row.h"
 #include "gutil/gscoped_ptr.h"
+#include "gutil/strings/substitute.h"
 #include "util/jni-util.h"
 #include "util/periodic-counter-updater.h"
 #include "util/runtime-profile.h"
@@ -40,27 +41,18 @@ using kudu::client::KuduRowResult;
 using kudu::client::KuduTable;
 using kudu::client::KuduScanner;
 
+#define IMPALA_RETURN_NOT_OK(expr, prepend) \
+  do { \
+    kudu::Status _s = (expr); \
+    if (PREDICT_FALSE(!_s.ok)) { \
+      return Status(strings::Substitute("$0: $1", prepend, _s.ToString()));
+    } \
+  } while (0)
+
 namespace impala {
 
 const string KuduScanNode::KUDU_READ_TIMER = "TotalKuduReadTime";
 const string KuduScanNode::KUDU_ROUND_TRIPS = "TotalKuduScanRoundTrips";
-
-namespace {
-
-Status MakeStatusAndFree(char* arg) {
-  string s(arg);
-  free(arg);
-  return Status(s);
-}
-
-template<class T, void (*F)(T*)>
-class FreeFunctor {
-  void operator()(T* obj) {
-    F(obj);
-  }
-};
-
-} // anonymous namespace
 
 KuduScanNode::KuduScanNode(ObjectPool* pool, const TPlanNode& tnode,
                              const DescriptorTbl& descs)
@@ -71,7 +63,6 @@ KuduScanNode::KuduScanNode(ObjectPool* pool, const TPlanNode& tnode,
       scanner_(NULL),
       cur_scan_range_idx_(0),
       cur_rows_(NULL),
-      num_rows_current_block_(0),
       rows_scanned_current_block_(0) {
 }
 
@@ -122,18 +113,6 @@ Status KuduScanNode::Prepare(RuntimeState* state) {
     const TKuduKeyRange& key_range = params.scan_range.kudu_key_range;
 
     scan_ranges_.push_back(key_range);
-/*
-    DCHECK(params.scan_range.__isset.hbase_key_range);
-    const THBaseKeyRange& key_range = params.scan_range.hbase_key_range;
-    scan_range_vector_.push_back(HBaseTableScanner::ScanRange());
-    HBaseTableScanner::ScanRange& sr = scan_range_vector_.back();
-    if (key_range.__isset.startKey) {
-      sr.set_start_key(key_range.startKey);
-    }
-    if (key_range.__isset.stopKey) {
-      sr.set_stop_key(key_range.stopKey);
-    }
-*/
   }
 
   return Status::OK;
@@ -165,23 +144,20 @@ static Status AddBound(kudu_range_predicate_t* pred, kudu_predicate_field_t fiel
 #endif
 
 Status KuduScanNode::Open(RuntimeState* state) {
-  const KuduTableDescriptor* table_desc = static_cast<const KuduTableDescriptor*>(tuple_desc_->table_desc());
-
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
+  RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
+  RETURN_IF_ERROR(QueryMaintenance(state));
   SCOPED_TIMER(runtime_profile_->total_time_counter());
 
-  kudu::Status s = kudu::client::KuduClientBuilder()
-    .master_server_addr(table_desc->kudu_master_address())
-    .Build(&client_);
-  if (!s.ok()){
-    return Status(s.ToString());
-  }
+  const KuduTableDescriptor* table_desc = static_cast<const KuduTableDescriptor*>(tuple_desc_->table_desc());
 
-  s = client_->OpenTable(table_desc->table_name(), &table_);
-  if (!s.ok()) {
-    return Status(s.ToString());
-  }
+  IMPALA_RETURN_NOT_OK(kudu::client::KuduClientBuilder()
+                       .master_server_addr(table_desc->kudu_master_address())
+                       .Build(&client_),
+                       "Unable to create Kudu client");
+
+  IMPALA_RETURN_NOT_OK(client_->OpenTable(table_desc->table_name(), &table_),
+                       "Unable to open Kudu table");
 
   table_schema_ = table_->schema();
 
@@ -344,22 +320,18 @@ bool KuduScanNode::HasMoreScanners() {
 Status KuduScanNode::OpenNextScanner()  {
   CHECK(scanner_ == NULL);
   CHECK_LT(cur_scan_range_idx_, scan_ranges_.size());
-//  const TKuduKeyRange& key_range = scan_ranges_[cur_scan_range_idx_];
+  const TKuduKeyRange& key_range = scan_ranges_[cur_scan_range_idx_];
 
   VLOG(1) << "Starting scanner " << (cur_scan_range_idx_ + 1)
           << "/" << scan_ranges_.size();
 
   kudu::Status s;
   scanner_ = new KuduScanner(table_.get());
-  s = scanner_->SetProjection(&schema_);
-  if (!s.ok()) {
-    return Status(s.ToString());
-  }
+  IMPALA_RETURN_NOT_OK(scanner_->SetProjection(&schema_),
+                       "Unable to set projection");
 
-  s = scanner_->Open();
-  if (!s.ok()) {
-    return Status(s.ToString());
-  }
+  IMPALA_RETURN_NOT_OK(scanner_->Open(),
+                       "Unable to open scanner");
 
   return Status::OK;
 }
@@ -400,16 +372,16 @@ void KuduScanNode::KuduRowToImpalaRow(const KuduRowResult& row,
         break;
       }
       case TYPE_TINYINT:
-        KUDU_CHECK_OK(row.GetInt8(i, reinterpret_cast<int8_t*>(slot)));
+        KUDU_CHECK_OK(row.GetUInt8(i, reinterpret_cast<uint8_t*>(slot)));
         break;
       case TYPE_SMALLINT:
-        KUDU_CHECK_OK(row.GetInt16(i, reinterpret_cast<int16_t*>(slot)));
+        KUDU_CHECK_OK(row.GetUInt16(i, reinterpret_cast<uint16_t*>(slot)));
         break;
       case TYPE_INT:
-        KUDU_CHECK_OK(row.GetInt32(i, reinterpret_cast<int32_t*>(slot)));
+        KUDU_CHECK_OK(row.GetUInt32(i, reinterpret_cast<uint32_t*>(slot)));
         break;
       case TYPE_BIGINT:
-        KUDU_CHECK_OK(row.GetInt64(i, reinterpret_cast<int64_t*>(slot)));
+        KUDU_CHECK_OK(row.GetUInt64(i, reinterpret_cast<uint64_t*>(slot)));
         break;
       default:
         DCHECK(false);
@@ -418,7 +390,7 @@ void KuduScanNode::KuduRowToImpalaRow(const KuduRowResult& row,
 }
 
 Status KuduScanNode::FetchNextBlockIfEmpty(bool* end_of_scanner) {
-  if (rows_scanned_current_block_ < num_rows_current_block_) {
+  if (rows_scanned_current_block_ < cur_rows_.size()) {
     // More remaining in this block which we haven't processed yet
     VLOG(1) << "Already have enough in current block";
     return Status::OK;
@@ -433,12 +405,9 @@ Status KuduScanNode::FetchNextBlockIfEmpty(bool* end_of_scanner) {
   SCOPED_TIMER(kudu_read_timer_);
 
   VLOG(1) << "Fetching next block from kudu";
-  kudu::Status s = scanner_->NextBatch(&cur_rows_);
-  if (!s.ok()) {
-    stringstream ss;
-    ss << "Could not advance iterator: " << s.ToString();
-    return Status(ss.str());
-  }
+  cur_rows_.clear();
+  IMPALA_RETURN_NOT_OK(scanner_->NextBatch(&cur_rows_),
+                       "Unable to advance iterator");
   kudu_round_trips_->Add(1);
   rows_scanned_current_block_ = 0;
   return Status::OK;
@@ -457,7 +426,10 @@ Status KuduScanNode::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple, 
   row->SetTuple(tuple_idx_, *tuple);
   (*tuple)->Init(tuple_desc_->num_null_bytes());
 
-  for (int krow_idx = rows_scanned_current_block_; krow_idx < num_rows_current_block_; ++krow_idx) {
+  VLOG(1) << "Decoding " << (cur_rows_.size() - rows_scanned_current_block_)
+          << " rows from current batch";
+
+  for (int krow_idx = rows_scanned_current_block_; krow_idx < cur_rows_.size(); ++krow_idx) {
     const KuduRowResult& krow = cur_rows_[krow_idx];
     KuduRowToImpalaRow(krow, row_batch, *tuple);
     ++rows_scanned_current_block_;
@@ -489,6 +461,7 @@ Status KuduScanNode::DecodeRowsIntoRowBatch(RowBatch* row_batch, Tuple** tuple, 
 Status KuduScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
+  RETURN_IF_ERROR(QueryMaintenance(state));
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   SCOPED_TIMER(materialize_tuple_timer());
   *eos = false;
@@ -507,6 +480,7 @@ Status KuduScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos
   bool batch_done = false;
   while (!batch_done) {
     RETURN_IF_CANCELLED(state);
+    RETURN_IF_ERROR(QueryMaintenance(state));
 
     bool end_of_scanner = false;
     RETURN_IF_ERROR(FetchNextBlockIfEmpty(&end_of_scanner));
@@ -529,7 +503,6 @@ Status KuduScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos
       return Status::OK;
     }
 
-    VLOG(1) << "Decoding into batch";
     RETURN_IF_ERROR(DecodeRowsIntoRowBatch(row_batch, &tuple, &batch_done));
   }
   *eos = ReachedLimit();

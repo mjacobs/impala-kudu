@@ -41,6 +41,7 @@ import com.cloudera.impala.thrift.TColumnValue;
 import com.cloudera.impala.thrift.TExplainLevel;
 import com.cloudera.impala.thrift.TKuduKeyRange;
 import com.cloudera.impala.thrift.TKuduScanNode;
+import com.cloudera.impala.thrift.TNetworkAddress;
 import com.cloudera.impala.thrift.TPlanNode;
 import com.cloudera.impala.thrift.TPlanNodeType;
 import com.cloudera.impala.thrift.TQueryOptions;
@@ -55,8 +56,10 @@ import com.google.common.net.HostAndPort;
 import com.stumbleupon.async.Deferred;
 
 import kudu.Common;
+import kudu.Common.HostPortPB;
 import kudu.rpc.KuduClient;
-
+import kudu.rpc.LocatedTablet;
+import kudu.rpc.LocatedTablet.Replica;
 
 /**
  * Full scan of an Kudu table.
@@ -86,6 +89,7 @@ public class KuduScanNode extends ScanNode {
     analyzer.materializeSlots(conjuncts_);
 
     computeMemLayout(analyzer);
+    computeScanRangeLocations(analyzer);
   }
 
   /**
@@ -123,15 +127,15 @@ public class KuduScanNode extends ScanNode {
 
   // TODO: this should be in kudu client
   private static kudu.rpc.KuduTable syncOpenTable(KuduClient client, String tableName) throws IOException {
-    Deferred<Object> d = client.openTable(tableName);
+    Deferred<kudu.rpc.KuduTable> d = client.openTable(tableName);
     try {
-      return (kudu.rpc.KuduTable)d.join(OPEN_TABLE_TIMEOUT_MS);
+      return d.join(OPEN_TABLE_TIMEOUT_MS);
     } catch (Exception ex) {
       throw new IOException(ex);
     }
   }
 
-  private NavigableMap<KuduClient.RemoteTablet, List<Common.HostPortPB>> getLocations() {
+  private List<LocatedTablet> getLocations() {
     KuduTable table = (KuduTable)desc_.getTable();
     String tableName = table.getKuduTableName();
     HostAndPort hp = HostAndPort.fromString(table.getKuduMasterAddress());
@@ -151,19 +155,14 @@ public class KuduScanNode extends ScanNode {
    * relevant region, and the created TScanRange will contain all the relevant regions
    * of that region server.
    */
-  @Override
-  public List<TScanRangeLocations> getScanRangeLocations(long maxScanRangeLength) {
+  public void computeScanRangeLocations(Analyzer analyzer) {
     KuduTable table = (KuduTable)desc_.getTable();
     String tableName = table.getKuduTableName();
 
-    NavigableMap<KuduClient.RemoteTablet, List<Common.HostPortPB>> locations =
-      getLocations();
+    List<LocatedTablet> locations = getLocations();
 
     List<TScanRangeLocations> result = Lists.newArrayList();
-    for (Map.Entry<KuduClient.RemoteTablet, List<Common.HostPortPB>> entry : locations.entrySet()) {
-      KuduClient.RemoteTablet tablet = entry.getKey();
-      List<Common.HostPortPB> hostPorts = entry.getValue();
-
+    for (LocatedTablet tablet : locations) {
       TScanRange scanRange = new TScanRange();
       TKuduKeyRange keyRange = new TKuduKeyRange();
       keyRange.setStartKey(tablet.getStartKey());
@@ -173,10 +172,13 @@ public class KuduScanNode extends ScanNode {
       TScanRangeLocations loc = new TScanRangeLocations();
       loc.setScan_range(scanRange);
 
-      for (Common.HostPortPB hostPort : hostPorts) {
+      List<Replica> replicas = tablet.getReplicas();
+      for (Replica replica : replicas) {
+        HostPortPB hostPort = replica.getRpcHostPort();
         String s = hostPort.getHost() + ":" + hostPort.getPort();
+        TNetworkAddress networkAddress = addressToTNetworkAddress(s);
         loc.addToLocations(
-          new TScanRangeLocation(addressToTNetworkAddress(s)));
+          new TScanRangeLocation(analyzer.getHostIndex().getIndex(networkAddress)));
       }
       result.add(loc);
     }
@@ -187,7 +189,7 @@ public class KuduScanNode extends ScanNode {
     }
     LOG.info("--------");
 
-    return result;
+    scanRanges_ = result;
   }
 
   @Override

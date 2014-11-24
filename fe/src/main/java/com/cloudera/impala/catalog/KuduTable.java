@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -97,10 +98,9 @@ public class KuduTable extends Table {
       throws TableLoadingException {
     int pos = 0;
     for (FieldSchema s: fieldSchemas) {
-      ColumnType type = parseColumnType(s);
+      Type type = parseColumnType(s);
       Column col = new Column(s.getName(), type, s.getComment(), pos);
-      colsByPos_.add(col);
-      colsByName_.put(s.getName(), col);
+      addColumn(col);
       ++pos;
       LOG.info("adding a column: " + s.getName());
       // TODO: column statistics
@@ -177,12 +177,12 @@ public class KuduTable extends Table {
    * Hive returns the columns in order of their declaration for Kudu tables.
    */
   @Override
-  public ArrayList<Column> getColumnsInHiveOrder() { return colsByPos_; }
+  public ArrayList<Column> getColumnsInHiveOrder() { return getColumns(); }
 
   @Override
-  public TTableDescriptor toThriftDescriptor() {
+  public TTableDescriptor toThriftDescriptor(Set<Long> referencedPartitions) {
     TTableDescriptor tableDescriptor =
-        new TTableDescriptor(id_.asInt(), TTableType.KUDU_TABLE, colsByPos_.size(),
+      new TTableDescriptor(id_.asInt(), TTableType.KUDU_TABLE, getColumns().size(),
                              numClusteringCols_, kuduTableName_, db_.getName());
     tableDescriptor.setKuduTable(getTKuduTable());
     return tableDescriptor;
@@ -215,8 +215,8 @@ public class KuduTable extends Table {
     tKuduTable.setMasterAddress(kuduMasterAddress_);
 
     List<String> colNames = new ArrayList<String>();
-    for (int i = 0; i < colsByPos_.size(); ++i) {
-      colNames.add(colsByPos_.get(i).getName());
+    for (int i = 0; i < getColumns().size(); ++i) {
+      colNames.add(getColumns().get(i).getName());
     }
     tKuduTable.setColNames(colNames);
 
