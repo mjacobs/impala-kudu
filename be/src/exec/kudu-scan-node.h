@@ -56,9 +56,10 @@ class KuduScanNode : public ScanNode {
   void CacheMaterializedSlots();
   Status BuildKuduSchema(kudu::client::KuduSchema* schema);
 
-/*
+
   Status SetupScanRangePredicate(const TKuduKeyRange& key_range,
                                  kudu::client::KuduScanner* scanner);
+/*
   Status AddScanRangePredicate(kudu_predicate_field_t bound_type,
                                const std::string& encoded_key,
                                kudu_range_predicate_t* pred);

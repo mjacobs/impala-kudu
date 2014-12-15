@@ -44,8 +44,8 @@ using kudu::client::KuduScanner;
 #define IMPALA_RETURN_NOT_OK(expr, prepend) \
   do { \
     kudu::Status _s = (expr); \
-    if (PREDICT_FALSE(!_s.ok)) { \
-      return Status(strings::Substitute("$0: $1", prepend, _s.ToString()));
+    if (PREDICT_FALSE(!_s.ok())) {                                      \
+      return Status(strings::Substitute("$0: $1", prepend, _s.ToString())); \
     } \
   } while (0)
 
@@ -267,42 +267,23 @@ Status ImmediatePredecessor(string* s) {
 
 } // anonymous namespace
 
-#if 0
 Status KuduScanNode::SetupScanRangePredicate(const TKuduKeyRange& key_range,
-                                             kudu_scanner_t* scanner) {
+                                             KuduScanner* scanner) {
   if (key_range.startKey.empty() && key_range.stopKey.empty()) {
     return Status::OK;
   }
 
-  // TODO: this function is full of leaks!
-
-  char* err = NULL;
-  kudu_err_t rc;
-  kudu_range_predicate_t* pred;
-  if ((rc = kudu_create_range_predicate(table_schema_, 0, &pred, &err)) != KUDU_OK) {
-    return MakeStatusAndFree(err);
-  }
-
-  // TODO: handle compound keys and ranges where the encoded form doesn't
-  // match the unencoded one
-
   if (!key_range.startKey.empty()) {
-    RETURN_IF_ERROR(AddScanRangePredicate(KUDU_LOWER_BOUND, key_range.startKey, pred));
+    IMPALA_RETURN_NOT_OK(scanner->AddLowerBound(key_range.startKey),
+                         "adding scan range lower bound");
   }
   if (!key_range.stopKey.empty()) {
-    // TODO: we don't support exclusive range predicates at the moment, so need to
-    // do some special handling here... this may be error prone
-    string bound = key_range.stopKey;
-    ImmediatePredecessor(&bound);
-    RETURN_IF_ERROR(AddScanRangePredicate(KUDU_UPPER_BOUND, bound, pred));
+    IMPALA_RETURN_NOT_OK(scanner->AddUpperBound(key_range.stopKey),
+                         "adding scan range upper bound");
   }
 
-  if ((rc = kudu_scanner_add_range_predicate(scanner, pred, &err)) != KUDU_OK) {
-    return MakeStatusAndFree(err);
-  }
   return Status::OK;
 }
-#endif
 
 Status KuduScanNode::CloseCurrentScanner() {
   if (scanner_) {
@@ -329,6 +310,8 @@ Status KuduScanNode::OpenNextScanner()  {
   scanner_ = new KuduScanner(table_.get());
   IMPALA_RETURN_NOT_OK(scanner_->SetProjection(&schema_),
                        "Unable to set projection");
+
+  RETURN_IF_ERROR(SetupScanRangePredicate(key_range, scanner_));
 
   IMPALA_RETURN_NOT_OK(scanner_->Open(),
                        "Unable to open scanner");
