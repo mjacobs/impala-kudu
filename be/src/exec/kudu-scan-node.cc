@@ -152,7 +152,7 @@ Status KuduScanNode::Open(RuntimeState* state) {
   const KuduTableDescriptor* table_desc = static_cast<const KuduTableDescriptor*>(tuple_desc_->table_desc());
 
   IMPALA_RETURN_NOT_OK(kudu::client::KuduClientBuilder()
-                       .master_server_addr(table_desc->kudu_master_address())
+                       .add_master_server_addr(table_desc->kudu_master_address())
                        .Build(&client_),
                        "Unable to create Kudu client");
 
