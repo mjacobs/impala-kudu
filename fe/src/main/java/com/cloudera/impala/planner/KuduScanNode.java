@@ -138,8 +138,7 @@ public class KuduScanNode extends ScanNode {
   private List<LocatedTablet> getLocations() {
     KuduTable table = (KuduTable)desc_.getTable();
     String tableName = table.getKuduTableName();
-    HostAndPort hp = HostAndPort.fromString(table.getKuduMasterAddress());
-    KuduClient client = new KuduClient(hp.getHostText(), hp.getPort());
+    KuduClient client = new KuduClient(table.getKuduMasterAddress());
     try {
       kudu.rpc.KuduTable tableClient = syncOpenTable(client, tableName);
       return tableClient.getTabletsLocations(OPEN_TABLE_TIMEOUT_MS);
