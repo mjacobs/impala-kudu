@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env impala-python
 # Copyright (c) 2012 Cloudera, Inc. All rights reserved.
 
 # This script generates the "CREATE TABLE", "INSERT", and "LOAD" statements for loading
@@ -556,6 +556,7 @@ def generate_statements(output_name, test_vectors, sections,
       if create_hive or file_format == 'hbase':
         output = hive_output
       elif codec == 'lzo':
+        # Impala CREATE TABLE doesn't allow INPUTFORMAT.
         output = hive_output
 
       # TODO: Currently, Kudu does not support partitioned tables via Impala
@@ -568,11 +569,14 @@ def generate_statements(output_name, test_vectors, sections,
       # sections), which is used to generate the create table statement.
       if create_hive:
         table_template = create_hive
+<<<<<<< HEAD
         if file_format == 'avro':
           print 'CREATE section not supported'
           continue
       elif create_kudu:
         table_template = create_kudu
+=======
+>>>>>>> upupstream/cdh5-trunk
       elif create:
         table_template = create
         if file_format in ['avro', 'hbase', 'kudu']:
@@ -580,10 +584,8 @@ def generate_statements(output_name, test_vectors, sections,
           print ("CREATE section not supported with %s, "
                  "skipping: '%s'" % (file_format, table_name))
           continue
-      else:
-        assert columns, "No CREATE or COLUMNS section defined for table " + table_name
+      elif columns:
         avro_schema_dir = "%s/%s" % (AVRO_SCHEMA_DIR, data_set)
-        temp_table_name = table_name
         table_template = build_table_template(
           create_file_format, columns, partition_columns,
           row_format, avro_schema_dir, table_name, table_properties)
@@ -593,9 +595,12 @@ def generate_statements(output_name, test_vectors, sections,
             os.makedirs(avro_schema_dir)
           with open("%s/%s.json" % (avro_schema_dir, table_name),"w") as f:
             f.write(avro_schema(columns))
+      else:
+        table_template = None
 
-      output.create.append(build_create_statement(table_template, table_name, db_name,
-          db_suffix, create_file_format, create_codec, data_path))
+      if table_template:
+        output.create.append(build_create_statement(table_template, table_name, db_name,
+            db_suffix, create_file_format, create_codec, data_path))
       # HBASE create table
       if file_format == 'hbase':
         # If the HBASE_COLUMN_FAMILIES section does not exist, default to 'd'
@@ -609,16 +614,28 @@ def generate_statements(output_name, test_vectors, sections,
       # used for adding partitions.
       # TODO: Consider splitting the ALTER subsection into specific components. At the
       # moment, it assumes we're only using ALTER for partitioning the table.
+<<<<<<< HEAD
       if alter and file_format not in ("hbase", "kudu"):
         use_table = 'USE {db_name};\n'.format(db_name=db)
+=======
+      if alter and file_format != "hbase":
+        use_db = 'USE {db_name};\n'.format(db_name=db)
+>>>>>>> upupstream/cdh5-trunk
         if output == hive_output and codec == 'lzo':
-          if not options.force_reload:
+          # Hive ALTER TABLE ADD PARTITION doesn't handle null partitions, so
+          # we can't run the ALTER section in this case.
+          if options.force_reload:
+            # IMPALA-2278: Hive INSERT OVERWRITE won't clear out partition directories
+            # that weren't already added to the table. So, for force reload, manually
+            # delete the partition directories.
+            output.create.append(("DFS -rm -R {data_path};").format(
+              data_path=data_path));
+          else:
             # If this is not a force reload use msck repair to add the partitions
-            # into the table. This is to work around a problem where the null
-            # partition cannot be explicitly created in Hive.
-            output.create.append(use_table + 'msck repair table %s;' % (table_name,))
+            # into the table.
+            output.create.append(use_db + 'msck repair table %s;' % (table_name))
         else:
-          output.create.append(use_table + alter.format(table_name=table_name))
+          output.create.append(use_db + alter.format(table_name=table_name))
 
       # If the directory already exists in HDFS, assume that data files already exist
       # and skip loading the data. Otherwise, the data is generated using either an

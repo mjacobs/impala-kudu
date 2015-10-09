@@ -22,6 +22,8 @@
 #include "exec/hdfs-parquet-scanner.h"
 
 #include <sstream>
+#include <avro/errors.h>
+#include <avro/schema.h>
 #include <boost/algorithm/string.hpp>
 #include <boost/foreach.hpp>
 #include <boost/filesystem.hpp>
@@ -81,15 +83,21 @@ const int UNEXPECTED_REMOTE_BYTES_WARN_THRESHOLD = 64 * 1024 * 1024;
 HdfsScanNode::HdfsScanNode(ObjectPool* pool, const TPlanNode& tnode,
                            const DescriptorTbl& descs)
     : ScanNode(pool, tnode, descs),
-      thrift_plan_node_(new TPlanNode(tnode)),
       runtime_state_(NULL),
       tuple_id_(tnode.hdfs_scan_node.tuple_id),
       reader_context_(NULL),
       tuple_desc_(NULL),
+      hdfs_table_(NULL),
       unknown_disk_id_warned_(false),
       initial_ranges_issued_(false),
       scanner_thread_bytes_required_(0),
+      max_compressed_text_file_length_(NULL),
       disks_accessed_bitmap_(TUnit::UNIT, 0),
+      bytes_read_local_(NULL),
+      bytes_read_short_circuit_(NULL),
+      bytes_read_dn_cache_(NULL),
+      num_remote_ranges_(NULL),
+      unexpected_remote_bytes_(NULL),
       done_(false),
       all_ranges_started_(false),
       counters_running_(false),
@@ -97,7 +105,7 @@ HdfsScanNode::HdfsScanNode(ObjectPool* pool, const TPlanNode& tnode,
   max_materialized_row_batches_ = FLAGS_max_row_batches;
   if (max_materialized_row_batches_ <= 0) {
     // TODO: This parameter has an U-shaped effect on performance: increasing the value
-    // would first improves performance, but further increasing would degrade performance.
+    // would first improve performance, but further increasing would degrade performance.
     // Investigate and tune this.
     max_materialized_row_batches_ =
         10 * (DiskInfo::num_disks() + DiskIoMgr::REMOTE_NUM_DISKS);
@@ -106,6 +114,24 @@ HdfsScanNode::HdfsScanNode(ObjectPool* pool, const TPlanNode& tnode,
 }
 
 HdfsScanNode::~HdfsScanNode() {
+}
+
+Status HdfsScanNode::Init(const TPlanNode& tnode) {
+  RETURN_IF_ERROR(ExecNode::Init(tnode));
+
+  // Add collection item conjuncts
+  const map<TTupleId, vector<TExpr> >& collection_conjuncts =
+      tnode.hdfs_scan_node.collection_conjuncts;
+  map<TTupleId, vector<TExpr> >::const_iterator iter = collection_conjuncts.begin();
+  for (; iter != collection_conjuncts.end(); ++iter) {
+    DCHECK(conjuncts_map_[iter->first].empty());
+    RETURN_IF_ERROR(
+        Expr::CreateExprTrees(pool_, iter->second, &conjuncts_map_[iter->first]));
+  }
+  // Add row batch conjuncts
+  DCHECK(conjuncts_map_[tuple_id_].empty());
+  conjuncts_map_[tuple_id_] = conjunct_ctxs_;
+  return Status::OK();
 }
 
 Status HdfsScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
@@ -182,7 +208,8 @@ Status HdfsScanNode::GetNextInternal(
 
 DiskIoMgr::ScanRange* HdfsScanNode::AllocateScanRange(
     hdfsFS fs, const char* file, int64_t len, int64_t offset, int64_t partition_id,
-    int disk_id, bool try_cache, bool expected_local, int64_t mtime) {
+    int disk_id, bool try_cache, bool expected_local, int64_t mtime,
+    const DiskIoMgr::ScanRange* original_split) {
   DCHECK_GE(disk_id, -1);
   // Require that the scan range is within [0, file_length). While this cannot be used
   // to guarantee safety (file_length metadata may be stale), it avoids different
@@ -194,8 +221,8 @@ DiskIoMgr::ScanRange* HdfsScanNode::AllocateScanRange(
       << "Scan range beyond end of file (offset=" << offset << ", len=" << len << ")";
   disk_id = runtime_state_->io_mgr()->AssignQueue(file, disk_id, expected_local);
 
-  ScanRangeMetadata* metadata =
-      runtime_state_->obj_pool()->Add(new ScanRangeMetadata(partition_id));
+  ScanRangeMetadata* metadata = runtime_state_->obj_pool()->Add(
+        new ScanRangeMetadata(partition_id, original_split));
   DiskIoMgr::ScanRange* range =
       runtime_state_->obj_pool()->Add(new DiskIoMgr::ScanRange());
   range->Reset(fs, file, len, offset, disk_id, try_cache, expected_local,
@@ -274,7 +301,7 @@ Tuple* HdfsScanNode::InitTemplateTuple(RuntimeState* state,
   // Look to protect access to partition_key_pool_ and value_ctxs
   // TODO: we can push the lock to the mempool and exprs_values should not
   // use internal memory.
-  Tuple* template_tuple = InitEmptyTemplateTuple();
+  Tuple* template_tuple = InitEmptyTemplateTuple(*tuple_desc_);
 
   unique_lock<mutex> l(lock_);
   for (int i = 0; i < partition_key_slots_.size(); ++i) {
@@ -286,13 +313,13 @@ Tuple* HdfsScanNode::InitTemplateTuple(RuntimeState* state,
   return template_tuple;
 }
 
-Tuple* HdfsScanNode::InitEmptyTemplateTuple() {
+Tuple* HdfsScanNode::InitEmptyTemplateTuple(const TupleDescriptor& tuple_desc) {
   Tuple* template_tuple = NULL;
   {
     unique_lock<mutex> l(lock_);
-    template_tuple = Tuple::Create(tuple_desc_->byte_size(), scan_node_pool_.get());
+    template_tuple = Tuple::Create(tuple_desc.byte_size(), scan_node_pool_.get());
   }
-  memset(template_tuple, 0, tuple_desc_->byte_size());
+  memset(template_tuple, 0, tuple_desc.byte_size());
   return template_tuple;
 }
 
@@ -309,6 +336,20 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
   tuple_desc_ = state->desc_tbl().GetTupleDescriptor(tuple_id_);
   DCHECK(tuple_desc_ != NULL);
 
+  // Prepare collection conjuncts
+  ConjunctsMap::const_iterator iter = conjuncts_map_.begin();
+  for (; iter != conjuncts_map_.end(); ++iter) {
+    TupleDescriptor* tuple_desc = state->desc_tbl().GetTupleDescriptor(iter->first);
+
+    // conjuncts_ are already prepared in ExecNode::Prepare(), don't try to prepare again
+    if (tuple_desc == tuple_desc_) continue;
+
+    RowDescriptor* collection_row_desc =
+        state->obj_pool()->Add(new RowDescriptor(tuple_desc, /* is_nullable */ false));
+    RETURN_IF_ERROR(
+        Expr::Prepare(iter->second, state, *collection_row_desc, expr_mem_tracker()));
+  }
+
   if (!state->cgroup().empty()) {
     scanner_threads_.SetCgroupsMgr(state->exec_env()->cgroups_mgr());
     scanner_threads_.SetCgroup(state->cgroup());
@@ -318,6 +359,18 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
   DCHECK(tuple_desc_->table_desc() != NULL);
   hdfs_table_ = static_cast<const HdfsTableDescriptor*>(tuple_desc_->table_desc());
   scan_node_pool_.reset(new MemPool(mem_tracker()));
+
+  // Parse Avro table schema if applicable
+  const string& avro_schema_str = hdfs_table_->avro_schema();
+  if (!avro_schema_str.empty()) {
+    avro_schema_t avro_schema;
+    int error = avro_schema_from_json_length(
+        avro_schema_str.c_str(), avro_schema_str.size(), &avro_schema);
+    if (error != 0) {
+      return Status(Substitute("Failed to parse table schema: $0", avro_strerror()));
+    }
+    RETURN_IF_ERROR(AvroSchemaElement::ConvertSchema(avro_schema, avro_schema_.get()));
+  }
 
   // Gather materialized partition-key slots and non-partition slots.
   const vector<SlotDescriptor*>& slots = tuple_desc_->slots();
@@ -359,6 +412,14 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
     partition_ids_.insert(split.partition_id);
     HdfsPartitionDescriptor* partition_desc =
         hdfs_table_->GetPartition(split.partition_id);
+    if (partition_desc == NULL) {
+      // TODO: this should be a DCHECK but we sometimes hit it. It's likely IMPALA-1702.
+      LOG(ERROR) << "Bad table descriptor! table_id=" << hdfs_table_->id()
+                 << " partition_id=" << split.partition_id
+                 << "\n" << PrintThrift(state->fragment_params());
+      return Status("Query encountered invalid metadata, likely due to IMPALA-1702."
+                    " Try rerunning the query.");
+    }
     filesystem::path file_path(partition_desc->location());
     file_path.append(split.file_name, filesystem::path::codecvt());
     const string& native_file_path = file_path.native();
@@ -374,12 +435,6 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
       file_desc->file_compression = split.file_compression;
       RETURN_IF_ERROR(HdfsFsCache::instance()->GetConnection(
           native_file_path, &file_desc->fs, &fs_cache));
-
-      if (partition_desc == NULL) {
-        stringstream ss;
-        ss << "Could not find partition with id: " << split.partition_id;
-        return Status(ss.str());
-      }
       ++num_unqueued_files_;
       per_type_files_[partition_desc->file_format()].push_back(file_desc);
     } else {
@@ -441,7 +496,10 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
   // Prepare all the partitions scanned by the scan node
   BOOST_FOREACH(const int64_t& partition_id, partition_ids_) {
     HdfsPartitionDescriptor* partition_desc = hdfs_table_->GetPartition(partition_id);
-    DCHECK(partition_desc != NULL);
+    // This is IMPALA-1702, but will have been caught earlier in this method.
+    DCHECK(partition_desc != NULL) << "table_id=" << hdfs_table_->id()
+                                   << " partition_id=" << partition_id
+                                   << "\n" << PrintThrift(state->fragment_params());
     RETURN_IF_ERROR(partition_desc->PrepareExprs(state));
   }
 
@@ -457,13 +515,7 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
   PrintHdfsSplitStats(per_volume_stats, &str);
   runtime_profile()->AddInfoString(HDFS_SPLIT_STATS_DESC, str.str());
 
-  // Initialize conjunct exprs
-  RETURN_IF_ERROR(Expr::CreateExprTrees(
-      runtime_state_->obj_pool(), thrift_plan_node_->conjuncts, &conjunct_ctxs_));
-  RETURN_IF_ERROR(
-      Expr::Prepare(conjunct_ctxs_, runtime_state_, row_desc(), expr_mem_tracker()));
-  AddExprCtxsToFree(conjunct_ctxs_);
-
+  // Create codegen'd functions
   for (int format = THdfsFileFormat::TEXT;
        format <= THdfsFileFormat::PARQUET; ++format) {
     vector<HdfsFileDesc*>& file_descs =
@@ -479,6 +531,7 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
     random_shuffle(file_descs.begin(), file_descs.end());
 
     // Create reusable codegen'd functions for each file type type needed
+    // TODO: do this for conjuncts_map_
     Function* fn;
     switch (format) {
       case THdfsFileFormat::TEXT:
@@ -511,6 +564,14 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
 Status HdfsScanNode::Open(RuntimeState* state) {
   RETURN_IF_ERROR(ExecNode::Open(state));
 
+  // Open collection conjuncts
+  ConjunctsMap::const_iterator iter = conjuncts_map_.begin();
+  for (; iter != conjuncts_map_.end(); ++iter) {
+    // conjuncts_ are already opened in ExecNode::Open()
+    if (iter->first == tuple_id_) continue;
+    RETURN_IF_ERROR(Expr::Open(iter->second, state));
+  }
+
   // We need at least one scanner thread to make progress. We need to make this
   // reservation before any ranges are issued.
   runtime_state_->resource_pool()->ReserveOptionalTokens(1);
@@ -536,12 +597,11 @@ Status HdfsScanNode::Open(RuntimeState* state) {
   // Open all the partition exprs used by the scan node
   BOOST_FOREACH(const int64_t& partition_id, partition_ids_) {
     HdfsPartitionDescriptor* partition_desc = hdfs_table_->GetPartition(partition_id);
-    DCHECK(partition_desc != NULL);
+    DCHECK(partition_desc != NULL) << "table_id=" << hdfs_table_->id()
+                                   << " partition_id=" << partition_id
+                                   << "\n" << PrintThrift(state->fragment_params());
     RETURN_IF_ERROR(partition_desc->OpenExprs(state));
   }
-
-  // Open all conjuncts
-  Expr::Open(conjunct_ctxs_, state);
 
   RETURN_IF_ERROR(runtime_state_->io_mgr()->RegisterContext(
       &reader_context_, mem_tracker()));
@@ -614,9 +674,9 @@ Status HdfsScanNode::Open(RuntimeState* state) {
   return Status::OK();
 }
 
-Status HdfsScanNode::Reset(RuntimeState* state, RowBatch* row_batchl) {
-  DCHECK(false) << "NYI";
-  return Status("NYI");
+Status HdfsScanNode::Reset(RuntimeState* state) {
+  DCHECK(false) << "Internal error: Scan nodes should not appear in subplans.";
+  return Status("Internal error: Scan nodes should not appear in subplans.");
 }
 
 void HdfsScanNode::Close(RuntimeState* state) {
@@ -651,14 +711,25 @@ void HdfsScanNode::Close(RuntimeState* state) {
 
   if (scan_node_pool_.get() != NULL) scan_node_pool_->FreeAll();
 
-  // Close all conjuncts
-  Expr::Close(conjunct_ctxs_, state);
-
   // Close all the partitions scanned by the scan node
   BOOST_FOREACH(const int64_t& partition_id, partition_ids_) {
     HdfsPartitionDescriptor* partition_desc = hdfs_table_->GetPartition(partition_id);
-    DCHECK(partition_desc != NULL);
+    if (partition_desc == NULL) {
+      // TODO: Revert when IMPALA-1702 is fixed.
+      LOG(ERROR) << "Bad table descriptor! table_id=" << hdfs_table_->id()
+                 << " partition_id=" << partition_id
+                 << "\n" << PrintThrift(state->fragment_params());
+      continue;
+    }
     partition_desc->CloseExprs(state);
+  }
+
+  // Close collection conjuncts
+  ConjunctsMap::const_iterator iter = conjuncts_map_.begin();
+  for (; iter != conjuncts_map_.end(); ++iter) {
+    // conjuncts_ are already closed in ExecNode::Close()
+    if (iter->first == tuple_id_) continue;
+    Expr::Close(iter->second, state);
   }
 
   ScanNode::Close(state);
@@ -675,11 +746,40 @@ Status HdfsScanNode::AddDiskIoRanges(const vector<DiskIoMgr::ScanRange*>& ranges
 }
 
 void HdfsScanNode::AddMaterializedRowBatch(RowBatch* row_batch) {
+  InitNullArrayValues(row_batch);
   materialized_row_batches_->AddBatch(row_batch);
 }
 
-Status HdfsScanNode::GetConjunctCtxs(vector<ExprContext*>* ctxs) {
-  return Expr::Clone(conjunct_ctxs_, runtime_state_, ctxs);
+void HdfsScanNode::InitNullArrayValues(const TupleDescriptor* tuple_desc,
+    Tuple* tuple) const {
+  BOOST_FOREACH(const SlotDescriptor* slot_desc, tuple_desc->collection_slots()) {
+    ArrayValue* slot = reinterpret_cast<ArrayValue*>(
+        tuple->GetSlot(slot_desc->tuple_offset()));
+    if (tuple->IsNull(slot_desc->null_indicator_offset())) {
+      *slot = ArrayValue();
+      continue;
+    }
+    // Recursively traverse collection items.
+    const TupleDescriptor* item_desc = slot_desc->collection_item_descriptor();
+    if (item_desc->collection_slots().empty()) continue;
+    for (int i = 0; i < slot->num_tuples; ++i) {
+      int item_offset = i * item_desc->byte_size();
+      Tuple* collection_item = reinterpret_cast<Tuple*>(slot->ptr + item_offset);
+      InitNullArrayValues(item_desc, collection_item);
+    }
+  }
+}
+
+void HdfsScanNode::InitNullArrayValues(RowBatch* row_batch) const {
+  DCHECK_EQ(row_batch->row_desc().tuple_descriptors().size(), 1);
+  const TupleDescriptor& tuple_desc =
+      *row_batch->row_desc().tuple_descriptors()[tuple_idx()];
+  if (tuple_desc.collection_slots().empty()) return;
+  for (int i = 0; i < row_batch->num_rows(); ++i) {
+    Tuple* tuple = row_batch->GetRow(i)->GetTuple(tuple_idx());
+    DCHECK(tuple != NULL);
+    InitNullArrayValues(&tuple_desc, tuple);
+  }
 }
 
 // For controlling the amount of memory used for scanners, we approximate the
@@ -828,8 +928,9 @@ void HdfsScanNode::ScannerThread() {
           reinterpret_cast<ScanRangeMetadata*>(scan_range->meta_data());
       int64_t partition_id = metadata->partition_id;
       HdfsPartitionDescriptor* partition = hdfs_table_->GetPartition(partition_id);
-      DCHECK_NOTNULL(partition);
-
+      DCHECK(partition != NULL) << "table_id=" << hdfs_table_->id()
+                                << " partition_id=" << partition_id
+                                << "\n" << PrintThrift(runtime_state_->fragment_params());
       ScannerContext* context = runtime_state_->obj_pool()->Add(
           new ScannerContext(runtime_state_, this, partition, scan_range));
       Status scanner_status;

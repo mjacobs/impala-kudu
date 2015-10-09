@@ -44,23 +44,18 @@ error_codes = (
    "Parquet files should not be split into multiple hdfs-blocks. file=$0"),
 
   ("PARQUET_COLUMN_METADATA_INVALID", 11,
-    "Column metadata states there are $0 values, but only read $1 values "
-    "from column $2"),
+   "Column metadata states there are $0 values, but read $1 values from column $2. "
+   "file=$3"),
 
-  ("PARQUET_HEADER_PAGE_SIZE_EXCEEDED", 12,
-    "ParquetScanner: could not read data page because page header exceeded "
-    "maximum size of $0"),
+  ("PARQUET_HEADER_PAGE_SIZE_EXCEEDED", 12, "(unused)"),
 
   ("PARQUET_HEADER_EOF", 13,
-    "ParquetScanner: reached EOF while deserializing data page header."),
+    "ParquetScanner: reached EOF while deserializing data page header. file=$0"),
 
   ("PARQUET_GROUP_ROW_COUNT_ERROR", 14,
-    "Metadata states that in group $0($1) there are $2 rows, but only $3 "
-    "rows were read."),
+    "Metadata states that in group $0($1) there are $2 rows, but $3 rows were read."),
 
-  ("PARQUET_GROUP_ROW_COUNT_OVERFLOW", 15,
-    "Metadata states that in group $0($1) there are $2 rows, but there is at least one "
-    "more row in the file."),
+  ("PARQUET_GROUP_ROW_COUNT_OVERFLOW", 15, "(unused)"),
 
   ("PARQUET_MISSING_PRECISION", 16,
    "File '$0' column '$1' does not have the decimal precision set."),
@@ -121,12 +116,91 @@ error_codes = (
 
   ("UDF_VERIFY_FAILED", 33,
    "Failed to verify function $0 from LLVM module $1, see log for more details."),
+               
+  ("PARQUET_CORRUPT_VALUE", 34, "File $0 corrupt. RLE level data bytes = $1"),
 
-  ("PARQUET_CORRUPT_VALUE", 34, "Corrupt value: $0"),
+  ("AVRO_DECIMAL_RESOLUTION_ERROR", 35, "Column '$0' has conflicting Avro decimal types. "
+   "Table schema $1: $2, file schema $1: $3"),
 
-  ("KUDU_IMPALA_TYPE_MISSING", 35, "Kudu type $0 is not available in Impala."),
+  ("AVRO_DECIMAL_METADATA_MISMATCH", 36, "Column '$0' has conflicting Avro decimal types. "
+   "Declared $1: $2, $1 in table's Avro schema: $3"),
 
-  ("IMPALA_KUDU_TYPE_MISSING", 36, "Impala type $0 is not available in Kudu."),
+  ("AVRO_SCHEMA_RESOLUTION_ERROR", 37, "Unresolvable types for column '$0': "
+   "table type: $1, file type: $2"),
+
+  ("AVRO_SCHEMA_METADATA_MISMATCH", 38, "Unresolvable types for column '$0': "
+   "declared column type: $1, table's Avro schema type: $2"),
+
+  ("AVRO_UNSUPPORTED_DEFAULT_VALUE", 39, "Field $0 is missing from file and default "
+   "values of type $1 are not yet supported."),
+
+  ("AVRO_MISSING_FIELD", 40, "Inconsistent table metadata. Mismatch between column "
+   "definition and Avro schema: cannot read field $0 because there are only $1 fields."),
+
+  ("AVRO_MISSING_DEFAULT", 41,
+   "Field $0 is missing from file and does not have a default value."),
+
+  ("AVRO_NULLABILITY_MISMATCH", 42,
+   "Field $0 is nullable in the file schema but not the table schema."),
+
+  ("AVRO_NOT_A_RECORD", 43,
+   "Inconsistent table metadata. Field $0 is not a record in the Avro schema."),
+
+  ("PARQUET_DEF_LEVEL_ERROR", 44, "Could not read definition level, even though metadata"
+   " states there are $0 values remaining in data page. file=$1"),
+
+  ("PARQUET_NUM_COL_VALS_ERROR", 45, "Mismatched number of values in column index $0 "
+   "($1 vs. $2). file=$3"),
+
+  ("PARQUET_DICT_DECODE_FAILURE", 46, "Failed to decode dictionary-encoded value. "
+   "file=$0"),
+
+  ("SSL_PASSWORD_CMD_FAILED", 47,
+   "SSL private-key password command ('$0') failed with error: $1"),
+
+  ("SSL_CERTIFICATE_PATH_BLANK", 48, "The SSL certificate path is blank"),
+  ("SSL_PRIVATE_KEY_PATH_BLANK", 49, "The SSL private key path is blank"),
+
+  ("SSL_CERTIFICATE_NOT_FOUND", 50, "The SSL certificate file does not exist at path $0"),
+  ("SSL_PRIVATE_KEY_NOT_FOUND", 51, "The SSL private key file does not exist at path $0"),
+
+  ("SSL_SOCKET_CREATION_FAILED", 52, "SSL socket creation failed: $0"),
+
+  ("MEM_ALLOC_FAILED", 53, "Memory allocation of $0 bytes failed"),
+
+  ("PARQUET_REP_LEVEL_ERROR", 54, "Could not read repetition level, even though metadata"
+   " states there are $0 values remaining in data page. file=$1"),
+
+  ("PARQUET_UNRECOGNIZED_SCHEMA", 55, "File '$0' has an incompatible Parquet schema for "
+   "column '$1'. Column type: $2, Parquet schema:\\n$3"),
+
+  ("COLLECTION_ALLOC_FAILED", 56, "Failed to allocate buffer for collection '$0'."),
+
+  ("TMP_DEVICE_BLACKLISTED", 57,
+    "Temporary device for directory $0 is blacklisted from a previous error and cannot "
+    "be used."),
+
+  ("TMP_FILE_BLACKLISTED", 58,
+    "Temporary file $0 is blacklisted from a previous error and cannot be expanded."),
+
+  ("RPC_CLIENT_CONNECT_FAILURE", 59,
+    "RPC client failed to connect: $0"),
+
+  ("STALE_METADATA_FILE_TOO_SHORT", 60, "Metadata for file '$0' appears stale. "
+   "Try running \\\"refresh $1\\\" to reload the file metadata."),
+
+  ("PARQUET_BAD_VERSION_NUMBER", 61, "File '$0' has an invalid version number: $1\\n"
+   "This could be due to stale metadata. Try running \\\"refresh $2\\\"."),
+
+  ("SCANNER_INCOMPLETE_READ", 62, "Tried to read $0 bytes but could only read $1 bytes. "
+   "This may indicate data file corruption. (file $2, byte offset: $3)"),
+
+  ("SCANNER_INVALID_READ", 63, "Invalid read of $0 bytes. This may indicate data file "
+   "corruption. (file $1, byte offset: $2)"),
+
+  ("KUDU_IMPALA_TYPE_MISSING", 64, "Kudu type $0 is not available in Impala."),
+
+  ("IMPALA_KUDU_TYPE_MISSING", 65, "Impala type $0 is not available in Kudu."),
 )
 
 import sys

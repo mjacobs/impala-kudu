@@ -96,6 +96,7 @@ class FunctionContextImpl {
 
  private:
   friend class impala_udf::FunctionContext;
+  friend class ExprContext;
 
   /// Preallocated buffer for storing varargs (if the function has any). Allocated and
   /// owned by this object, but populated by an Expr function.
@@ -168,6 +169,27 @@ class FunctionContextImpl {
 
   /// Indicates whether this context has been closed. Used for verification/debugging.
   bool closed_;
+};
+
+}
+
+namespace impala_udf {
+
+/// Temporary ArrayVal definition. This is not ready for public consumption because users
+/// must have access to our internal tuple layout.
+struct ArrayVal : public AnyVal {
+  uint8_t* ptr;
+  int num_tuples;
+
+  /// Construct an ArrayVal from ptr/num_tuples. Note: this does not make a copy of ptr so
+  /// the buffer must exist as long as this ArrayVal does.
+  ArrayVal(uint8_t* ptr = NULL, int num_tuples = 0) : ptr(ptr), num_tuples(num_tuples) {}
+
+  static ArrayVal null() {
+    ArrayVal av;
+    av.is_null = true;
+    return av;
+  }
 };
 
 }

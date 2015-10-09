@@ -319,3 +319,122 @@ where T2.bigint_col < 10 and false
 |
 00:EMPTYSET
 ====
+# IMPALA-2088: Test empty union operands with analytic functions.
+# TODO: Simplify the plan of unions with empty operands using an empty set node.
+# TODO: Simplify the plan of unions with only a single non-empty operand to not
+# use a union node (this is tricky because a union materializes a new tuple).
+select lead(-496, 81) over (order by t1.double_col desc, t1.id asc)
+from functional.alltypestiny t1 where 5 = 6
+union
+select 794.67
+from functional.alltypes t1 where 5 = 6
+union all
+select coalesce(10.4, int_col)
+from functional.alltypes where false
+---- PLAN
+02:UNION
+|
+01:AGGREGATE [FINALIZE]
+|  group by: lead(-496, 81, NULL) OVER(...)
+|
+00:UNION
+====
+# IMPALA-2088: Test empty union operands with analytic functions.
+select lead(-496, 81) over (order by t1.double_col desc, t1.id asc)
+from functional.alltypestiny t1 where 5 = 6
+union
+select 794.67
+from functional.alltypes t1 where 5 = 6
+union all
+select coalesce(10.4, int_col)
+from functional.alltypes where false
+union all
+select 1
+union all select bigint_col
+from functional.alltypestiny
+---- PLAN
+02:UNION
+|  constant-operands=1
+|
+|--01:AGGREGATE [FINALIZE]
+|  |  group by: lead(-496, 81, NULL) OVER(...)
+|  |
+|  00:UNION
+|
+03:SCAN HDFS [functional.alltypestiny]
+   partitions=4/4 files=4 size=460B
+====
+# IMPALA-2216: Make sure the final output exprs are substituted, even
+# if the resulting plan is an EmptySetNode.
+select * from (select 10 as i, 2 as j, '2013' as s) as t
+where t.i < 10
+---- PLAN
+00:EMPTYSET
+====
+# IMPALA-2216: Make sure the final output exprs are substituted, even
+# if the table sink is fed by an EmptySetNode.
+insert into functional.alltypes (id) partition(year,month)
+select * from (select 10 as i, 2 as j, 2013 as s) as t
+where t.i < 10
+---- PLAN
+WRITE TO HDFS [functional.alltypes, OVERWRITE=false, PARTITION-KEYS=(2,2013)]
+|  partitions=1
+|
+00:EMPTYSET
+====
+# IMPALA-2430: Test empty blocks containing relative table refs.
+select c_custkey, v1.cnt, v2.o_orderkey, v3.l_linenumber, v4.cnt
+from tpch_nested_parquet.customer c
+left outer join
+  (select count(*) cnt from c.c_orders
+   where false) v1
+left outer join
+  (select o_orderkey from c.c_orders
+   where 20 < 10) v2
+left outer join
+  (select l_linenumber from c.c_orders.o_lineitems
+   where "a" in ("b", "c")) v3
+left outer join
+  (select count(*) cnt from c.c_orders o left outer join
+     (select l_linenumber from o.o_lineitems
+      where null) nv) v4
+where c_custkey < 10
+---- PLAN
+01:SUBPLAN
+|
+|--16:NESTED LOOP JOIN [LEFT OUTER JOIN]
+|  |
+|  |--12:AGGREGATE [FINALIZE]
+|  |  |  output: count(*)
+|  |  |
+|  |  08:SUBPLAN
+|  |  |
+|  |  |--11:NESTED LOOP JOIN [RIGHT OUTER JOIN]
+|  |  |  |
+|  |  |  |--09:SINGULAR ROW SRC
+|  |  |  |
+|  |  |  10:EMPTYSET
+|  |  |
+|  |  07:UNNEST [c.c_orders o]
+|  |
+|  15:NESTED LOOP JOIN [LEFT OUTER JOIN]
+|  |
+|  |--06:EMPTYSET
+|  |
+|  14:NESTED LOOP JOIN [LEFT OUTER JOIN]
+|  |
+|  |--05:EMPTYSET
+|  |
+|  13:NESTED LOOP JOIN [RIGHT OUTER JOIN]
+|  |
+|  |--02:SINGULAR ROW SRC
+|  |
+|  04:AGGREGATE [FINALIZE]
+|  |  output: count(*)
+|  |
+|  03:EMPTYSET
+|
+00:SCAN HDFS [tpch_nested_parquet.customer c]
+   partitions=1/1 files=4 size=554.13MB
+   predicates: c_custkey < 10
+====

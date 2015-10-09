@@ -72,6 +72,11 @@ public class PlannerTest extends PlannerTestBase {
   }
 
   @Test
+  public void testComplexTypesFileFormats() {
+    runPlannerTestFile("complex-types-file-formats");
+  }
+
+  @Test
   public void testJoins() {
     runPlannerTestFile("joins");
   }
@@ -162,6 +167,11 @@ public class PlannerTest extends PlannerTestBase {
   }
 
   @Test
+  public void testTpchNested() {
+    runPlannerTestFile("tpch-nested", "tpch_nested_parquet");
+  }
+
+  @Test
   public void testTpcds() {
     // Uses ss_sold_date_sk as the partition key of store_sales to allow static partition
     // pruning. The original predicates were rephrased in terms of the ss_sold_date_sk
@@ -174,5 +184,12 @@ public class PlannerTest extends PlannerTestBase {
     TQueryOptions options = new TQueryOptions();
     options.setExec_single_node_rows_threshold(8);
     runPlannerTestFile("small-query-opt", options);
+  }
+
+  @Test
+  public void testSingleNodeNlJoin() {
+    TQueryOptions options = new TQueryOptions();
+    options.setNum_nodes(1);
+    runPlannerTestFile("nested-loop-join", options);
   }
 }

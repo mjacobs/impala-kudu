@@ -396,8 +396,9 @@ class Coordinator {
   /// an error status, and returns the current query_status_.
   /// Calls CancelInternal() when switching to an error status.
   /// If failed_fragment is non-null, it is the fragment_id that has failed, used
-  /// for error reporting.
-  Status UpdateStatus(const Status& status, const TUniqueId* failed_fragment);
+  /// for error reporting along with instance_hostname.
+  Status UpdateStatus(const Status& status, const TUniqueId* failed_fragment,
+      const std::string& instance_hostname = "");
 
   /// Returns only when either all backends have reported success or the query is in
   /// error. Returns the status of the query.
@@ -450,6 +451,13 @@ class Coordinator {
   typedef boost::unordered_map<std::string, std::pair<bool, short> > PermissionCache;
   void PopulatePathPermissionCache(hdfsFS fs, const std::string& path_str,
       PermissionCache* permissions_cache);
+
+  /// Validates that all collection-typed slots in the given batch are set to NULL.
+  /// See SubplanNode for details on when collection-typed slots are set to NULL.
+  /// TODO: This validation will become obsolete when we can return collection values.
+  /// We will then need a different mechanism to assert the correct behavior of the
+  /// SubplanNode with respect to setting collection-slots to NULL.
+  void ValidateCollectionSlots(RowBatch* batch);
 };
 
 }

@@ -18,25 +18,31 @@ import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.UUID;
 
-import junit.framework.Assert;
-
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
+import org.junit.Assert;
 import org.junit.Test;
 
+import com.cloudera.impala.catalog.ArrayType;
+import com.cloudera.impala.catalog.Catalog;
 import com.cloudera.impala.catalog.CatalogException;
 import com.cloudera.impala.catalog.DataSource;
 import com.cloudera.impala.catalog.DataSourceTable;
 import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.catalog.ScalarType;
+import com.cloudera.impala.catalog.StructField;
+import com.cloudera.impala.catalog.StructType;
 import com.cloudera.impala.catalog.Type;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.FileSystemUtil;
+import com.cloudera.impala.util.MetaStoreUtil;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -130,24 +136,24 @@ public class AnalyzeDDLTest extends AnalyzerTest {
 
     // IF NOT EXISTS properly checks for partition existence
     AnalyzesOk("alter table functional.alltypes add " +
-          "partition(year=2050, month=10)");
+        "partition(year=2050, month=10)");
     AnalysisError("alter table functional.alltypes add " +
-          "partition(year=2010, month=10)",
-          "Partition spec already exists: (year=2010, month=10).");
+        "partition(year=2010, month=10)",
+        "Partition spec already exists: (year=2010, month=10).");
     AnalyzesOk("alter table functional.alltypes add if not exists " +
-          " partition(year=2010, month=10)");
+        " partition(year=2010, month=10)");
     AnalyzesOk("alter table functional.alltypes add if not exists " +
         " partition(year=2010, month=10) location " +
         "'/test-warehouse/alltypes/year=2010/month=10'");
 
     // IF EXISTS properly checks for partition existence
     AnalyzesOk("alter table functional.alltypes drop " +
-          "partition(year=2010, month=10)");
+        "partition(year=2010, month=10)");
     AnalysisError("alter table functional.alltypes drop " +
-          "partition(year=2050, month=10)",
-          "Partition spec does not exist: (year=2050, month=10).");
+        "partition(year=2050, month=10)",
+        "Partition spec does not exist: (year=2050, month=10).");
     AnalyzesOk("alter table functional.alltypes drop if exists " +
-          "partition(year=2050, month=10)");
+        "partition(year=2050, month=10)");
 
     // Caching ops
     AnalyzesOk("alter table functional.alltypes add " +
@@ -293,7 +299,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
 
     AnalysisError(
         "alter table functional.alltypes change column int_col Tinyint_col int",
-        "Column already exists: Tinyint_col");
+        "Column already exists: tinyint_col");
 
     // Invalid column name.
     AnalysisError("alter table functional.alltypes change column int_col `???` int",
@@ -501,6 +507,96 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "Partition spec does not exist: (year=9999, month=1).");
   }
 
+
+  @Test
+  public void TestAlterTableSetAvroProperties() {
+    // Test set tblproperties with avro.schema.url and avro.schema.literal
+    // TODO: Include customized schema files
+
+    for (String propertyType : Lists.newArrayList("tblproperties", "serdeproperties")) {
+      // Valid url with valid schema
+      AnalyzesOk(String.format("alter table functional.alltypes set %s" +
+          "('avro.schema.url'=" +
+          "'hdfs:///test-warehouse/avro_schemas/functional/alltypes.json')",
+          propertyType));
+
+      // Invalid schema URL
+      AnalysisError(String.format("alter table functional.alltypes set %s " +
+          "('avro.schema.url'='')", propertyType),
+          "Invalid avro.schema.url: . Can not create a Path from an empty string");
+      AnalysisError(String.format("alter table functional.alltypes set %s " +
+          "('avro.schema.url'='hdfs://invalid*host/schema.avsc')", propertyType),
+          "Failed to read Avro schema at: hdfs://invalid*host/schema.avsc. " +
+          "Incomplete HDFS URI, no host: hdfs://invalid*host/schema.avsc");
+      AnalysisError(String.format("alter table functional.alltypes set %s" +
+          "('avro.schema.url'='schema.avsc')", propertyType),
+          "Invalid avro.schema.url: schema.avsc. Path does not exist.");
+      AnalysisError(String.format("alter table functional.alltypes set %s " +
+          "('avro.schema.url'='foo://bar/schema.avsc')", propertyType),
+          "Failed to read Avro schema at: foo://bar/schema.avsc. " +
+          "No FileSystem for scheme: foo");
+
+      // Valid schema literal
+      AnalyzesOk(String.format("alter table functional.alltypes set %s" +
+          "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+          "\"fields\": [{\"name\": \"string1\", \"type\": \"string\"}] }')",
+          propertyType));
+
+      // Invalid schema
+      AnalysisError(String.format("alter table functional.alltypes set %s " +
+          "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+          "\"fields\": {\"name\": \"string1\", \"type\": \"string\"}]}')", propertyType),
+          "Error parsing Avro schema for table 'functional.alltypes': " +
+          "org.codehaus.jackson.JsonParseException: Unexpected close marker ']': " +
+          "expected '}'");
+      AnalysisError(String.format("alter table functional.alltypes set %s " +
+          "('avro.schema.literal'='')", propertyType),
+          "Avro schema is null or empty: functional.alltypes");
+      AnalysisError(String.format("alter table functional.alltypes set %s " +
+          "('avro.schema.literal'='{\"name\": \"my_record\"}')", propertyType),
+          "Error parsing Avro schema for table 'functional.alltypes': " +
+          "No type: {\"name\":\"my_record\"}");
+      AnalysisError(String.format("alter table functional.alltypes set %s " +
+          "('avro.schema.literal'='{\"name\":\"my_record\", \"type\": \"record\"}')",
+          propertyType), "Error parsing Avro schema for table 'functional.alltypes': " +
+          "Record has no fields: {\"name\":\"my_record\",\"type\":\"record\"}");
+      AnalysisError(String.format("alter table functional.alltypes set %s " +
+          "('avro.schema.literal'='" +
+          "{\"type\":\"record\", \"fields\":[ {\"name\":\"fff\",\"type\":\"int\"} ] }')",
+          propertyType), "Error parsing Avro schema for table 'functional.alltypes': " +
+          "No name in schema: {\"type\":\"record\",\"fields\":[{\"name\":\"fff\"," +
+          "\"type\":\"int\"}]}");
+
+      // Unsupported types
+      // Union
+      AnalysisError(String.format("alter table functional.alltypes set %s " +
+          "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+          "\"fields\": [{\"name\": \"string1\", \"type\": \"string\"}," +
+          "{\"name\": \"union1\", \"type\": [\"float\", \"boolean\"]}]}')",
+          propertyType), "Unsupported type 'union' of column 'union1'");
+
+      // Check avro.schema.url and avro.schema.literal evaluation order,
+      // skip checking url when literal is provided.
+      AnalysisError(String.format("alter table functional.alltypes set %s " +
+          "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+          "\"fields\": {\"name\": \"string1\", \"type\": \"string\"}]}', " +
+          "'avro.schema.url'='')", propertyType),
+          "Error parsing Avro schema for table 'functional.alltypes': " +
+          "org.codehaus.jackson.JsonParseException: Unexpected close marker ']': " +
+          "expected '}'");
+      // Url is invalid but ignored because literal is provided.
+      AnalyzesOk(String.format("alter table functional.alltypes set %s " +
+          "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+          "\"fields\": [{\"name\": \"string1\", \"type\": \"string\"}] }', " +
+          "'avro.schema.url'='')", propertyType));
+      // Even though url is valid, literal has higher priority.
+      AnalysisError(String.format("alter table functional.alltypes set %s " +
+          "('avro.schema.literal'='', 'avro.schema.url'=" +
+          "'hdfs:///test-warehouse/avro_schemas/functional/alltypes.json')",
+          propertyType), "Avro schema is null or empty: functional.alltypes");
+    }
+  }
+
   @Test
   public void TestAlterTableRename() throws AnalysisException {
     AnalyzesOk("alter table functional.alltypes rename to new_alltypes");
@@ -534,6 +630,22 @@ public class AnalyzeDDLTest extends AnalyzerTest {
 
     // It should be okay to rename a table produced by a data source.
     AnalyzesOk("alter table functional.alltypes_datasource rename to new_datasrc_tbl");
+  }
+
+  @Test
+  public void TestAlterTableRecoverPartitions() throws CatalogException {
+    AnalyzesOk("alter table functional.alltypes recover partitions");
+    AnalysisError("alter table baddb.alltypes recover partitions",
+        "Database does not exist: baddb");
+    AnalysisError("alter table functional.badtbl recover partitions",
+        "Table does not exist: functional.badtbl");
+    AnalysisError("alter table functional.alltypesnopart recover partitions",
+        "Table is not partitioned: functional.alltypesnopart");
+    AnalysisError("alter table functional.view_view recover partitions",
+        "ALTER TABLE not allowed on a view: functional.view_view");
+    AnalysisError("alter table functional_hbase.alltypes recover partitions",
+        "ALTER TABLE RECOVER PARTITIONS must target an HDFS table: " +
+        "functional_hbase.alltypes");
   }
 
   @Test
@@ -657,10 +769,10 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     // Mismatched column name (table was created by Hive).
     AnalysisError("compute stats functional_avro_snap.schema_resolution_test",
         "Cannot COMPUTE STATS on Avro table 'schema_resolution_test' because its " +
-            "column definitions do not match those in the Avro schema.\nDefinition of " +
-            "column 'col1' of type 'string' does not match the Avro-schema column " +
-            "'boolean1' of type 'BOOLEAN' at position '0'.\nPlease re-create the table " +
-            "with column definitions, e.g., using the result of 'SHOW CREATE TABLE'");
+        "column definitions do not match those in the Avro schema.\nDefinition of " +
+        "column 'col1' of type 'string' does not match the Avro-schema column " +
+        "'boolean1' of type 'BOOLEAN' at position '0'.\nPlease re-create the table " +
+        "with column definitions, e.g., using the result of 'SHOW CREATE TABLE'");
   }
 
   @Test
@@ -723,6 +835,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
   @Test
   public void TestDrop() throws AnalysisException {
     AnalyzesOk("drop database functional");
+    AnalyzesOk("drop database functional cascade");
+    AnalyzesOk("drop database functional restrict");
     AnalyzesOk("drop table functional.alltypes");
     AnalyzesOk("drop view functional.alltypes_view");
 
@@ -730,12 +844,20 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     // an analysis error should be thrown
     AnalysisError("drop database db_does_not_exist",
         "Database does not exist: db_does_not_exist");
+    AnalysisError("drop database db_does_not_exist cascade",
+        "Database does not exist: db_does_not_exist");
+    AnalysisError("drop database db_does_not_exist restrict",
+        "Database does not exist: db_does_not_exist");
     AnalysisError("drop table db_does_not_exist.alltypes",
         "Database does not exist: db_does_not_exist");
     AnalysisError("drop view db_does_not_exist.alltypes_view",
         "Database does not exist: db_does_not_exist");
     // Invalid name reports non-existence instead of invalidity.
     AnalysisError("drop database `???`",
+        "Database does not exist: ???");
+    AnalysisError("drop database `???` cascade",
+        "Database does not exist: ???");
+    AnalysisError("drop database `???` restrict",
         "Database does not exist: ???");
     AnalysisError("drop table functional.`%^&`",
         "Table does not exist: functional.%^&");
@@ -751,6 +873,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
 
     // No error is thrown if the user specifies IF EXISTS
     AnalyzesOk("drop database if exists db_does_not_exist");
+    AnalyzesOk("drop database if exists db_does_not_exist cascade");
+    AnalyzesOk("drop database if exists db_does_not_exist restrict");
 
     // No error is thrown if the database does not exist
     AnalyzesOk("drop table if exists db_does_not_exist.alltypes");
@@ -897,21 +1021,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalysisError("create table if not exists functional.zipcode_incomes like parquet "
         + "'/test-warehouse/schemas/malformed_decimal_tiny.parquet'",
         "Unsupported parquet type FIXED_LEN_BYTE_ARRAY for field c1");
-
-    // this has structures, maps, and arrays
-    AnalysisError("create table table_DNE like parquet "
-        + "'/test-warehouse/schemas/unsupported.parquet'",
-        "Unsupported parquet type for field strct");
-    AnalysisError("create table table_DNE like parquet "
-        + "'/test-warehouse/schemas/map.parquet'",
-        "Unsupported parquet type for field mp");
-    AnalysisError("create table table_DNE like parquet "
-        + "'/test-warehouse/schemas/array.parquet'",
-        "Unsupported parquet type for field lst");
-    AnalysisError("create table table_DNE like parquet "
-        + "'/test-warehouse/schemas/struct.parquet'",
-        "Unsupported parquet type for field strct");
- }
+  }
 
   @Test
   public void TestCreateTableAsSelect() throws AnalysisException {
@@ -967,6 +1077,29 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "functional.alltypes as t1 right join (select 1 as int_col from " +
         "functional.alltypestiny as t1) as t2 on t2.int_col = t1.int_col) " +
         "select * from with_1 limit 10");
+
+    // CTAS with a correlated inline view.
+    AnalyzesOk("create table test as select id, item " +
+        "from functional.allcomplextypes b, (select item from b.int_array_col) v1");
+    // Correlated inline view in WITH clause.
+    AnalyzesOk("create table test as " +
+        "with w as (select id, item from functional.allcomplextypes b, " +
+        "(select item from b.int_array_col) v1) select * from w");
+    // CTAS with illegal correlated inline views.
+    AnalysisError("create table test as select id, item " +
+        "from functional.allcomplextypes b, " +
+        "(select item from b.int_array_col, functional.alltypes) v1",
+        "Nested query is illegal because it contains a table reference " +
+        "'b.int_array_col' correlated with an outer block as well as an " +
+        "uncorrelated one 'functional.alltypes':\n" +
+        "SELECT item FROM b.int_array_col, functional.alltypes");
+    AnalysisError("create table test as " +
+        "with w as (select id, item from functional.allcomplextypes b, " +
+        "(select item from b.int_array_col, functional.alltypes) v1) select * from w",
+        "Nested query is illegal because it contains a table reference " +
+        "'b.int_array_col' correlated with an outer block as well as an " +
+        "uncorrelated one 'functional.alltypes':\n" +
+        "SELECT item FROM b.int_array_col, functional.alltypes");
   }
 
   @Test
@@ -1086,10 +1219,30 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "ESCAPED BY values and LINE/FIELD terminators must be specified as a single " +
         "character or as a decimal value in the range [-128:127]: ||");
 
+    // IMPALA-2251: it should not be possible to create text tables with the same
+    // delimiter character used for multiple purposes.
+    AnalysisError("create table functional.broken_text_table (c int) " +
+        "row format delimited fields terminated by '\001' lines terminated by '\001'",
+        "Field delimiter and line delimiter have same value: byte 1");
+    AnalysisError("create table functional.broken_text_table (c int) " +
+         "row format delimited lines terminated by '\001'",
+        "Field delimiter and line delimiter have same value: byte 1");
+    AnalysisError("create table functional.broken_text_table (c int) " +
+        "row format delimited fields terminated by '\012'",
+        "Field delimiter and line delimiter have same value: byte 10");
+    AnalyzesOk("create table functional.broken_text_table (c int) " +
+        "row format delimited escaped by '\001'",
+        "Field delimiter and escape character have same value: byte 1. " +
+        "Escape character will be ignored");
+    AnalyzesOk("create table functional.broken_text_table (c int) " +
+        "row format delimited escaped by 'x' lines terminated by 'x'",
+        "Line delimiter and escape character have same value: byte 120. " +
+        "Escape character will be ignored");
+
     AnalysisError("create table db_does_not_exist.new_table (i int)",
         "Database does not exist: db_does_not_exist");
     AnalysisError("create table new_table (i int, I string)",
-        "Duplicate column name: I");
+        "Duplicate column name: i");
     AnalysisError("create table new_table (c1 double, col2 int, c1 double, c4 string)",
         "Duplicate column name: c1");
     AnalysisError("create table new_table (i int, s string) PARTITIONED BY (i int)",
@@ -1125,6 +1278,18 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "Invalid column/field name: ???");
     AnalysisError("create table new_table (i int) PARTITIONED BY (`^&*` int)",
         "Invalid column/field name: ^&*");
+    // Test HMS constraint on type name length.
+    AnalyzesOk(String.format("create table t (i %s)",
+        genTypeSql(MetaStoreUtil.MAX_TYPE_NAME_LENGTH)));
+    AnalysisError(String.format("create table t (i %s)",
+        genTypeSql(MetaStoreUtil.MAX_TYPE_NAME_LENGTH + 1)),
+        "Type of column 'i' exceeds maximum type length of 4000 characters:");
+    // Test HMS constraint on comment length.
+    AnalyzesOk(String.format("create table t (i int comment '%s')",
+        StringUtils.repeat("c", MetaStoreUtil.CREATE_MAX_COMMENT_LENGTH)));
+    AnalysisError(String.format("create table t (i int comment '%s')",
+        StringUtils.repeat("c", MetaStoreUtil.CREATE_MAX_COMMENT_LENGTH + 1)),
+        "Comment of column 'i' exceeds maximum length of 256 characters:");
 
     // Valid URI values.
     AnalyzesOk("create table tbl (i int) location '/test-warehouse/new_table'");
@@ -1177,6 +1342,39 @@ public class AnalyzeDDLTest extends AnalyzerTest {
           "Tables produced by an external data source do not support the column type: " +
           type.name());
     }
+  }
+
+  /**
+   * Generates a valid type string with exactly the given number of characters.
+   * The type is a struct with at least two fields.
+   * The given length must be at least "struct<s:int,c:int>".length() == 19.
+   */
+  private String genTypeSql(int length) {
+    Preconditions.checkState(length >= 19);
+    StringBuilder result = new StringBuilder();
+    result.append("struct<s:int");
+    // The middle fields always have a fixed length.
+    int midFieldLen = ",f000:int".length();
+    // The last field has a variable length, but this is the minimum.
+    int lastFieldMinLen = ",f:int".length();
+    int fieldIdx = 0;
+    while (result.length() < length - midFieldLen - lastFieldMinLen) {
+      String fieldStr = String.format(",f%03d:int", fieldIdx);
+      result.append(fieldStr);
+      ++fieldIdx;
+    }
+    Preconditions.checkState(result.length() == length - 1 ||
+        result.length() < length - lastFieldMinLen);
+    // Generate last field with a variable length.
+    if (result.length() < length - 1) {
+      int fieldNameLen = length - result.length() - ",:int".length() - 1;
+      Preconditions.checkState(fieldNameLen > 0);
+      String fieldStr = String.format(",%s:int", StringUtils.repeat("f", fieldNameLen));
+      result.append(fieldStr);
+    }
+    result.append(">");
+    Preconditions.checkState(result.length() == length);
+    return result.toString();
   }
 
   @Test
@@ -1372,10 +1570,14 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "double_col double, date_string_col string, string_col string, " +
         "timestamp_col timestamp) with serdeproperties ('avro.schema.url'='%s')" +
         "stored as avro", alltypesSchemaLoc),
-        "Ignoring column definitions in favor of Avro schema due to a mismatched " +
-        "column name at position 5.\n" +
-        "Column definition: bad_int_col INT\n" +
-        "Avro schema column: int_col INT");
+        "Resolved the following name and/or type inconsistencies between the column " +
+        "definitions and the Avro schema.\n" +
+        "Column definition at position 4:  bad_int_col INT\n" +
+        "Avro schema column at position 4: int_col INT\n" +
+        "Resolution at position 4: int_col INT\n" +
+        "Column definition at position 10:  timestamp_col TIMESTAMP\n" +
+        "Avro schema column at position 10: timestamp_col STRING\n" +
+        "Resolution at position 10: timestamp_col STRING");
     // Mismatched type.
     AnalyzesOk(String.format(
         "create table foo_avro (id int, bool_col boolean, tinyint_col int, " +
@@ -1383,33 +1585,43 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "double_col bigint, date_string_col string, string_col string, " +
         "timestamp_col timestamp) stored as avro tblproperties ('avro.schema.url'='%s')",
         alltypesSchemaLoc),
-        "Ignoring column definitions in favor of Avro schema due to a mismatched " +
-        "column type at position 8.\n" +
-        "Column definition: double_col BIGINT\n" +
-        "Avro schema column: double_col DOUBLE");
+        "Resolved the following name and/or type inconsistencies between the column " +
+        "definitions and the Avro schema.\n" +
+        "Column definition at position 7:  double_col BIGINT\n" +
+        "Avro schema column at position 7: double_col DOUBLE\n" +
+        "Resolution at position 7: double_col DOUBLE\n" +
+        "Column definition at position 10:  timestamp_col TIMESTAMP\n" +
+        "Avro schema column at position 10: timestamp_col STRING\n" +
+        "Resolution at position 10: timestamp_col STRING");
 
-    // No Avro schema specified for Avro format table.
-    AnalysisError("create table foo_avro (i int) stored as avro",
-        "No Avro schema provided in SERDEPROPERTIES or TBLPROPERTIES for table: " +
-        "default.foo_avro");
-    AnalysisError("create table foo_avro (i int) stored as avro tblproperties ('a'='b')",
-        "No Avro schema provided in SERDEPROPERTIES or TBLPROPERTIES for table: " +
-        "default.foo_avro");
+    // Avro schema is inferred from column definitions.
+    AnalyzesOk("create table foo_avro (c1 tinyint, c2 smallint, c3 int, c4 bigint, " +
+        "c5 float, c6 double, c7 timestamp, c8 string, c9 char(10), c10 varchar(20)," +
+        "c11 decimal(10, 5), c12 struct<f1:int,f2:string>, c13 array<int>," +
+        "c14 map<string,string>) stored as avro");
+    AnalyzesOk("create table foo_avro (c1 tinyint, c2 smallint, c3 int, c4 bigint, " +
+        "c5 float, c6 double, c7 timestamp, c8 string, c9 char(10), c10 varchar(20)," +
+        "c11 decimal(10, 5), c12 struct<f1:int,f2:string>, c13 array<int>," +
+        "c14 map<string,string>) partitioned by (year int, month int) stored as avro");
+    // Neither Avro schema nor column definitions.
     AnalysisError("create table foo_avro stored as avro tblproperties ('a'='b')",
-        "No Avro schema provided in SERDEPROPERTIES or TBLPROPERTIES for table: "+
-        "default.foo_avro");
+        "An Avro table requires column definitions or an Avro schema.");
 
     // Invalid schema URL
+    AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
+        "('avro.schema.url'='')",
+        "Invalid avro.schema.url: . Can not create a Path from an empty string");
     AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
         "('avro.schema.url'='schema.avsc')",
         "Invalid avro.schema.url: schema.avsc. Path does not exist.");
     AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
         "('avro.schema.url'='hdfs://invalid*host/schema.avsc')",
-        "Invalid avro.schema.url: hdfs://invalid*host/schema.avsc. " +
+        "Failed to read Avro schema at: hdfs://invalid*host/schema.avsc. " +
         "Incomplete HDFS URI, no host: hdfs://invalid*host/schema.avsc");
     AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
         "('avro.schema.url'='foo://bar/schema.avsc')",
-        "Invalid avro.schema.url: foo://bar/schema.avsc. No FileSystem for scheme: foo");
+        "Failed to read Avro schema at: foo://bar/schema.avsc. " +
+        "No FileSystem for scheme: foo");
 
     // Decimal parsing
     AnalyzesOk("create table foo_avro (i int) stored as avro tblproperties " +
@@ -1450,28 +1662,21 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "org.codehaus.jackson.JsonParseException: Unexpected close marker ']': "+
         "expected '}'");
 
-    // Unsupported types
-    // Array
-    AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
+    // Map/Array types in Avro schema.
+    AnalyzesOk("create table foo_avro (i int) stored as avro tblproperties " +
         "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
         "\"fields\": [{\"name\": \"string1\", \"type\": \"string\"}," +
-        "{\"name\": \"list1\", \"type\": {\"type\":\"array\", \"items\": \"int\"}}]}')",
-        "Error parsing Avro schema for table 'default.foo_avro': " +
-        "Unsupported type 'array' of column 'list1'");
-    // Map
-    AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
+        "{\"name\": \"list1\", \"type\": {\"type\":\"array\", \"items\": \"int\"}}]}')");
+    AnalyzesOk("create table foo_avro (i int) stored as avro tblproperties " +
         "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
         "\"fields\": [{\"name\": \"string1\", \"type\": \"string\"}," +
-        "{\"name\": \"map1\", \"type\": {\"type\":\"map\", \"values\": \"int\"}}]}')",
-        "Error parsing Avro schema for table 'default.foo_avro': " +
-        "Unsupported type 'map' of column 'map1'");
+        "{\"name\": \"map1\", \"type\": {\"type\":\"map\", \"values\": \"int\"}}]}')");
 
-    // Union
+    // Union is not supported
     AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
         "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
         "\"fields\": [{\"name\": \"string1\", \"type\": \"string\"}," +
         "{\"name\": \"union1\", \"type\": [\"float\", \"boolean\"]}]}')",
-        "Error parsing Avro schema for table 'default.foo_avro': " +
         "Unsupported type 'union' of column 'union1'");
 
     // TODO: Add COLLECTION ITEMS TERMINATED BY and MAP KEYS TERMINATED BY clauses.
@@ -1894,7 +2099,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalysisError("create aggregate function "
         + "foo(int, int, int, int, int, int, int , int, int) "
         + "RETURNS int" + loc,
-      "UDAs with more than 8 arguments are not yet supported.");
+        "UDAs with more than 8 arguments are not yet supported.");
 
     // Check that CHAR and VARCHAR are not valid UDA argument or return types
     String symbols =
@@ -1927,34 +2132,18 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "MERGE_FN='_Z8AggMergePN10impala_udf15FunctionContextERKNS_6IntValEPS2_'");
 
     // Try with intermediate type
-    // TODO: this is currently not supported. Remove these tests and re-enable
-    // the commented out ones when we do.
     AnalyzesOk("create aggregate function foo(int) RETURNS int " +
         "INTERMEDIATE int" + loc + "UPDATE_FN='AggUpdate'");
+    AnalyzesOk("create aggregate function foo(int) RETURNS int " +
+        "INTERMEDIATE CHAR(10)" + loc + "UPDATE_FN='AggIntermediateUpdate'");
     AnalysisError("create aggregate function foo(int) RETURNS int " +
-        "INTERMEDIATE double" + loc + "UPDATE_FN='AggUpdate'",
-        "UDAs with an intermediate type, DOUBLE, that is different from the " +
-        "return type, INT, are currently not supported.");
-    AnalysisError("create aggregate function foo(int) RETURNS int " +
-        "INTERMEDIATE char(10)" + loc + "UPDATE_FN='AggUpdate'",
-        "UDAs with an intermediate type, CHAR(10), that is different from the " +
-        "return type, INT, are currently not supported.");
-    AnalysisError("create aggregate function foo(int) RETURNS int " +
-        "INTERMEDIATE decimal(10)" + loc + "UPDATE_FN='AggUpdate'",
-        "UDAs with an intermediate type, DECIMAL(10,0), that is different from the " +
-        "return type, INT, are currently not supported.");
-    AnalysisError("create aggregate function foo(int) RETURNS int " +
-        "INTERMEDIATE decimal(40)" + loc + "UPDATE_FN='AggUpdate'",
-        "Decimal precision must be <= 38: 40");
-    //AnalyzesOk("create aggregate function foo(int) RETURNS int " +
-    //    "INTERMEDIATE CHAR(10)" + loc + "UPDATE_FN='AggUpdate'");
-    //AnalysisError("create aggregate function foo(int) RETURNS int " +
-    //    "INTERMEDIATE CHAR(10)" + loc + "UPDATE_FN='Agg' INIT_FN='AggInit' " +
-    //    "MERGE_FN='AggMerge'" ,
-    //    "Finalize() is required for this UDA.");
-    //AnalyzesOk("create aggregate function foo(int) RETURNS int " +
-    //    "INTERMEDIATE CHAR(10)" + loc + "UPDATE_FN='Agg' INIT_FN='AggInit' " +
-    //    "MERGE_FN='AggMerge' FINALIZE_FN='AggFinalize'");
+        "INTERMEDIATE CHAR(10)" + loc + "UPDATE_FN='AggIntermediate' " +
+        "INIT_FN='AggIntermediateInit' MERGE_FN='AggIntermediateMerge'" ,
+        "Finalize() is required for this UDA.");
+    AnalyzesOk("create aggregate function foo(int) RETURNS int " +
+        "INTERMEDIATE CHAR(10)" + loc + "UPDATE_FN='AggIntermediate' " +
+        "INIT_FN='AggIntermediateInit' MERGE_FN='AggIntermediateMerge' " +
+        "FINALIZE_FN='AggIntermediateFinalize'");
 
     // Udf only arguments must not be set.
     AnalysisError("create aggregate function foo(int) RETURNS int" + loc + "SYMBOL='Bad'",
@@ -1982,7 +2171,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
 
     // Test missing .ll file. TODO: reenable when we can run IR UDAs
     AnalysisError("create aggregate function foo(int) RETURNS int LOCATION " +
-            "'/foo.ll' UPDATE_FN='Fn'", "IR UDAs are not yet supported.");
+        "'/foo.ll' UPDATE_FN='Fn'", "IR UDAs are not yet supported.");
     //AnalysisError("create aggregate function foo(int) RETURNS int LOCATION " +
     //    "'/foo.ll' UPDATE_FN='Fn'", "Could not load binary: /foo.ll");
     //AnalysisError("create aggregate function foo(int) RETURNS int LOCATION " +
@@ -2039,7 +2228,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "Could not find function BadFn(STRING) returns STRING in: " + hdfsLoc);
     AnalysisError("create aggregate function foo(string, double) RETURNS string" + loc +
         "UPDATE_FN='Agg2Update' INIT_FN='AggInit' MERGE_FN='AggMerge' "+
-            "FINALIZE_FN='not there'",
+        "FINALIZE_FN='not there'",
         "Could not find function not there(STRING) in: " + hdfsLoc);
   }
 
@@ -2065,6 +2254,16 @@ public class AnalyzeDDLTest extends AnalyzerTest {
             "CREATE TABLE t (i MAP<%s, %s>)", typeDefStr, typeDefStr));
       }
     }
+  }
+
+  /**
+   * Wraps the given typeDef in a CREATE TABLE stmt and runs AnalyzesOk().
+   * Returns the analyzed type.
+   */
+  private Type TypeDefAnalyzeOk(String typeDef) {
+    ParseNode stmt = AnalyzesOk(String.format("CREATE TABLE t (i %s)", typeDef));
+    CreateTableStmt createTableStmt = (CreateTableStmt) stmt;
+    return createTableStmt.getColumnDefs().get(0).getType();
   }
 
   /**
@@ -2122,6 +2321,34 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     // Invalid struct-field name.
     TypeDefAnalysisError("STRUCT<`???`: int>",
         "Invalid struct field name: ???");
+
+    // Test maximum nesting depth with all complex types.
+    for (String prefix: Arrays.asList("struct<f1:int,f2:", "array<", "map<string,")) {
+      String middle = "int";
+      String suffix = ">";
+      // Test type with exactly the max nesting depth.
+      String maxTypeDef = genTypeSql(Type.MAX_NESTING_DEPTH, prefix, middle, suffix);
+      Type maxType = TypeDefAnalyzeOk(maxTypeDef);
+      Assert.assertFalse(maxType.exceedsMaxNestingDepth());
+      // Test type with exactly one level above the max nesting depth.
+      String oneAboveMaxDef =
+          genTypeSql(Type.MAX_NESTING_DEPTH + 1, prefix, middle, suffix);
+      TypeDefAnalysisError(oneAboveMaxDef, "Type exceeds the maximum nesting depth");
+      // Test type with very deep nesting to test we do not hit a stack overflow.
+      String veryDeepDef =
+          genTypeSql(Type.MAX_NESTING_DEPTH * 100, prefix, middle, suffix);
+      TypeDefAnalysisError(veryDeepDef, "Type exceeds the maximum nesting depth");
+    }
+  }
+
+  /**
+   * Generates a string with the following pattern:
+   * <prefix>*<middle><suffix>*
+   * with exactly depth-1 repetitions of prefix and suffix
+   */
+  private String genTypeSql(int depth, String prefix, String middle, String suffix) {
+    return StringUtils.repeat(prefix, depth - 1) +
+        middle + StringUtils.repeat(suffix, depth - 1);
   }
 
   @Test
@@ -2140,9 +2367,49 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalyzesOk("describe formatted functional.alltypes");
     AnalyzesOk("describe functional.alltypes");
     AnalysisError("describe formatted nodb.alltypes",
-        "Database does not exist: nodb");
+        "Could not resolve path: 'nodb.alltypes'");
     AnalysisError("describe functional.notbl",
-        "Table does not exist: functional.notbl");
+        "Could not resolve path: 'functional.notbl'");
+
+    // Complex typed fields.
+    AnalyzesOk("describe functional_parquet.allcomplextypes.int_array_col");
+    AnalyzesOk("describe functional_parquet.allcomplextypes.map_array_col");
+    AnalyzesOk("describe functional_parquet.allcomplextypes.map_map_col");
+    AnalyzesOk("describe functional_parquet.allcomplextypes.map_map_col.value");
+    AnalyzesOk("describe functional_parquet.allcomplextypes.complex_struct_col");
+    AnalyzesOk("describe functional_parquet.allcomplextypes.complex_struct_col.f3");
+    AnalysisError("describe formatted functional_parquet.allcomplextypes.int_array_col",
+        "DESCRIBE FORMATTED must refer to a table");
+    AnalysisError("describe functional_parquet.allcomplextypes.id",
+        "Cannot describe path 'functional_parquet.allcomplextypes.id' targeting " +
+        "scalar type: INT");
+    AnalysisError("describe functional_parquet.allcomplextypes.nonexistent",
+        "Could not resolve path: 'functional_parquet.allcomplextypes.nonexistent'");
+
+    // Handling of ambiguous paths.
+    addTestDb("ambig");
+    addTestTable("create table ambig.ambig (ambig struct<ambig:array<int>>)");
+    // Single element path can only be resolved as <table>.
+    DescribeStmt describe = (DescribeStmt)AnalyzesOk("describe ambig",
+        createAnalyzer("ambig"));
+    Assert.assertEquals("ambig", describe.toThrift().db);
+    Assert.assertEquals("ambig", describe.toThrift().table_name, "ambig");
+    StructType colStructType = new StructType(Lists.newArrayList(
+        new StructField("ambig", new ArrayType(Type.INT))));
+    StructType tableStructType = new StructType(Lists.newArrayList(
+        new StructField("ambig", colStructType)));
+    Assert.assertEquals(tableStructType.toSql(),
+        Type.fromThrift(describe.toThrift().result_struct).toSql());
+
+    // Path could be resolved as either <db>.<table> or <table>.<complex field>
+    AnalysisError("describe ambig.ambig", createAnalyzer("ambig"),
+        "Path is ambiguous: 'ambig.ambig'");
+    // Path could be resolved as either <db>.<table>.<field> or <table>.<field>.<field>
+    AnalysisError("describe ambig.ambig.ambig", createAnalyzer("ambig"),
+        "Path is ambiguous: 'ambig.ambig.ambig'");
+    // 4 element path can only be resolved to nested array.
+    AnalyzesOk("describe ambig.ambig.ambig.ambig", createAnalyzer("ambig"));
+
   }
 
   @Test

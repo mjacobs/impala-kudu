@@ -30,6 +30,7 @@
 #include "exprs/expr.h"
 #include "exprs/expr-context.h"
 #include "exprs/aggregate-functions.h"
+#include "exprs/bit-byte-functions.h"
 #include "exprs/case-expr.h"
 #include "exprs/cast-functions.h"
 #include "exprs/compound-predicates.h"
@@ -87,8 +88,8 @@ FunctionContext* Expr::RegisterFunctionContext(ExprContext* ctx, RuntimeState* s
   for (int i = 0; i < children_.size(); ++i) {
     arg_types.push_back(AnyValUtil::ColumnTypeToTypeDesc(children_[i]->type_));
   }
-  context_index_ = ctx->Register(state, return_type, arg_types, varargs_buffer_size);
-  return ctx->fn_context(context_index_);
+  fn_context_index_ = ctx->Register(state, return_type, arg_types, varargs_buffer_size);
+  return ctx->fn_context(fn_context_index_);
 }
 
 Expr::Expr(const ColumnType& type, bool is_slotref)
@@ -96,16 +97,16 @@ Expr::Expr(const ColumnType& type, bool is_slotref)
       is_slotref_(is_slotref),
       type_(type),
       output_scale_(-1),
-      context_index_(-1),
+      fn_context_index_(-1),
       ir_compute_fn_(NULL) {
 }
 
 Expr::Expr(const TExprNode& node, bool is_slotref)
     : cache_entry_(NULL),
       is_slotref_(is_slotref),
-      type_(ColumnType(node.type)),
+      type_(ColumnType::FromThrift(node.type)),
       output_scale_(-1),
-      context_index_(-1),
+      fn_context_index_(-1),
       ir_compute_fn_(NULL) {
   if (node.__isset.fn) fn_ = node.fn;
 }
@@ -261,8 +262,11 @@ struct MemLayoutData {
   int expr_idx;
   int byte_size;
   bool variable_length;
+  int alignment;
 
   // TODO: sort by type as well?  Any reason to do this?
+  // TODO: would sorting in reverse order of size be faster due to better packing?
+  // TODO: why put var-len at end?
   bool operator<(const MemLayoutData& rhs) const {
     // variable_len go at end
     if (this->variable_length && !rhs.variable_length) return false;
@@ -278,51 +282,56 @@ int Expr::ComputeResultsLayout(const vector<Expr*>& exprs, vector<int>* offsets,
     return 0;
   }
 
+  // Don't align more than word (8-byte) size. There's no performance gain beyond 8-byte
+  // alignment, and there is a performance gain to keeping the results buffer small. This
+  // is consistent with what compilers do.
+  int MAX_ALIGNMENT = sizeof(int64_t);
+
   vector<MemLayoutData> data;
   data.resize(exprs.size());
 
   // Collect all the byte sizes and sort them
   for (int i = 0; i < exprs.size(); ++i) {
+    DCHECK(!exprs[i]->type().IsComplexType()) << "NYI";
     data[i].expr_idx = i;
-    if (exprs[i]->type().IsVarLen()) {
-      data[i].byte_size = 16;
-      data[i].variable_length = true;
+    data[i].byte_size = exprs[i]->type().GetSlotSize();
+    DCHECK_GT(data[i].byte_size, 0);
+    data[i].variable_length = exprs[i]->type().IsVarLenStringType();
+
+    bool fixed_len_char = exprs[i]->type().type == TYPE_CHAR && !data[i].variable_length;
+
+    // Compute the alignment of this value. Values should be self-aligned for optimal
+    // memory access speed, up to the max alignment (e.g., if this value is an int32_t,
+    // its offset in the buffer should be divisible by sizeof(int32_t)).
+    // TODO: is self-alignment really necessary for perf?
+    if (!fixed_len_char) {
+      data[i].alignment = min(data[i].byte_size, MAX_ALIGNMENT);
     } else {
-      data[i].byte_size = exprs[i]->type().GetByteSize();
-      data[i].variable_length = false;
+      // Fixed-len chars are aligned to a one-byte boundary, as if they were char[],
+      // leaving no padding between them and the previous value.
+      data[i].alignment = 1;
     }
-    DCHECK_NE(data[i].byte_size, 0);
   }
 
   sort(data.begin(), data.end());
 
   // Walk the types and store in a packed aligned layout
-  int max_alignment = sizeof(int64_t);
-  int current_alignment = data[0].byte_size;
   int byte_offset = 0;
 
   offsets->resize(exprs.size());
-  offsets->clear();
   *var_result_begin = -1;
 
   for (int i = 0; i < data.size(); ++i) {
-    DCHECK_GE(data[i].byte_size, current_alignment);
-    // Don't align more than word (8-byte) size.  This is consistent with what compilers
-    // do.
-    if (exprs[data[i].expr_idx]->type().type == TYPE_CHAR &&
-        !exprs[data[i].expr_idx]->type().IsVarLen()) {
-      // CHARs are not padded, to be consistent with complier layouts
-      // aligns the next value on an 8 byte boundary
-      current_alignment = (data[i].byte_size + current_alignment) % max_alignment;
-    } else if (data[i].byte_size != current_alignment &&
-               current_alignment != max_alignment) {
-      byte_offset += data[i].byte_size - current_alignment;
-      current_alignment = min(data[i].byte_size, max_alignment);
-    }
+
+    // Increase byte_offset so data[i] is at the right alignment (i.e. add padding between
+    // this value and the previous).
+    byte_offset = BitUtil::RoundUp(byte_offset, data[i].alignment);
+
     (*offsets)[data[i].expr_idx] = byte_offset;
     if (data[i].variable_length && *var_result_begin == -1) {
       *var_result_begin = byte_offset;
     }
+    DCHECK(!(i == 0 && byte_offset > 0)) << "first value should be at start of layout";
     byte_offset += data[i].byte_size;
   }
 
@@ -374,10 +383,15 @@ Status Expr::Open(RuntimeState* state, ExprContext* context,
   return Status::OK();
 }
 
-Status Expr::Clone(const vector<ExprContext*>& ctxs, RuntimeState* state,
-                   vector<ExprContext*>* new_ctxs) {
+Status Expr::CloneIfNotExists(const vector<ExprContext*>& ctxs, RuntimeState* state,
+    vector<ExprContext*>* new_ctxs) {
   DCHECK(new_ctxs != NULL);
-  DCHECK(new_ctxs->empty());
+  if (!new_ctxs->empty()) {
+    // 'ctxs' was already cloned into '*new_ctxs', nothing to do.
+    DCHECK_EQ(new_ctxs->size(), ctxs.size());
+    for (int i = 0; i < new_ctxs->size(); ++i) DCHECK((*new_ctxs)[i]->is_clone_);
+    return Status::OK();
+  }
   new_ctxs->resize(ctxs.size());
   for (int i = 0; i < ctxs.size(); ++i) {
     RETURN_IF_ERROR(ctxs[i]->Clone(state, &(*new_ctxs)[i]));
@@ -475,6 +489,7 @@ void Expr::InitBuiltinsDummy() {
   // from that class in.
   // TODO: is there a better way to do this?
   AggregateFunctions::InitNull(NULL, NULL);
+  BitByteFunctions::CountSet(NULL, TinyIntVal::null());
   CastFunctions::CastToBooleanVal(NULL, TinyIntVal::null());
   CompoundPredicate::Not(NULL, BooleanVal::null());
   ConditionalFunctions::NullIfZero(NULL, TinyIntVal::null());
@@ -668,6 +683,10 @@ StringVal Expr::GetStringVal(ExprContext* context, TupleRow* row) {
   DCHECK(false) << DebugString();
   return StringVal::null();
 }
+ArrayVal Expr::GetArrayVal(ExprContext* context, TupleRow* row) {
+  DCHECK(false) << DebugString();
+  return ArrayVal::null();
+}
 TimestampVal Expr::GetTimestampVal(ExprContext* context, TupleRow* row) {
   DCHECK(false) << DebugString();
   return TimestampVal::null();
@@ -675,6 +694,14 @@ TimestampVal Expr::GetTimestampVal(ExprContext* context, TupleRow* row) {
 DecimalVal Expr::GetDecimalVal(ExprContext* context, TupleRow* row) {
   DCHECK(false) << DebugString();
   return DecimalVal::null();
+}
+
+Status Expr::GetFnContextError(ExprContext* ctx) {
+  if (fn_context_index_ != -1) {
+    FunctionContext* fn_ctx = ctx->fn_context(fn_context_index_);
+    if (fn_ctx->has_error()) return Status(fn_ctx->error_msg());
+  }
+  return Status::OK();
 }
 
 }

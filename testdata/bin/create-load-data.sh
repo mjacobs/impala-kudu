@@ -92,13 +92,11 @@ function load-custom-schemas {
   hadoop fs -rm -r -f ${SCHEMA_DEST_DIR}
   hadoop fs -mkdir ${SCHEMA_DEST_DIR}
   hadoop fs -put $SCHEMA_SRC_DIR/zipcode_incomes.parquet ${SCHEMA_DEST_DIR}/
-  hadoop fs -put $SCHEMA_SRC_DIR/unsupported.parquet ${SCHEMA_DEST_DIR}/
-  hadoop fs -put $SCHEMA_SRC_DIR/map.parquet ${SCHEMA_DEST_DIR}/
-  hadoop fs -put $SCHEMA_SRC_DIR/array.parquet ${SCHEMA_DEST_DIR}/
-  hadoop fs -put $SCHEMA_SRC_DIR/struct.parquet ${SCHEMA_DEST_DIR}/
   hadoop fs -put $SCHEMA_SRC_DIR/alltypestiny.parquet ${SCHEMA_DEST_DIR}/
   hadoop fs -put $SCHEMA_SRC_DIR/malformed_decimal_tiny.parquet ${SCHEMA_DEST_DIR}/
   hadoop fs -put $SCHEMA_SRC_DIR/decimal.parquet ${SCHEMA_DEST_DIR}/
+  hadoop fs -put $SCHEMA_SRC_DIR/nested/modern_nested.parquet ${SCHEMA_DEST_DIR}/
+  hadoop fs -put $SCHEMA_SRC_DIR/nested/legacy_nested.parquet ${SCHEMA_DEST_DIR}/
 
   # CHAR and VARCHAR tables written by Hive
   hadoop fs -mkdir -p /test-warehouse/chars_formats_avro_snap/
@@ -144,8 +142,8 @@ function load-data {
 
   LOG_FILE=${DATA_LOADING_LOG_DIR}/data-load-${WORKLOAD}-${EXPLORATION_STRATEGY}.log
   echo "$MSG. Logging to ${LOG_FILE}"
-  # Use unbuffered logging by executing with 'python -u'
-  python -u ${IMPALA_HOME}/bin/load-data.py ${ARGS[@]} &> ${LOG_FILE}
+  # Use unbuffered logging by executing with -u
+  impala-python -u ${IMPALA_HOME}/bin/load-data.py ${ARGS[@]} &> ${LOG_FILE}
 }
 
 function cache-test-tables {
@@ -164,7 +162,7 @@ function load-aux-workloads {
   rm -f $LOG_FILE
   # Load all the auxiliary workloads (if any exist)
   if [ -d ${IMPALA_AUX_WORKLOAD_DIR} ] && [ -d ${IMPALA_AUX_DATASET_DIR} ]; then
-    python -u ${IMPALA_HOME}/bin/load-data.py --workloads all\
+    impala-python -u ${IMPALA_HOME}/bin/load-data.py --workloads all\
         --workload_dir=${IMPALA_AUX_WORKLOAD_DIR}\
         --dataset_dir=${IMPALA_AUX_DATASET_DIR}\
         --exploration_strategy=core ${LOAD_DATA_ARGS} &>> $LOG_FILE
@@ -310,7 +308,12 @@ fi
 
 # Start Impala
 ${IMPALA_HOME}/bin/start-impala-cluster.py -s 3 --log_dir=${DATA_LOADING_LOG_DIR}
-${IMPALA_HOME}/testdata/bin/setup-hdfs-env.sh
+# The hdfs environment script sets up kms (encryption) and cache pools (hdfs caching).
+# On a non-hdfs filesystem, we don't test encryption or hdfs caching, so this setup is not
+# needed.
+if [[ "${TARGET_FILESYSTEM}" == "hdfs" ]]; then
+  ${IMPALA_HOME}/testdata/bin/setup-hdfs-env.sh
+fi
 
 if [ $SKIP_METADATA_LOAD -eq 0 ]; then
   # load custom schems
@@ -319,6 +322,9 @@ if [ $SKIP_METADATA_LOAD -eq 0 ]; then
   load-data "functional-query" "exhaustive"
 
   load-data "tpch" "core"
+  # Load tpch nested data.
+  # TODO: Hacky and introduces more complexity into the system, but it is expedient.
+  ${IMPALA_HOME}/testdata/bin/load_nested.sh
   load-data "tpcds" "core"
   load-aux-workloads
   copy-and-load-dependent-tables

@@ -42,48 +42,49 @@ namespace impala {
 BufferedBlockMgr::BlockMgrsMap BufferedBlockMgr::query_to_block_mgrs_;
 SpinLock BufferedBlockMgr::static_block_mgrs_lock_;
 
+
 struct BufferedBlockMgr::Client {
-Client(BufferedBlockMgr* mgr, int num_reserved_buffers, MemTracker* tracker,
-    RuntimeState* state)
-  : mgr_(mgr),
-    state_(state),
-    tracker_(tracker),
-    query_tracker_(mgr_->mem_tracker_->parent()),
-    num_reserved_buffers_(num_reserved_buffers),
-    num_tmp_reserved_buffers_(0),
-    num_pinned_buffers_(0) {
-}
+  Client(BufferedBlockMgr* mgr, int num_reserved_buffers, MemTracker* tracker,
+         RuntimeState* state)
+      : mgr_(mgr),
+        state_(state),
+        tracker_(tracker),
+        query_tracker_(mgr_->mem_tracker_->parent()),
+        num_reserved_buffers_(num_reserved_buffers),
+        num_tmp_reserved_buffers_(0),
+        num_pinned_buffers_(0) {
+  }
 
-// Unowned.
-BufferedBlockMgr* mgr_;
+  /// Unowned.
+  BufferedBlockMgr* mgr_;
 
-// Unowned.
-RuntimeState* state_;
+  /// Unowned.
+  RuntimeState* state_;
 
-// Tracker for this client. Can be NULL. Unowned.
-// If this is set, when the client gets a buffer, we update the consumption on this
-// tracker. However, we don't want to transfer the buffer from the block mgr to the
-// client (i.e. release from the block mgr), since the block mgr is where the
-// block mem usage limit is enforced. Even when we give a buffer to a client, the
-// buffer is still owned and counts against the block mgr tracker (i.e. there is a
-// fixed pool of buffers regardless of if they are in the block mgr or the clients).
-MemTracker* tracker_;
+  /// Tracker for this client. Can be NULL. Unowned.
+  /// If this is set, when the client gets a buffer, we update the consumption on this
+  /// tracker. However, we don't want to transfer the buffer from the block mgr to the
+  /// client (i.e. release from the block mgr), since the block mgr is where the
+  /// block mem usage limit is enforced. Even when we give a buffer to a client, the
+  /// buffer is still owned and counts against the block mgr tracker (i.e. there is a
+  /// fixed pool of buffers regardless of if they are in the block mgr or the clients).
+  MemTracker* tracker_;
 
-  // This is the common ancestor between the block mgr tracker and the client tracker.
-  // When memory is transferred to the client, we want it to stop at this tracker.
+  /// This is the common ancestor between the block mgr tracker and the client tracker.
+  /// When memory is transferred to the client, we want it to stop at this tracker.
   MemTracker* query_tracker_;
 
-  // Number of buffers reserved by this client.
+  /// Number of buffers reserved by this client.
   int num_reserved_buffers_;
 
-  // Number of buffers temporarily reserved.
+  /// Number of buffers temporarily reserved.
   int num_tmp_reserved_buffers_;
 
-  // Number of buffers pinned by this client.
+  /// Number of buffers pinned by this client.
   int num_pinned_buffers_;
 
   void PinBuffer(BufferDescriptor* buffer) {
-    DCHECK_NOTNULL(buffer);
+    DCHECK(buffer != NULL);
     if (buffer->len == mgr_->max_block_size()) {
       ++num_pinned_buffers_;
       if (tracker_ != NULL) tracker_->ConsumeLocal(buffer->len, query_tracker_);
@@ -91,7 +92,7 @@ MemTracker* tracker_;
   }
 
   void UnpinBuffer(BufferDescriptor* buffer) {
-    DCHECK_NOTNULL(buffer);
+    DCHECK(buffer != NULL);
     if (buffer->len == mgr_->max_block_size()) {
       DCHECK_GT(num_pinned_buffers_, 0);
       --num_pinned_buffers_;
@@ -115,6 +116,7 @@ BufferedBlockMgr::Block::Block(BufferedBlockMgr* block_mgr)
     block_mgr_(block_mgr),
     client_(NULL),
     write_range_(NULL),
+    tmp_file_(NULL),
     valid_data_len_(0),
     num_rows_(0) {
 }
@@ -165,6 +167,11 @@ bool BufferedBlockMgr::Block::Validate() const {
   return true;
 }
 
+string BufferedBlockMgr::Block::TmpFilePath() const {
+  if (tmp_file_ == NULL) return "";
+  return tmp_file_->path();
+}
+
 string BufferedBlockMgr::Block::DebugString() const {
   stringstream ss;
   ss << "Block: " << this << endl
@@ -179,12 +186,14 @@ string BufferedBlockMgr::Block::DebugString() const {
   return ss.str();
 }
 
-BufferedBlockMgr::BufferedBlockMgr(RuntimeState* state, int64_t block_size)
+BufferedBlockMgr::BufferedBlockMgr(RuntimeState* state, TmpFileMgr* tmp_file_mgr,
+    int64_t block_size)
   : max_block_size_(block_size),
     // Keep two writes in flight per scratch disk so the disks can stay busy.
-    block_write_threshold_(TmpFileMgr::num_tmp_devices() * 2),
+    block_write_threshold_(tmp_file_mgr->num_active_tmp_devices() * 2),
     disable_spill_(state->query_ctx().disable_spilling),
     query_id_(state->query_id()),
+    tmp_file_mgr_(tmp_file_mgr),
     initialized_(false),
     unfullfilled_reserved_buffers_(0),
     total_pinned_buffers_(0),
@@ -197,9 +206,9 @@ BufferedBlockMgr::BufferedBlockMgr(RuntimeState* state, int64_t block_size)
 }
 
 Status BufferedBlockMgr::Create(RuntimeState* state, MemTracker* parent,
-    RuntimeProfile* profile, int64_t mem_limit, int64_t block_size,
-    shared_ptr<BufferedBlockMgr>* block_mgr) {
-  DCHECK_NOTNULL(parent);
+    RuntimeProfile* profile, TmpFileMgr* tmp_file_mgr, int64_t mem_limit,
+    int64_t block_size, shared_ptr<BufferedBlockMgr>* block_mgr) {
+  DCHECK(parent != NULL);
   block_mgr->reset();
   {
     lock_guard<SpinLock> lock(static_block_mgrs_lock_);
@@ -210,7 +219,7 @@ Status BufferedBlockMgr::Create(RuntimeState* state, MemTracker* parent,
       // all shared_ptr references have gone to 0 and it is in the process of
       // being deleted. This can happen if the last shared reference is released
       // but before the weak ptr is removed from the map.
-      block_mgr->reset(new BufferedBlockMgr(state, block_size));
+      block_mgr->reset(new BufferedBlockMgr(state, tmp_file_mgr, block_size));
       query_to_block_mgrs_[state->query_id()] = *block_mgr;
     }
   }
@@ -235,15 +244,16 @@ int64_t BufferedBlockMgr::remaining_unreserved_buffers() const {
 Status BufferedBlockMgr::RegisterClient(int num_reserved_buffers, MemTracker* tracker,
     RuntimeState* state, Client** client) {
   DCHECK_GE(num_reserved_buffers, 0);
+  Client* aClient = new Client(this, num_reserved_buffers, tracker, state);
   lock_guard<mutex> lock(lock_);
-  *client = obj_pool_.Add(new Client(this, num_reserved_buffers, tracker, state));
+  *client = obj_pool_.Add(aClient);
   unfullfilled_reserved_buffers_ += num_reserved_buffers;
   return Status::OK();
 }
 
 void BufferedBlockMgr::ClearReservations(Client* client) {
-  // TODO: The modifications to the client's mem variables can be made w/o the lock.
   lock_guard<mutex> lock(lock_);
+  // TODO: Can the modifications to the client's mem variables can be made w/o the lock?
   if (client->num_pinned_buffers_ < client->num_reserved_buffers_) {
     unfullfilled_reserved_buffers_ -=
         client->num_reserved_buffers_ - client->num_pinned_buffers_;
@@ -256,6 +266,7 @@ void BufferedBlockMgr::ClearReservations(Client* client) {
 
 bool BufferedBlockMgr::TryAcquireTmpReservation(Client* client, int num_buffers) {
   lock_guard<mutex> lock(lock_);
+  // TODO: Can the modifications to the client's mem variables can be made w/o the lock?
   DCHECK_EQ(client->num_tmp_reserved_buffers_, 0);
   if (client->num_pinned_buffers_ < client->num_reserved_buffers_) {
     // If client has unused reserved buffers, we use those first.
@@ -269,13 +280,14 @@ bool BufferedBlockMgr::TryAcquireTmpReservation(Client* client, int num_buffers)
   return true;
 }
 
-void BufferedBlockMgr::ClearTmpReservation(Client* client) {
-  lock_guard<mutex> lock(lock_);
-  unfullfilled_reserved_buffers_ -= client->num_tmp_reserved_buffers_;
-  client->num_tmp_reserved_buffers_ = 0;
-}
-
 bool BufferedBlockMgr::ConsumeMemory(Client* client, int64_t size) {
+  // Workaround IMPALA-1619. Return immediately if the allocation size will cause
+  // an arithmetic overflow.
+  if (UNLIKELY(size >= (1LL << 31))) {
+    LOG(WARNING) << "Trying to allocate memory >=2GB (" << size << ")B."
+                 << GetStackTrace();
+    return false;
+  }
   int buffers_needed = BitUtil::Ceil(size, max_block_size());
   DCHECK_GT(buffers_needed, 0) << "Trying to consume 0 memory";
   unique_lock<mutex> lock(lock_);
@@ -287,7 +299,7 @@ bool BufferedBlockMgr::ConsumeMemory(Client* client, int64_t size) {
   }
 
   if (max(0L, remaining_unreserved_buffers()) + client->num_tmp_reserved_buffers_ <
-        buffers_needed) {
+      buffers_needed) {
     return false;
   }
 
@@ -312,8 +324,9 @@ bool BufferedBlockMgr::ConsumeMemory(Client* client, int64_t size) {
   int buffers_acquired = 0;
   do {
     BufferDescriptor* buffer_desc = NULL;
-    FindBuffer(lock, &buffer_desc); // This waits on the lock.
+    Status s = FindBuffer(lock, &buffer_desc); // This waits on the lock.
     if (buffer_desc == NULL) break;
+    DCHECK(s.ok());
     all_io_buffers_.erase(buffer_desc->all_buffers_it);
     if (buffer_desc->block != NULL) buffer_desc->block->buffer_desc_ = NULL;
     delete[] buffer_desc->buffer;
@@ -329,13 +342,8 @@ bool BufferedBlockMgr::ConsumeMemory(Client* client, int64_t size) {
       VLOG_QUERY << "Query: " << query_id_ << " write unpinned buffers failed.";
       client->state_->LogError(status.msg());
     }
-    if (buffers_acquired < additional_tmp_reservations) {
-      // TODO: what is the reasoning behind this calculation?
-      client->num_tmp_reserved_buffers_ -=
-          (additional_tmp_reservations - buffers_acquired);
-      unfullfilled_reserved_buffers_ -=
-          (additional_tmp_reservations - buffers_acquired);
-    }
+    client->num_tmp_reserved_buffers_ -= additional_tmp_reservations;
+    unfullfilled_reserved_buffers_ -= additional_tmp_reservations;
     mem_tracker_->Release(buffers_acquired * max_block_size());
     return false;
   }
@@ -366,16 +374,21 @@ void BufferedBlockMgr::Cancel() {
   io_mgr_->CancelContext(io_request_context_);
 }
 
-Status BufferedBlockMgr::MemLimitTooLowError(Client* client) {
+bool BufferedBlockMgr::IsCancelled() {
+  lock_guard<mutex> lock(lock_);
+  return is_cancelled_;
+}
+
+Status BufferedBlockMgr::MemLimitTooLowError(Client* client, int node_id) {
   // TODO: what to print here. We can't know the value of the entire query here.
-  Status status = Status::MEM_LIMIT_EXCEEDED;
-  status.AddDetail(Substitute("The memory limit is set too low initialize the"
-      " spilling operator. The minimum required memory to spill this operator is $0.",
-      PrettyPrinter::Print(client->num_reserved_buffers_ * max_block_size(),
+  Status status = Status::MemLimitExceeded();
+  status.AddDetail(Substitute("The memory limit is set too low to initialize spilling"
+      " operator (id=$0). The minimum required memory to spill this operator is $1.",
+      node_id, PrettyPrinter::Print(client->num_reserved_buffers_ * max_block_size(),
       TUnit::BYTES)));
-  VLOG_QUERY << "Query: " << query_id_ << " ran out of memory: " << endl
-             << DebugInternal() << endl << client->DebugString() << endl
-             << GetStackTrace();
+  VLOG_QUERY << "Query: " << query_id_ << ". Node=" << node_id
+             << " ran out of memory: " << endl
+             << DebugInternal() << endl << client->DebugString();
   return status;
 }
 
@@ -481,8 +494,25 @@ Status BufferedBlockMgr::TransferBuffer(Block* dst, Block* src, bool unpin) {
 BufferedBlockMgr::~BufferedBlockMgr() {
   {
     lock_guard<SpinLock> lock(static_block_mgrs_lock_);
-    DCHECK(query_to_block_mgrs_.find(query_id_) != query_to_block_mgrs_.end());
-    query_to_block_mgrs_.erase(query_id_);
+    BlockMgrsMap::iterator it = query_to_block_mgrs_.find(query_id_);
+    // IMPALA-2286: Another fragment may have called Create() for this query_id_ and
+    // saw that this BufferedBlockMgr is being destructed.  That fragement will
+    // overwrite the map entry for query_id_, pointing it to a different
+    // BufferedBlockMgr object.  We should let that object's destructor remove the
+    // entry.  On the other hand, if the second BufferedBlockMgr is destructed before
+    // this thread acquires the lock, then we'll remove the entry (because we can't
+    // distinguish between the two expired pointers), and when the other
+    // ~BufferedBlockMgr() call occurs, it won't find an entry for this query_id_.
+    if (it != query_to_block_mgrs_.end()) {
+      shared_ptr<BufferedBlockMgr> mgr = it->second.lock();
+      if (mgr.get() == NULL) {
+        // The BufferBlockMgr object referenced by this entry is being deconstructed.
+        query_to_block_mgrs_.erase(it);
+      } else {
+        // The map references another (still valid) BufferedBlockMgr.
+        DCHECK_NE(mgr.get(), this);
+      }
+    }
   }
 
   if (io_request_context_ != NULL) io_mgr_->UnregisterContext(io_request_context_);
@@ -535,7 +565,7 @@ Status BufferedBlockMgr::DeleteOrUnpinBlock(Block* block, bool unpin) {
 
 Status BufferedBlockMgr::PinBlock(Block* block, bool* pinned, Block* release_block,
     bool unpin) {
-  DCHECK_NOTNULL(block);
+  DCHECK(block != NULL);
   DCHECK(!block->is_deleted_);
   *pinned = false;
   if (block->is_pinned_) {
@@ -597,13 +627,15 @@ Status BufferedBlockMgr::PinBlock(Block* block, bool* pinned, Block* release_blo
 
   // Read from the io mgr buffer into the block's assigned buffer.
   int64_t offset = 0;
-  DiskIoMgr::BufferDescriptor* io_mgr_buffer;
+  bool buffer_eosr;
   do {
+    DiskIoMgr::BufferDescriptor* io_mgr_buffer;
     RETURN_IF_ERROR(scan_range->GetNext(&io_mgr_buffer));
     memcpy(block->buffer() + offset, io_mgr_buffer->buffer(), io_mgr_buffer->len());
     offset += io_mgr_buffer->len();
+    buffer_eosr = io_mgr_buffer->eosr();
     io_mgr_buffer->Return();
-  } while (!io_mgr_buffer->eosr());
+  } while (!buffer_eosr);
   DCHECK_EQ(offset, block->write_range_->len());
 
   // Verify integrity first, because the hash was generated from encrypted data.
@@ -665,13 +697,11 @@ Status BufferedBlockMgr::WriteUnpinnedBlock(Block* block) {
   if (block->write_range_ == NULL) {
     if (tmp_files_.empty()) RETURN_IF_ERROR(InitTmpFiles());
 
-    // First time the block is being persisted. Find the next physical file in
-    // round-robin order and create a write range for it.
-    TmpFileMgr::File& tmp_file = tmp_files_[next_block_index_];
-    next_block_index_ = (next_block_index_ + 1) % tmp_files_.size();
+    // First time the block is being persisted - need to allocate tmp file space.
+    TmpFileMgr::File* tmp_file;
     int64_t file_offset;
-    RETURN_IF_ERROR(tmp_file.AllocateSpace(max_block_size_, &file_offset));
-    int disk_id = tmp_file.disk_id();
+    RETURN_IF_ERROR(AllocateScratchSpace(max_block_size_, &tmp_file, &file_offset));
+    int disk_id = tmp_file->disk_id();
     if (disk_id < 0) {
       // Assign a valid disk id to the write range if the tmp file was not assigned one.
       static unsigned int next_disk_id = 0;
@@ -681,7 +711,8 @@ Status BufferedBlockMgr::WriteUnpinnedBlock(Block* block) {
     DiskIoMgr::WriteRange::WriteDoneCallback callback =
         bind(mem_fn(&BufferedBlockMgr::WriteComplete), this, block, _1);
     block->write_range_ = obj_pool_.Add(new DiskIoMgr::WriteRange(
-        tmp_file.path(), file_offset, disk_id, callback));
+        tmp_file->path(), file_offset, disk_id, callback));
+    block->tmp_file_ = tmp_file;
   }
 
   uint8_t* outbuf = NULL;
@@ -712,6 +743,31 @@ Status BufferedBlockMgr::WriteUnpinnedBlock(Block* block) {
   return Status::OK();
 }
 
+Status BufferedBlockMgr::AllocateScratchSpace(int64_t block_size,
+    TmpFileMgr::File** tmp_file, int64_t* file_offset) {
+  // Assumes block manager lock is already taken.
+  vector<Status> errs;
+  // Find the next physical file in round-robin order and create a write range for it.
+  for (int attempt = 0; attempt < tmp_files_.size(); ++attempt) {
+    *tmp_file = &tmp_files_[next_block_index_];
+    next_block_index_ = (next_block_index_ + 1) % tmp_files_.size();
+    if ((*tmp_file)->is_blacklisted()) continue;
+    Status status = (*tmp_file)->AllocateSpace(max_block_size_, file_offset);
+    if (status.ok()) return Status::OK();
+    // Log error and try other files if there was a problem. Problematic files will be
+    // blacklisted so we will not repeatedly log the same error.
+    LOG(WARNING) << "Error while allocating temporary file range: "
+                 << status.msg().msg() << ". Will try another temporary file.";
+    errs.push_back(status);
+  }
+  Status err_status("No usable temporary files: space could not be allocated on any "
+      "temporary device.");
+  for (int i = 0; i < errs.size(); ++i) {
+    err_status.MergeStatus(errs[i]);
+  }
+  return err_status;
+}
+
 void BufferedBlockMgr::WriteComplete(Block* block, const Status& write_status) {
   Status status = Status::OK();
   lock_guard<mutex> lock(lock_);
@@ -730,6 +786,8 @@ void BufferedBlockMgr::WriteComplete(Block* block, const Status& write_status) {
   if (encryption_) EncryptDone(block);
 
   // ReturnUnusedBlock() will clear the block, so save the client pointer.
+  // We have to be careful while touching the state because it may have been cleaned up by
+  // another thread.
   RuntimeState* state = block->client_->state_;
   // If the block was re-pinned when it was in the IOMgr queue, don't free it.
   if (block->is_pinned_) {
@@ -762,9 +820,16 @@ void BufferedBlockMgr::WriteComplete(Block* block, const Status& write_status) {
   DCHECK(Validate()) << endl << DebugInternal();
 
   if (!write_status.ok() || !status.ok() || is_cancelled_) {
+    VLOG_FILE << "Query: " << query_id_ << ". Write did not complete successfully: "
+        "write_status=" << write_status.GetDetail() << ", status=" << status.GetDetail()
+        << ". is_cancelled_=" << is_cancelled_;
+
     // If the instance is already cancelled, don't confuse things with these errors.
-    if (!state->is_cancelled()) {
+    if (!write_status.IsCancelled() && !state->is_cancelled()) {
       if (!write_status.ok()) {
+        // Report but do not attempt to recover from write error.
+        DCHECK(block->tmp_file_ != NULL);
+        block->tmp_file_->ReportIOError(write_status.msg());
         VLOG_QUERY << "Query: " << query_id_ << " write complete callback with error.";
         state->LogError(write_status.msg());
       }
@@ -834,9 +899,9 @@ void BufferedBlockMgr::ReturnUnusedBlock(Block* block) {
 }
 
 Status BufferedBlockMgr::FindBufferForBlock(Block* block, bool* in_mem) {
-  DCHECK_NOTNULL(block);
+  DCHECK(block != NULL);
   Client* client = block->client_;
-  DCHECK_NOTNULL(client);
+  DCHECK(client != NULL);
   DCHECK(!block->is_pinned_ && !block->is_deleted_)
       << "Pinned or deleted block " << endl << block->DebugString();
   *in_mem = false;
@@ -895,17 +960,16 @@ Status BufferedBlockMgr::FindBufferForBlock(Block* block, bool* in_mem) {
       if (VLOG_QUERY_IS_ON) {
         stringstream ss;
         ss << "Query id=" << query_id_ << " was unable to get minimum required buffers."
-           << endl << DebugInternal() << endl << client->DebugString()
-           << endl << GetStackTrace();
+           << endl << DebugInternal() << endl << client->DebugString();
         VLOG_QUERY << ss.str();
       }
-      Status status = Status::MEM_LIMIT_EXCEEDED;
+      Status status = Status::MemLimitExceeded();
       status.AddDetail("Query did not have enough memory to get the minimum required "
           "buffers in the block manager.");
       return status;
     }
 
-    DCHECK_NOTNULL(buffer_desc);
+    DCHECK(buffer_desc != NULL);
     if (buffer_desc->block != NULL) {
       // This buffer was assigned to a block but now we are reusing it. Reset the
       // previous block->buffer link.
@@ -915,7 +979,10 @@ Status BufferedBlockMgr::FindBufferForBlock(Block* block, bool* in_mem) {
     buffer_desc->block = block;
     block->buffer_desc_ = buffer_desc;
   }
-  DCHECK_NOTNULL(block->buffer_desc_);
+  DCHECK(block->buffer_desc_ != NULL);
+  DCHECK(block->buffer_desc_->len < max_block_size() || !block->is_pinned_)
+      << "Trying to pin already pinned block. "
+      << block->buffer_desc_->len << " " << block->is_pinned_;
   block->is_pinned_ = true;
   client->PinBuffer(block->buffer_desc_);
   ++total_pinned_buffers_;
@@ -977,7 +1044,7 @@ Status BufferedBlockMgr::FindBuffer(unique_lock<mutex>& lock,
 }
 
 BufferedBlockMgr::Block* BufferedBlockMgr::GetUnusedBlock(Client* client) {
-  DCHECK_NOTNULL(client);
+  DCHECK(client != NULL);
   Block* new_block = NULL;
   if (unused_blocks_.empty()) {
     new_block = obj_pool_.Add(new Block(this));
@@ -987,7 +1054,7 @@ BufferedBlockMgr::Block* BufferedBlockMgr::GetUnusedBlock(Client* client) {
     new_block = unused_blocks_.Dequeue();
     recycled_blocks_counter_->Add(1);
   }
-  DCHECK_NOTNULL(new_block);
+  DCHECK(new_block != NULL);
   new_block->client_ = client;
   return new_block;
 }
@@ -1146,21 +1213,24 @@ void BufferedBlockMgr::Init(DiskIoMgr* io_mgr, RuntimeProfile* parent_profile,
 
 Status BufferedBlockMgr::InitTmpFiles() {
   DCHECK(tmp_files_.empty());
+  DCHECK(tmp_file_mgr_ != NULL);
 
+  vector<TmpFileMgr::DeviceId> tmp_devices = tmp_file_mgr_->active_tmp_devices();
   // Initialize the tmp files and the initial file to use.
-  int num_tmp_devices = TmpFileMgr::num_tmp_devices();
-  if (num_tmp_devices == 0) {
-    return Status(
-        "No spilling directories configured. Cannot spill. Set --scratch_dirs.");
-  }
-
-  tmp_files_.reserve(num_tmp_devices);
-  for (int i = 0; i < num_tmp_devices; ++i) {
+  tmp_files_.reserve(tmp_devices.size());
+  for (int i = 0; i < tmp_devices.size(); ++i) {
     TmpFileMgr::File* tmp_file;
-    RETURN_IF_ERROR(TmpFileMgr::GetFile(i, query_id_, &tmp_file));
-    tmp_files_.push_back(tmp_file);
+    TmpFileMgr::DeviceId tmp_device_id = tmp_devices[i];
+    // It is possible for a device to be blacklisted after it was returned
+    // by active_tmp_devices() - handle this gracefully.
+    Status status = tmp_file_mgr_->GetFile(tmp_device_id, query_id_, &tmp_file);
+    if (status.ok()) tmp_files_.push_back(tmp_file);
   }
-  next_block_index_ = rand() % num_tmp_devices;
+  if (tmp_files_.empty()) {
+    return Status("No spilling directories configured. Cannot spill. Set --scratch_dirs"
+        " or see log for previous errors that prevented use of provided directories");
+  }
+  next_block_index_ = rand() % tmp_files_.size();
   return Status::OK();
 }
 

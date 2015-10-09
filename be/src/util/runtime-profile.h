@@ -18,7 +18,6 @@
 
 #include <boost/function.hpp>
 #include <boost/scoped_ptr.hpp>
-#include <boost/thread/mutex.hpp>
 #include <boost/unordered_map.hpp>
 #include <iostream>
 #include <sys/time.h>
@@ -52,6 +51,8 @@ namespace impala {
       (profile)->AddCounter(name, TUnit::TIME_NS, parent)
   #define SCOPED_TIMER(c) \
       ScopedTimer<MonotonicStopWatch> MACRO_CONCAT(SCOPED_TIMER, __COUNTER__)(c)
+  #define CANCEL_SAFE_SCOPED_TIMER(c, is_cancelled) \
+      ScopedTimer<MonotonicStopWatch> MACRO_CONCAT(SCOPED_TIMER, __COUNTER__)(c, is_cancelled)
   #define COUNTER_ADD(c, v) (c)->Add(v)
   #define COUNTER_SET(c, v) (c)->Set(v)
   #define ADD_THREAD_COUNTERS(profile, prefix) (profile)->AddThreadCounters(prefix)
@@ -64,6 +65,7 @@ namespace impala {
   #define ADD_TIMER(profile, name) NULL
   #define ADD_CHILD_TIMER(profile, name, parent) NULL
   #define SCOPED_TIMER(c)
+  #define CANCEL_SAFE_SCOPED_TIMER(c)
   #define COUNTER_ADD(c, v)
   #define COUNTER_SET(c, v)
   #define ADD_THREAD_COUNTERS(profile, prefix) NULL
@@ -280,37 +282,37 @@ class RuntimeProfile {
     /// Starts the timer without resetting it.
     void Start() { sw_.Start(); }
 
-    /// Stores an event in sequence with the given label and the
-    /// current time (relative to the first time Start() was called) as
-    /// the timestamp.
+    /// Stores an event in sequence with the given label and the current time
+    /// (relative to the first time Start() was called) as the timestamp.
     void MarkEvent(const std::string& label) {
-      boost::lock_guard<boost::mutex> event_lock(lock_);
-      events_.push_back(make_pair(label, sw_.ElapsedTime()));
+      Event event = make_pair(label, sw_.ElapsedTime());
+      boost::lock_guard<SpinLock> event_lock(lock_);
+      events_.push_back(event);
     }
 
     int64_t ElapsedTime() { return sw_.ElapsedTime(); }
 
-    /// An Event is a <label, timestamp> pair
+    /// An Event is a <label, timestamp> pair.
     typedef std::pair<std::string, int64_t> Event;
 
-    /// An EventList is a sequence of Events, in increasing timestamp order
+    /// An EventList is a sequence of Events, in increasing timestamp order.
     typedef std::vector<Event> EventList;
 
     /// Copies the member events_ into the supplied vector 'events'.
     /// The supplied vector 'events' is cleared before this.
     void GetEvents(std::vector<Event>* events) {
       events->clear();
-      boost::lock_guard<boost::mutex> event_lock(lock_);
+      boost::lock_guard<SpinLock> event_lock(lock_);
       events->insert(events->end(), events_.begin(), events_.end());
     }
 
     void ToThrift(TEventSequence* seq) const;
 
    private:
-    /// Protect access to events_
-    boost::mutex lock_;
+    /// Protect access to events_.
+    SpinLock lock_;
 
-    /// Stored in increasing time order
+    /// Stored in increasing time order.
     EventList events_;
 
     /// Timer which allows events to be timestamped when they are recorded.
@@ -352,9 +354,10 @@ class RuntimeProfile {
 
   /// Create a runtime profile object with 'name'.  Counters and merged profile are
   /// allocated from pool.
-  /// If is_averaged_profile is true, the counters in this profile will be derived averages
-  /// (of unit AveragedCounter) from other profiles, so the counter map will be left empty
-  /// Otherwise, the counter map is initialized with a single entry for TotalTime.
+  /// If is_averaged_profile is true, the counters in this profile will be derived
+  /// averages (of unit AveragedCounter) from other profiles, so the counter map will
+  /// be left empty Otherwise, the counter map is initialized with a single entry for
+  /// TotalTime.
   RuntimeProfile(ObjectPool* pool, const std::string& name,
       bool is_averaged_profile = false);
 
@@ -378,7 +381,7 @@ class RuntimeProfile {
   /// invalidate pointers to profiles.
   template <class Compare>
   void SortChildren(const Compare& cmp) {
-    boost::lock_guard<boost::mutex> l(children_lock_);
+    boost::lock_guard<SpinLock> l(children_lock_);
     std::sort(children_.begin(), children_.end(), cmp);
   }
 
@@ -423,6 +426,10 @@ class RuntimeProfile {
   /// that the caller can update.  The counter is owned by the RuntimeProfile object.
   ThreadCounters* AddThreadCounters(const std::string& prefix);
 
+  // Add a derived counter to capture the local time. This function can be called at most
+  // once.
+  void AddLocalTimeCounter(const DerivedCounterFunction& counter_fn);
+
   /// Gets the counter object with 'name'.  Returns NULL if there is no counter with
   /// that name.
   Counter* GetCounter(const std::string& name);
@@ -452,8 +459,6 @@ class RuntimeProfile {
   /// Returns the counter for the total elapsed time.
   Counter* total_time_counter() { return counter_map_[TOTAL_TIME_COUNTER_NAME]; }
   Counter* inactive_timer() { return counter_map_[INACTIVE_TIME_COUNTER_NAME]; }
-  Counter* total_async_timer() { return counter_map_[ASYNC_TIME_COUNTER_NAME]; }
-
   int64_t local_time() { return local_time_ns_; }
 
   /// Prints the counters in a name: value format.
@@ -575,42 +580,45 @@ class RuntimeProfile {
   /// A set of bucket counters registered in this runtime profile.
   std::set<std::vector<Counter*>* > bucketing_counters_;
 
-  /// protects counter_map_, counter_child_map_ and bucketing_counters_
-  mutable boost::mutex counter_map_lock_;
+  /// Protects counter_map_, counter_child_map_ and bucketing_counters_.
+  mutable SpinLock counter_map_lock_;
 
   /// Child profiles.  Does not own memory.
   /// We record children in both a map (to facilitate updates) and a vector
   /// (to print things in the order they were registered)
   typedef std::map<std::string, RuntimeProfile*> ChildMap;
   ChildMap child_map_;
-  /// vector of (profile, indentation flag)
+
+  /// Vector of (profile, indentation flag).
   typedef std::vector<std::pair<RuntimeProfile*, bool> > ChildVector;
   ChildVector children_;
-  mutable boost::mutex children_lock_;  // protects child_map_ and children_
+
+  /// Protects child_map_ and children_.
+  mutable SpinLock children_lock_;
 
   typedef std::map<std::string, std::string> InfoStrings;
   InfoStrings info_strings_;
 
-  /// Keeps track of the order in which InfoStrings are displayed when printed
+  /// Keeps track of the order in which InfoStrings are displayed when printed.
   typedef std::vector<std::string> InfoStringsDisplayOrder;
   InfoStringsDisplayOrder info_strings_display_order_;
 
-  /// Protects info_strings_ and info_strings_display_order_
-  mutable boost::mutex info_strings_lock_;
+  /// Protects info_strings_ and info_strings_display_order_.
+  mutable SpinLock info_strings_lock_;
 
   typedef std::map<std::string, EventSequence*> EventSequenceMap;
   EventSequenceMap event_sequence_map_;
-  mutable boost::mutex event_sequence_lock_;
+
+  /// Protects event_sequence_map_.
+  mutable SpinLock event_sequence_lock_;
 
   typedef std::map<std::string, TimeSeriesCounter*> TimeSeriesCounterMap;
   TimeSeriesCounterMap time_series_counter_map_;
-  mutable boost::mutex time_series_counter_map_lock_;
+
+  /// Protects time_series_counter_map_.
+  mutable SpinLock time_series_counter_map_lock_;
 
   Counter counter_total_time_;
-
-  /// Total time that child profiles spent in an asychronous thread. This is used
-  /// in the local_time_percent_ calculation.
-  Counter total_async_timer_;
 
   /// Total time spent waiting (on non-children) that should not be counted when
   /// computing local_time_percent_. This is updated for example in the exchange
@@ -636,8 +644,8 @@ class RuntimeProfile {
 
   /// Name of the counter maintaining the total time.
   static const std::string TOTAL_TIME_COUNTER_NAME;
+  static const std::string LOCAL_TIME_COUNTER_NAME;
   static const std::string INACTIVE_TIME_COUNTER_NAME;
-  static const std::string ASYNC_TIME_COUNTER_NAME;
 
   /// Create a subtree of runtime profiles from nodes, starting at *node_idx.
   /// On return, *node_idx is the index one past the end of this subtree
@@ -700,12 +708,17 @@ class ScopedCounter {
 
 /// Utility class to update time elapsed when the object goes out of scope.
 /// 'T' must implement the StopWatch "interface" (Start,Stop,ElapsedTime) but
-/// we use templates not to pay for virtual function overhead.
+/// we use templates not to pay for virtual function overhead. In some cases
+/// the runtime profile may be deleted while the counter is still active. In this
+/// case the is_cancelled argument can be provided so that ScopedTimer will not
+/// update the counter when the query is cancelled. The destructor for ScopedTimer
+/// can access both is_cancelled and the counter, so the caller must ensure that it
+/// is safe to access both at the end of the scope in which the timer is used.
 template<class T>
 class ScopedTimer {
  public:
-  ScopedTimer(RuntimeProfile::Counter* counter) :
-    counter_(counter) {
+  ScopedTimer(RuntimeProfile::Counter* counter, const bool* is_cancelled = NULL) :
+    counter_(counter), is_cancelled_(is_cancelled){
     if (counter == NULL) return;
     DCHECK(counter->unit() == TUnit::TIME_NS);
     sw_.Start();
@@ -715,7 +728,7 @@ class ScopedTimer {
   void Start() { sw_.Start(); }
 
   void UpdateCounter() {
-    if (counter_ != NULL) {
+    if (counter_ != NULL && !IsCancelled()) {
       counter_->Add(sw_.ElapsedTime());
     }
   }
@@ -724,6 +737,10 @@ class ScopedTimer {
   void ReleaseCounter() {
     UpdateCounter();
     counter_ = NULL;
+  }
+
+  bool IsCancelled() {
+    return is_cancelled_ != NULL && *is_cancelled_;
   }
 
   /// Update counter when object is destroyed
@@ -739,6 +756,7 @@ class ScopedTimer {
 
   T sw_;
   RuntimeProfile::Counter* counter_;
+  const bool* is_cancelled_;
 };
 
 /// Utility class to update ThreadCounter when the object goes out of scope or when Stop is

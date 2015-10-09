@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # Copyright (c) 2012 Cloudera, Inc. All rights reserved.
 #
 # Talk to an impalad through beeswax.
@@ -342,9 +341,12 @@ class ImpalaBeeswaxClient(object):
       if query_state == self.query_states["FINISHED"]:
         break
       elif query_state == self.query_states["EXCEPTION"]:
-        error_log = self.__do_rpc(
-          lambda: self.imp_service.get_log(query_handle.log_context))
-        raise ImpalaBeeswaxException("Query aborted:" + error_log, None)
+        try:
+          error_log = self.__do_rpc(
+            lambda: self.imp_service.get_log(query_handle.log_context))
+          raise ImpalaBeeswaxException("Query aborted:" + error_log, None)
+        finally:
+          self.close_query(query_handle)
       time.sleep(0.05)
 
   def get_default_configuration(self):

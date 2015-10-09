@@ -28,11 +28,12 @@ namespace impala {
 // TODO: is there a more controlled way to do this.
 const Status Status::CANCELLED(ErrorMsg::Init(TErrorCode::CANCELLED, "Cancelled"));
 
-const Status Status::MEM_LIMIT_EXCEEDED(
-    ErrorMsg::Init(TErrorCode::MEM_LIMIT_EXCEEDED, "Memory limit exceeded"));
-
 const Status Status::DEPRECATED_RPC(ErrorMsg::Init(TErrorCode::NOT_IMPLEMENTED_ERROR,
     "Deprecated RPC; please update your client"));
+
+Status Status::MemLimitExceeded() {
+  return Status(TErrorCode::MEM_LIMIT_EXCEEDED, "Memory limit exceeded");
+}
 
 Status::Status(TErrorCode::type code)
     : msg_(new ErrorMsg(code)) {
@@ -111,6 +112,13 @@ Status::Status(const string& error_msg)
   VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
 }
 
+Status::Status(const ErrorMsg& error_msg, bool silent)
+  : msg_(new ErrorMsg(error_msg)) {
+  if (!silent) {
+    VLOG(1) << msg_->msg() << "\n" << GetStackTrace();
+  }
+}
+
 Status::Status(const string& error_msg, bool silent)
   : msg_(new ErrorMsg(TErrorCode::GENERAL, error_msg)) {
   if (!silent) {
@@ -157,12 +165,16 @@ Status& Status::operator=(
   return *this;
 }
 
+Status Status::Expected(const ErrorMsg& error_msg) {
+  return Status(error_msg, true);
+}
+
 Status Status::Expected(const std::string& error_msg) {
   return Status(error_msg, true);
 }
 
 void Status::AddDetail(const std::string& msg) {
-  DCHECK_NOTNULL(msg_);
+  DCHECK(msg_ != NULL);
   msg_->AddDetail(msg);
   VLOG(2) << msg;
 }

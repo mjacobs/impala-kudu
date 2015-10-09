@@ -555,6 +555,74 @@ delimited fields terminated by ','  escaped by '\\'
 ---- DATASET
 functional
 ---- BASE_TABLE_NAME
+complextypestbl
+---- COLUMNS
+id bigint
+int_array array<int>
+int_array_array array<array<int>>
+int_map map<string, int>
+int_map_array array<map<string, int>>
+nested_struct struct<a: int, b: array<int>, c: struct<d: array<array<struct<e: int, f: string>>>>, g: map<string, struct<h: struct<i: array<float>>>>>
+---- DEPENDENT_LOAD
+`hadoop fs -mkdir -p /test-warehouse/complextypestbl_parquet && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/nullable.parq \
+/test-warehouse/complextypestbl_parquet/ && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/ComplexTypesTbl/nonnullable.parq \
+/test-warehouse/complextypestbl_parquet/
+---- LOAD
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypes_fileformat
+---- CREATE_HIVE
+-- Used for positive/negative testing of complex types on various file formats.
+-- In particular, queries on file formats for which we do not support complex types
+-- should fail gracefully.
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
+  id int,
+  s struct<f1:string,f2:int>,
+  a array<int>,
+  m map<string,bigint>)
+STORED AS {file_format};
+---- ALTER
+-- This INSERT is placed in the ALTER section and not in the DEPENDENT_LOAD section because
+-- it must always be executed in Hive. The DEPENDENT_LOAD section is sometimes executed in
+-- Impala, but Impala currently does not support inserting into tables with complex types.
+INSERT OVERWRITE TABLE {table_name} SELECT * FROM functional.{table_name};
+---- LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} SELECT id, named_struct("f1",string_col,"f2",int_col), array(1, 2, 3), map("k", cast(0 as bigint)) FROM functional.alltypestiny;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+complextypes_multifileformat
+---- CREATE_HIVE
+-- Used for positive/negative testing of complex types on various file formats.
+-- In particular, queries on file formats for which we do not support complex types
+-- should fail gracefully. This table allows testing at a partition granularity.
+CREATE TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
+  id int,
+  s struct<f1:string,f2:int>,
+  a array<int>,
+  m map<string,bigint>)
+PARTITIONED BY (p int)
+STORED AS {file_format};
+---- LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION(p=1) SELECT id, named_struct("f1",string_col,"f2",int_col), array(1, 2, 3), map("k", cast(0 as bigint)) FROM functional.alltypestiny;
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION(p=2) SELECT id, named_struct("f1",string_col,"f2",int_col), array(1, 2, 3), map("k", cast(0 as bigint)) FROM functional.alltypestiny;
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION(p=3) SELECT id, named_struct("f1",string_col,"f2",int_col), array(1, 2, 3), map("k", cast(0 as bigint)) FROM functional.alltypestiny;
+-- The order of insertions and alterations is deliberately chose to work around a Hive
+-- bug where the format of an altered partition is reverted back to the original format after
+-- an insert. So we first do the insert, and then alter the format.
+USE {db_name}{db_suffix};
+ALTER TABLE {table_name} PARTITION (p=2) SET FILEFORMAT PARQUET;
+ALTER TABLE {table_name} PARTITION (p=3) SET FILEFORMAT AVRO;
+USE default;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
 testtbl
 ---- COLUMNS
 id bigint
@@ -1306,6 +1374,18 @@ bad_parquet
 field STRING
 ====
 ---- DATASET
+-- IMPALA-2130: Wrong verification of parquet file version
+functional
+---- BASE_TABLE_NAME
+bad_magic_number
+---- COLUMNS
+field STRING
+---- LOAD
+`hadoop fs -mkdir -p /test-warehouse/bad_magic_number_parquet && \
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/bad_magic_number.parquet \
+/test-warehouse/bad_magic_number_parquet/
+====
+---- DATASET
 -- IMPALA-1658: Timestamps written by Hive are local-to-UTC adjusted.
 functional
 ---- BASE_TABLE_NAME
@@ -1524,6 +1604,34 @@ OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ---- DATASET
 functional
 ---- BASE_TABLE_NAME
+no_avro_schema
+---- CREATE_HIVE
+-- Avro schema is inferred from the column definitions (IMPALA-1136)
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
+id int,
+bool_col boolean,
+tinyint_col tinyint,
+smallint_col smallint,
+int_col int,
+bigint_col bigint,
+float_col float,
+double_col double,
+date_string_col string,
+string_col string,
+timestamp_col string)
+PARTITIONED BY (year int, month int)
+STORED AS AVRO
+LOCATION '/test-warehouse/alltypes_avro_snap';
+---- ALTER
+-- The second partition is added twice because there seems to be a Hive/beeline
+-- bug where the last alter is not executed properly.
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION (year=2009,month=9);
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION (year=2010,month=10);
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION (year=2010,month=10);
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
 table_no_newline
 ---- CREATE
 CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
@@ -1649,4 +1757,43 @@ LOCATION '/test-warehouse/{table_name}';
 ---- LOAD
 `hadoop fs -mkdir -p /test-warehouse/alltimezones && \
 hadoop fs -put -f ${IMPALA_HOME}/testdata/data/timezoneverification.csv /test-warehouse/alltimezones
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+avro_unicode_nulls
+---- CREATE_HIVE
+create external table {db_name}{db_suffix}.{table_name} like {db_name}.liketbl stored as avro LOCATION '/test-warehouse/avro_null_char';
+---- LOAD
+`hdfs dfs -mkdir -p /test-warehouse/avro_null_char && \
+hdfs dfs -put -f ${IMPALA_HOME}/testdata/avro_null_char/000000_0 /test-warehouse/avro_null_char/
+====
+---- DATASET
+-- IMPALA-1881: Maximize data locality when scanning Parquet files with multiple row groups.
+functional
+---- BASE_TABLE_NAME
+lineitem_multiblock
+---- COLUMNS
+L_ORDERKEY BIGINT
+L_PARTKEY BIGINT
+L_SUPPKEY BIGINT
+L_LINENUMBER INT
+L_QUANTITY DECIMAL(12,2)
+L_EXTENDEDPRICE DECIMAL(12,2)
+L_DISCOUNT DECIMAL(12,2)
+L_TAX DECIMAL(12,2)
+L_RETURNFLAG STRING
+L_LINESTATUS STRING
+L_SHIPDATE STRING
+L_COMMITDATE STRING
+L_RECEIPTDATE STRING
+L_SHIPINSTRUCT STRING
+L_SHIPMODE STRING
+L_COMMENT STRING
+---- ROW_FORMAT
+DELIMITED FIELDS TERMINATED BY '|'
+---- LOAD
+`hadoop fs -mkdir -p /test-warehouse/lineitem_multiblock_parquet && \
+hadoop fs -Ddfs.block.size=1048576 -put -f \
+${IMPALA_HOME}/testdata/LineItemMultiBlock/000000_0 /test-warehouse/lineitem_multiblock_parquet
 ====

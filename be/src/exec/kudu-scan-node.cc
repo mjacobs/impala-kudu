@@ -264,7 +264,7 @@ void KuduScanNode::GetSlotRefColumnName(const TExprNode& node, string* col_name)
   BOOST_FOREACH(SlotDescriptor* slot, tuple_desc_->slots()) {
     if (slot->id() == slot_id) {
       int col_idx = slot->col_pos();
-      *col_name = table_desc->col_names()[col_idx];
+      *col_name = table_desc->col_descs()[col_idx].name();
       return;
     }
   }
@@ -381,7 +381,7 @@ TKuduKeyRange* KuduScanNode::GetNextKeyRange() {
 }
 
 Status KuduScanNode::GetConjunctCtxs(vector<ExprContext*>* ctxs) {
-  return Expr::Clone(conjunct_ctxs_, state_, ctxs);
+  return Expr::CloneIfNotExists(conjunct_ctxs_, state_, ctxs);
 }
 
 void KuduScanNode::ClonePredicates(vector<KuduPredicate*>* predicates) {

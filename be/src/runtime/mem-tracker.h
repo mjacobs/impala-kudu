@@ -116,8 +116,8 @@ class MemTracker {
 
   /// Increases consumption of this tracker and its ancestors by 'bytes'.
   void Consume(int64_t bytes) {
-    if (bytes < 0) {
-      Release(-bytes);
+    if (bytes <= 0) {
+      if (bytes < 0) Release(-bytes);
       return;
     }
 
@@ -126,7 +126,6 @@ class MemTracker {
       consumption_->Set(consumption_metric_->value());
       return;
     }
-    if (bytes == 0) return;
     if (UNLIKELY(enable_logging_)) LogUpdate(true, bytes);
     for (std::vector<MemTracker*>::iterator tracker = all_trackers_.begin();
          tracker != all_trackers_.end(); ++tracker) {
@@ -171,20 +170,29 @@ class MemTracker {
       MemTracker* tracker = all_trackers_[i];
       int64_t limit = tracker->effective_limit();
       if (limit < 0) {
-        tracker->consumption_->Add(bytes);
+        tracker->consumption_->Add(bytes); // No limit at this tracker.
       } else {
-        if (!tracker->consumption_->TryAdd(bytes, limit)) {
-          // One of the trackers failed, attempt to GC memory or expand our limit. If that
-          // succeeds, TryUpdate() again. Bail if either fails.
-          //
+        // If TryConsume fails, we can try to GC or expand the RM reservation, but we may
+        // need to try several times if there are concurrent consumers because we don't
+        // take a lock before trying to update consumption_.
+        bool fail_consume = false;
+        while (!tracker->consumption_->TryAdd(bytes, limit)) {
+          VLOG_RPC << "TryConsume failed, bytes=" << bytes
+                   << " consumption=" << tracker->consumption_->current_value()
+                   << " limit=" << limit << " attempting to GC and expand reservation";
           // TODO: This may not be right if more than one tracker can actually change its
-          // rm reservation limit.
-          if (!tracker->GcMemory(limit - bytes) || tracker->ExpandRmReservation(bytes)) {
-            if (!tracker->consumption_->TryAdd(bytes, tracker->limit_)) break;
-          } else {
+          // RM reservation limit.
+          if (tracker->GcMemory(limit - bytes) && !tracker->ExpandRmReservation(bytes)) {
+            fail_consume = true;
             break;
           }
+          VLOG_RPC << "GC or expansion succeeded, TryConsume bytes=" << bytes
+                   << " consumption=" << tracker->consumption_->current_value()
+                   << " new limit=" << tracker->effective_limit() << " prev=" << limit;
+          // Need to update the limit if the RM reservation was expanded.
+          limit = tracker->effective_limit();
         }
+        if (fail_consume) break;
       }
     }
     // Everyone succeeded, return.
@@ -207,8 +215,8 @@ class MemTracker {
 
   /// Decreases consumption of this tracker and its ancestors by 'bytes'.
   void Release(int64_t bytes) {
-    if (bytes < 0) {
-      Consume(-bytes);
+    if (bytes <= 0) {
+      if (bytes < 0) Consume(-bytes);
       return;
     }
 
@@ -221,7 +229,6 @@ class MemTracker {
       consumption_->Set(consumption_metric_->value());
       return;
     }
-    if (bytes == 0) return;
     if (UNLIKELY(enable_logging_)) LogUpdate(false, bytes);
     for (std::vector<MemTracker*>::iterator tracker = all_trackers_.begin();
          tracker != all_trackers_.end(); ++tracker) {

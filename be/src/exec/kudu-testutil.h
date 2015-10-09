@@ -195,10 +195,18 @@ class KuduTestHelper {
     t_tbl_desc.__set_id(0);
     t_tbl_desc.__set_tableType(::impala::TTableType::KUDU_TABLE);
     t_tbl_desc.__set_kuduTable(t_kudu_table);
-    t_tbl_desc.__set_colNames(boost::assign::list_of("key")("int_val")("string_val"));
 
+    TColumnDescriptor key;
+    key.__set_name("key");
+
+    TColumnDescriptor int_val;
+    int_val.__set_name("int_val");
+
+    TColumnDescriptor string_val;
+    string_val.__set_name("string_val");
+
+    t_tbl_desc.__set_columnDescriptors(boost::assign::list_of(key)(int_val)(string_val));
     desc_builder.SetTableDescriptor(t_tbl_desc);
-
     *desc_tbl = desc_builder.Build();
   }
 

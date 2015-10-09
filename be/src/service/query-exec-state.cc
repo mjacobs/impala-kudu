@@ -53,6 +53,7 @@ namespace impala {
 static const string PER_HOST_MEM_KEY = "Estimated Per-Host Mem";
 static const string PER_HOST_VCORES_KEY = "Estimated Per-Host VCores";
 static const string TABLES_MISSING_STATS_KEY = "Tables Missing Stats";
+static const string TABLES_WITH_CORRUPT_STATS_KEY = "Tables With Corrupt Table Stats";
 
 ImpalaServer::QueryExecState::QueryExecState(
     const TQueryCtx& query_ctx, ExecEnv* exec_env, Frontend* frontend,
@@ -374,6 +375,19 @@ Status ImpalaServer::QueryExecState::ExecQueryOrDmlRequest(
     summary_profile_.AddInfoString(TABLES_MISSING_STATS_KEY, ss.str());
   }
 
+  if (!query_exec_request.query_ctx.__isset.parent_query_id &&
+      query_exec_request.query_ctx.__isset.tables_with_corrupt_stats &&
+      !query_exec_request.query_ctx.tables_with_corrupt_stats.empty()) {
+    stringstream ss;
+    const vector<TTableName>& tbls =
+        query_exec_request.query_ctx.tables_with_corrupt_stats;
+    for (int i = 0; i < tbls.size(); ++i) {
+      if (i != 0) ss << ",";
+      ss << tbls[i].db_name << "." << tbls[i].table_name;
+    }
+    summary_profile_.AddInfoString(TABLES_WITH_CORRUPT_STATS_KEY, ss.str());
+  }
+
   // If desc_tbl is not set, query has SELECT with no FROM. In that
   // case, the query can only have a single fragment, and that fragment needs to be
   // executed by the coordinator. This check confirms that.
@@ -481,6 +495,7 @@ Status ImpalaServer::QueryExecState::ExecDdlRequest() {
     // wait for another catalog update if any partitions were altered as a result
     // of the operation.
     DCHECK(exec_request_.__isset.query_exec_request);
+    DCHECK(exec_request_.__isset.catalog_cleanup_request);
     RETURN_IF_ERROR(ExecQueryOrDmlRequest(exec_request_.query_exec_request));
   }
   return Status::OK();
@@ -509,6 +524,13 @@ void ImpalaServer::QueryExecState::Done() {
 
   // Update result set cache metrics, and update mem limit accounting.
   ClearResultCache();
+
+  if (!query_status_.ok() && catalog_op_type() == TCatalogOpType::DDL &&
+      ddl_type() == TDdlType::CREATE_TABLE_AS_SELECT) {
+    LOG(INFO) << "Delete newly created table due to error in CTAS query: "
+              << query_status_.GetDetail();
+    CtasCleanup();
+  }
 }
 
 Status ImpalaServer::QueryExecState::Exec(const TMetadataOpRequest& exec_request) {
@@ -566,7 +588,8 @@ Status ImpalaServer::QueryExecState::WaitInternal() {
     RETURN_IF_ERROR(UpdateCatalog());
   }
 
-  if (ddl_type() == TDdlType::COMPUTE_STATS && child_queries_.size() > 0) {
+  if (catalog_op_type() == TCatalogOpType::DDL &&
+      ddl_type() == TDdlType::COMPUTE_STATS && child_queries_.size() > 0) {
     RETURN_IF_ERROR(UpdateTableAndColumnStats());
   }
 
@@ -574,10 +597,9 @@ Status ImpalaServer::QueryExecState::WaitInternal() {
     // Queries that do not return a result are finished at this point. This includes
     // DML operations and a subset of the DDL operations.
     eos_ = true;
-  } else {
-    if (ddl_type() == TDdlType::CREATE_TABLE_AS_SELECT) {
-      SetCreateTableAsSelectResultSet();
-    }
+  } else if (catalog_op_type() == TCatalogOpType::DDL &&
+      ddl_type() == TDdlType::CREATE_TABLE_AS_SELECT) {
+    SetCreateTableAsSelectResultSet();
   }
   // Rows are available now (for SELECT statement), so start the 'wait' timer that tracks
   // how long Impala waits for the client to fetch rows. For other statements, track the
@@ -708,6 +730,8 @@ Status ImpalaServer::QueryExecState::FetchRowsInternal(const int32_t max_rows,
     }
   }
   ExprContext::FreeLocalAllocations(output_expr_ctxs_);
+  // Check if there was an error evaluating a row value.
+  RETURN_IF_ERROR(coord_->runtime_state()->CheckQueryState());
 
   // Update the result cache if necessary.
   if (result_cache_max_size_ > 0 && result_cache_.get() != NULL) {
@@ -1017,10 +1041,33 @@ void ImpalaServer::QueryExecState::ClearResultCache() {
   int64_t total_bytes = result_cache_->ByteSize();
   ImpaladMetrics::RESULTSET_CACHE_TOTAL_BYTES->Increment(-total_bytes);
   if (coord_ != NULL) {
-    DCHECK_NOTNULL(coord_->query_mem_tracker());
+    DCHECK(coord_->query_mem_tracker() != NULL);
     coord_->query_mem_tracker()->Release(total_bytes);
   }
   result_cache_.reset(NULL);
+}
+
+void ImpalaServer::QueryExecState::CtasCleanup() {
+  DCHECK(catalog_op_type() == TCatalogOpType::DDL &&
+      ddl_type() == TDdlType::CREATE_TABLE_AS_SELECT);
+  // Cleanup newly created table, don't update original query status.
+  const TDdlExecResponse* ddl_resp = catalog_op_executor_->ddl_exec_response();
+  // ddl_resp is NULL means the DDL execution fails.
+  // table will not be created and there is nothing to cleanup.
+  if (ddl_resp != NULL && ddl_resp->new_table_created) {
+    CatalogOpExecutor droptable_op_executor(exec_env_, frontend_,
+        &server_profile_);
+    Status status = droptable_op_executor.Exec(exec_request_.catalog_cleanup_request);
+    if (status.ok()) {
+      // Cleanup catalog cache.
+      parent_server_->ProcessCatalogUpdateResult(
+          *droptable_op_executor.update_catalog_result(),
+          exec_request_.query_options.sync_ddl);
+    } else {
+      LOG(ERROR) << "Cannot drop table created by CTAS query: "
+                 << status.GetDetail();
+    }
+  }
 }
 
 }

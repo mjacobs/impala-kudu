@@ -10,7 +10,9 @@ import org.slf4j.LoggerFactory;
 import com.cloudera.impala.analysis.AnalysisContext;
 import com.cloudera.impala.analysis.ColumnLineageGraph;
 import com.cloudera.impala.analysis.Expr;
+import com.cloudera.impala.analysis.ExprSubstitutionMap;
 import com.cloudera.impala.analysis.InsertStmt;
+import com.cloudera.impala.analysis.QueryStmt;
 import com.cloudera.impala.catalog.HBaseTable;
 import com.cloudera.impala.catalog.Table;
 import com.cloudera.impala.common.ImpalaException;
@@ -24,7 +26,6 @@ import com.cloudera.impala.util.MaxRowsProcessedVisitor;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-
 
 /**
  * Creates an executable plan from an analyzed parse tree and query options.
@@ -41,6 +42,15 @@ public class Planner {
   /**
    * Returns a list of plan fragments for executing an analyzed parse tree.
    * May return a single-node or distributed executable plan.
+   *
+   * Plan generation may fail and throw for the following reasons:
+   * 1. Expr evaluation failed, e.g., during partition pruning.
+   * 2. A certain feature is not yet implemented, e.g., physical join implementation for
+   *    outer/semi joins without equi conjuncts.
+   * 3. Expr substitution failed, e.g., because an expr was substituted with a type that
+   *    render the containing expr semantically invalid. Analysis should have ensured
+   *    that such an expr substitution during plan generation never fails. If it does,
+   *    that typically means there is a bug in analysis, or a broken/missing smap.
    */
   public ArrayList<PlanFragment> createPlan() throws ImpalaException {
     SingleNodePlanner singleNodePlanner = new SingleNodePlanner(ctx_);
@@ -71,6 +81,7 @@ public class Planner {
       fragments = Lists.newArrayList(new PlanFragment(
           ctx_.getNextFragmentId(), singleNodePlan, DataPartition.UNPARTITIONED));
     } else {
+      singleNodePlanner.validatePlan(singleNodePlan);
       // create distributed plan
       fragments = distributedPlanner.createPlanFragments(singleNodePlan);
     }
@@ -93,21 +104,31 @@ public class Planner {
       rootFragment.setSink(ctx_.getAnalysisResult().getDeleteStmt().createDataSink());
     }
 
+    ExprSubstitutionMap rootNodeSmap = rootFragment.getPlanRoot().getOutputSmap();
     ColumnLineageGraph graph = ctx_.getRootAnalyzer().getColumnLineageGraph();
     List<Expr> resultExprs = null;
     Table targetTable = null;
     if (ctx_.isInsertOrCtas()) {
       InsertStmt insertStmt = ctx_.getAnalysisResult().getInsertStmt();
+      insertStmt.substituteResultExprs(rootNodeSmap, ctx_.getRootAnalyzer());
       resultExprs = insertStmt.getResultExprs();
       targetTable = insertStmt.getTargetTable();
+      if (!ctx_.isSingleNodeExec()) {
+        // repartition on partition keys
+        rootFragment = distributedPlanner.createInsertFragment(
+            rootFragment, insertStmt, ctx_.getRootAnalyzer(), fragments);
+      }
       graph.addTargetColumnLabels(targetTable);
     } else {
+      QueryStmt queryStmt = ctx_.getQueryStmt();
+      queryStmt.substituteResultExprs(rootNodeSmap, ctx_.getRootAnalyzer());
       resultExprs = ctx_.getQueryStmt().getResultExprs();
       graph.addTargetColumnLabels(ctx_.getQueryStmt().getColLabels());
     }
     resultExprs = Expr.substituteList(resultExprs,
         rootFragment.getPlanRoot().getOutputSmap(), ctx_.getRootAnalyzer(), true);
     rootFragment.setOutputExprs(resultExprs);
+
     LOG.debug("desctbl: " + ctx_.getRootAnalyzer().getDescTbl().debugString());
     LOG.debug("resultexprs: " + Expr.debugString(rootFragment.getOutputExprs()));
     LOG.debug("finalize plan fragments");
@@ -156,6 +177,22 @@ public class Planner {
           request.per_host_vcores));
       hasHeader = true;
     }
+
+    // IMPALA-1983 In the case of corrupt stats, issue a warning for all queries except
+    // child queries of 'compute stats'.
+    if (!request.query_ctx.isSetParent_query_id() &&
+        request.query_ctx.isSetTables_with_corrupt_stats() &&
+        !request.query_ctx.getTables_with_corrupt_stats().isEmpty()) {
+      List<String> tableNames = Lists.newArrayList();
+      for (TTableName tableName: request.query_ctx.getTables_with_corrupt_stats()) {
+        tableNames.add(tableName.db_name + "." + tableName.table_name);
+      }
+      str.append("WARNING: The following tables have potentially corrupt table\n" +
+          "statistics. Drop and re-compute statistics to resolve this problem.\n" +
+          Joiner.on(", ").join(tableNames) + "\n");
+      hasHeader = true;
+    }
+
     // Append warning about tables missing stats except for child queries of
     // 'compute stats'. The parent_query_id is only set for compute stats child queries.
     if (!request.query_ctx.isSetParent_query_id() &&
@@ -169,6 +206,7 @@ public class Planner {
           "and/or column statistics.\n" + Joiner.on(", ").join(tableNames) + "\n");
       hasHeader = true;
     }
+
     if (request.query_ctx.isDisable_spilling()) {
       str.append("WARNING: Spilling is disabled for this query as a safety guard.\n" +
           "Reason: Query option disable_unsafe_spills is set, at least one table\n" +

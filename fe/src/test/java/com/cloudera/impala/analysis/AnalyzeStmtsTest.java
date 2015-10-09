@@ -20,8 +20,7 @@ import static org.junit.Assert.fail;
 import java.lang.reflect.Field;
 import java.util.List;
 
-import junit.framework.Assert;
-
+import org.junit.Assert;
 import org.junit.Test;
 
 import com.cloudera.impala.catalog.PrimitiveType;
@@ -320,52 +319,77 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
 
   /**
    * Checks that the given SQL analyzes ok, and asserts that the last result expr in the
-   * parsed SelectStmt is a SlotRef whose absolute physical path is identical to the
-   * given expected one. Intentionally allows multiple result exprs to be analyzed to
-   * test absolute path caching, though only the last path is validated.
+   * parsed SelectStmt is a scalar SlotRef whose absolute path is identical to the given
+   * expected one. Also asserts that the slot's absolute path is equal to its
+   * materialized path. Intentionally allows multiple result exprs to be analyzed to test
+   * absolute path caching, though only the last path is validated.
    */
-  private void testSlotRefPath(String sql, List<Integer> expectedPhysPath) {
+  private void testSlotRefPath(String sql, List<Integer> expectedAbsPath) {
     SelectStmt stmt = (SelectStmt) AnalyzesOk(sql);
     Expr e = stmt.getResultExprs().get(stmt.getResultExprs().size() - 1);
     Preconditions.checkState(e instanceof SlotRef);
+    Preconditions.checkState(e.getType().isScalarType());
     SlotRef slotRef = (SlotRef) e;
-    List<Integer> actualPhysPath = slotRef.getDesc().getAbsolutePath();
-    Assert.assertTrue(String.format("Expected path: %s\nActual path:%s",
-        expectedPhysPath, actualPhysPath),
-        actualPhysPath.equals(expectedPhysPath));
+    List<Integer> actualAbsPath = slotRef.getDesc().getPath().getAbsolutePath();
+    Assert.assertEquals("Mismatched absolute paths.", expectedAbsPath, actualAbsPath);
+    List<Integer> actualMatPath = slotRef.getDesc().getMaterializedPath();
+    Assert.assertEquals("Mismatched absolute/materialized paths.",
+        actualAbsPath, actualMatPath);
   }
 
   /**
    * Checks that the given SQL analyzes ok, and asserts that all result exprs in the
-   * parsed SelectStmt are SlotRefs and that the absolute physical path of result expr at
-   * position i matches expectedPhysPaths[i].
+   * parsed SelectStmt are SlotRefs and that the absolute path of result expr at
+   * position i matches expectedAbsPaths[i]. Also asserts for all SlotRefs that the
+   * materialized path of its SlotDescriptor is identical to its absolute path.
    */
-  private void testStarPath(String sql, List<Integer>... expectedPhysPaths) {
+  private void testStarPath(String sql, List<Integer>... expectedAbsPaths) {
     SelectStmt stmt = (SelectStmt) AnalyzesOk(sql);
-    List<List<Integer>> actualPaths = Lists.newArrayList();
+    List<List<Integer>> actualAbsPaths = Lists.newArrayList();
     for (int i = 0; i < stmt.getResultExprs().size(); ++i) {
       Expr e = stmt.getResultExprs().get(i);
       Preconditions.checkState(e instanceof SlotRef);
       SlotRef slotRef = (SlotRef) e;
-      actualPaths.add(slotRef.getDesc().getAbsolutePath());
+      List<Integer> actualAbsPath = slotRef.getDesc().getPath().getAbsolutePath();
+      List<Integer> actualMatPath = slotRef.getDesc().getMaterializedPath();
+      Assert.assertEquals("Mismatched paths.", actualAbsPath, actualMatPath);
+      actualAbsPaths.add(actualAbsPath);
     }
-    List<List<Integer>> expectedPaths = Lists.newArrayList(expectedPhysPaths);
-    Assert.assertTrue(String.format("Expected paths: %s\nActual paths:%s",
-        expectedPaths, actualPaths),
-        actualPaths.equals(expectedPaths));
+    List<List<Integer>> expectedPaths = Lists.newArrayList(expectedAbsPaths);
+    Assert.assertEquals("Mismatched absolute paths.", expectedPaths, actualAbsPaths);
+
   }
 
   /**
-   * Checks that the given SQL analyzes ok, and asserts that the last table ref in the
-   * parsed SelectStmt has an absolute physical path identical to the given expected one.
+   * Checks that the given SQL analyzes ok. Asserts that the last table ref in the
+   * parsed SelectStmt has an absolute path identical to the given expected one, and
+   * likewise for the materialized path. For non-relative table refs the materialized
+   * path is expected to be null, otherwise the given materialized path must be identical
+   * to the materialized path of the slot that materializes the referenced collection in
+   * the parent tuple.
    */
-  private void testTableRefPath(String sql, List<Integer> expectedPhysPath) {
+  private void testTableRefPath(String sql, List<Integer> expectedAbsPath,
+      List<Integer> expectedMatPath) {
     SelectStmt stmt = (SelectStmt) AnalyzesOk(sql);
     TableRef lastTblRef = stmt.getTableRefs().get(stmt.getTableRefs().size() - 1);
-    List<Integer> actualPhysPath = lastTblRef.getDesc().getPath().getAbsolutePath();
-    Assert.assertTrue(String.format("Expected path: %s\nActual path:%s",
-        expectedPhysPath, actualPhysPath),
-        actualPhysPath.equals(expectedPhysPath));
+    // Check absolute path.
+    List<Integer> actualAbsPath = lastTblRef.getDesc().getPath().getAbsolutePath();
+    Assert.assertEquals("Mismatched absolute paths.", expectedAbsPath, actualAbsPath);
+    // Check materialized path.
+    if (!lastTblRef.isRelative()) {
+      Assert.assertNull("There is no materialized path for non-relative table refs.\n" +
+          "The expected materialized path should be null.", expectedMatPath);
+      return;
+    }
+    CollectionTableRef collectionTblRef = (CollectionTableRef) lastTblRef;
+    Expr collectionExpr = collectionTblRef.getCollectionExpr();
+    Preconditions.checkState(collectionExpr instanceof SlotRef);
+    SlotRef collectionSlotRef = (SlotRef) collectionExpr;
+    SlotDescriptor collectionSlotDesc = collectionSlotRef.getDesc();
+    Assert.assertEquals("Mismatched paths.",
+        actualAbsPath, collectionSlotDesc.getPath().getAbsolutePath());
+    Assert.assertEquals("Mismatched materialized paths.",
+        expectedMatPath, collectionSlotDesc.getMaterializedPath());
   }
 
   @SuppressWarnings("unchecked")
@@ -478,52 +502,61 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "                  m2:map<int,struct<x:int,y:int,m3:map<int,int>>>>>)");
 
     // Test paths with c3.
-    testTableRefPath("select 1 from d.t7.c3.a1", path(2, 0, 0));
-    testTableRefPath("select 1 from d.t7.c3.item.a1", path(2, 0, 0));
+    testTableRefPath("select 1 from d.t7.c3.a1", path(2, 0, 0), null);
+    testTableRefPath("select 1 from d.t7.c3.item.a1", path(2, 0, 0), null);
     testSlotRefPath("select item from d.t7.c3.a1", path(2, 0, 0, 0));
     testSlotRefPath("select item from d.t7.c3.item.a1", path(2, 0, 0, 0));
-    testTableRefPath("select 1 from d.t7.c3.a2", path(2, 0, 1));
-    testTableRefPath("select 1 from d.t7.c3.item.a2", path(2, 0, 1));
+    testTableRefPath("select 1 from d.t7.c3.a2", path(2, 0, 1), null);
+    testTableRefPath("select 1 from d.t7.c3.item.a2", path(2, 0, 1), null);
     testSlotRefPath("select x from d.t7.c3.a2", path(2, 0, 1, 0, 0));
     testSlotRefPath("select x from d.t7.c3.item.a2", path(2, 0, 1, 0, 0));
-    testTableRefPath("select 1 from d.t7.c3.a2.a3", path(2, 0, 1, 0, 2));
-    testTableRefPath("select 1 from d.t7.c3.item.a2.item.a3", path(2, 0, 1, 0, 2));
+    testTableRefPath("select 1 from d.t7.c3.a2.a3", path(2, 0, 1, 0, 2), null);
+    testTableRefPath("select 1 from d.t7.c3.item.a2.item.a3", path(2, 0, 1, 0, 2), null);
     testSlotRefPath("select item from d.t7.c3.a2.a3", path(2, 0, 1, 0, 2, 0));
     testSlotRefPath("select item from d.t7.c3.item.a2.item.a3", path(2, 0, 1, 0, 2, 0));
     // Test path assembly with multiple tuple descriptors.
-    testTableRefPath("select 1 from d.t7, t7.c3, c3.a2, a2.a3", path(2, 0, 1, 0, 2));
+    testTableRefPath("select 1 from d.t7, t7.c3, c3.a2, a2.a3",
+        path(2, 0, 1, 0, 2), path(2, 0, 1, 0, 2));
     testTableRefPath("select 1 from d.t7, t7.c3, c3.item.a2, a2.item.a3",
-        path(2, 0, 1, 0, 2));
+        path(2, 0, 1, 0, 2), path(2, 0, 1, 0, 2));
     testSlotRefPath("select y from d.t7, t7.c3, c3.a2, a2.a3", path(2, 0, 1, 0, 1));
     testSlotRefPath("select y, x from d.t7, t7.c3, c3.a2, a2.a3", path(2, 0, 1, 0, 0));
     testSlotRefPath("select x, y from d.t7, t7.c3.item.a2, a2.a3", path(2, 0, 1, 0, 1));
     testSlotRefPath("select a1.item from d.t7, t7.c3, c3.a1, c3.a2, a2.a3",
         path(2, 0, 0, 0));
+    // Test materialized path.
+    testTableRefPath("select 1 from d.t7, t7.c3.a1", path(2, 0, 0), path(2));
+    testTableRefPath("select 1 from d.t7, t7.c3.a2", path(2, 0, 1), path(2));
+    testTableRefPath("select 1 from d.t7, t7.c3.a2.a3", path(2, 0, 1, 0, 2), path(2));
+    testTableRefPath("select 1 from d.t7, t7.c3, c3.a2.a3",
+        path(2, 0, 1, 0, 2), path(2, 0, 1));
 
     // Test paths with c5.
-    testTableRefPath("select 1 from d.t7.c5.m1", path(4, 1, 0));
-    testTableRefPath("select 1 from d.t7.c5.value.m1", path(4, 1, 0));
+    testTableRefPath("select 1 from d.t7.c5.m1", path(4, 1, 0), null);
+    testTableRefPath("select 1 from d.t7.c5.value.m1", path(4, 1, 0), null);
     testSlotRefPath("select key from d.t7.c5.m1", path(4, 1, 0, 0));
     testSlotRefPath("select key from d.t7.c5.value.m1", path(4, 1, 0, 0));
     testSlotRefPath("select value from d.t7.c5.m1", path(4, 1, 0, 1));
     testSlotRefPath("select value from d.t7.c5.value.m1", path(4, 1, 0, 1));
-    testTableRefPath("select 1 from d.t7.c5.m2", path(4, 1, 1));
-    testTableRefPath("select 1 from d.t7.c5.value.m2", path(4, 1, 1));
+    testTableRefPath("select 1 from d.t7.c5.m2", path(4, 1, 1), null);
+    testTableRefPath("select 1 from d.t7.c5.value.m2", path(4, 1, 1), null);
     testSlotRefPath("select key from d.t7.c5.m2", path(4, 1, 1, 0));
     testSlotRefPath("select key from d.t7.c5.value.m2", path(4, 1, 1, 0));
     testSlotRefPath("select x from d.t7.c5.m2", path(4, 1, 1, 1, 0));
     testSlotRefPath("select x from d.t7.c5.value.m2", path(4, 1, 1, 1, 0));
-    testTableRefPath("select 1 from d.t7.c5.m2.m3", path(4, 1, 1, 1, 2));
-    testTableRefPath("select 1 from d.t7.c5.value.m2.value.m3", path(4, 1, 1, 1, 2));
+    testTableRefPath("select 1 from d.t7.c5.m2.m3", path(4, 1, 1, 1, 2), null);
+    testTableRefPath("select 1 from d.t7.c5.value.m2.value.m3",
+        path(4, 1, 1, 1, 2), null);
     testSlotRefPath("select key from d.t7.c5.m2.m3", path(4, 1, 1, 1, 2, 0));
     testSlotRefPath("select key from d.t7.c5.value.m2.value.m3", path(4, 1, 1, 1, 2, 0));
     testSlotRefPath("select value from d.t7.c5.m2.m3", path(4, 1, 1, 1, 2, 1));
     testSlotRefPath("select value from d.t7.c5.value.m2.value.m3",
         path(4, 1, 1, 1, 2, 1));
     // Test path assembly with multiple tuple descriptors.
-    testTableRefPath("select 1 from d.t7, t7.c5, c5.m2, m2.m3", path(4, 1, 1, 1, 2));
+    testTableRefPath("select 1 from d.t7, t7.c5, c5.m2, m2.m3",
+        path(4, 1, 1, 1, 2), path(4, 1, 1, 1, 2));
     testTableRefPath("select 1 from d.t7, t7.c5, c5.value.m2, m2.value.m3",
-        path(4, 1, 1, 1, 2));
+        path(4, 1, 1, 1, 2), path(4, 1, 1, 1, 2));
     testSlotRefPath("select y from d.t7, t7.c5, c5.m2, m2.m3",
         path(4, 1, 1, 1, 1));
     testSlotRefPath("select y, x from d.t7, t7.c5, c5.m2, m2.m3",
@@ -532,6 +565,31 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         path(4, 1, 1, 1, 1));
     testSlotRefPath("select m1.key from d.t7, t7.c5, c5.m1, c5.m2, m2.m3",
         path(4, 1, 0, 0));
+    // Test materialized path.
+    testTableRefPath("select 1 from d.t7, t7.c5.m1", path(4, 1, 0), path(4));
+    testTableRefPath("select 1 from d.t7, t7.c5.m2", path(4, 1, 1), path(4));
+    testTableRefPath("select 1 from d.t7, t7.c5.m2.m3", path(4, 1, 1, 1, 2), path(4));
+    testTableRefPath("select 1 from d.t7, t7.c5, c5.m2.m3",
+        path(4, 1, 1, 1, 2), path(4, 1, 1));
+
+    // Tests that an attempted implicit match must be succeeded by an explicit match.
+    addTestTable("create table d.t8 (" +
+        "s1 struct<" +
+        "  s2:struct<" +
+        "    a:array<" +
+        "      array<struct<" +
+        "        e:int,f:string>>>>>)");
+    // Explanation of test:
+    // - d.t8.s1.s2.a resolves to a CollectionStructType with fields 'item' and 'pos'
+    // - we are allowed to implicitly skip the 'item' field
+    // - d.t8.s1.s2.a.item again resolves to a CollectionStructType with 'item' and 'pos'
+    // - however, we are not allowed to implicitly skip 'item' again, since we have
+    //   already skipped 'item' previously
+    // - the rule is: an implicit match must be followed by an explicit one
+    AnalysisError("select f from d.t8.s1.s2.a",
+        "Could not resolve column/field reference: 'f'");
+    AnalysisError("select 1 from d.t8.s1.s2.a, a.f",
+        "Could not resolve table reference: 'a.f'");
   }
 
   @Test
@@ -634,9 +692,10 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalysisError("select t.a.a.a.* from a.a t",
         "Cannot expand star in 't.a.a.a.*' because path 't.a.a.a' " +
         "resolved to type 'INT'.");
+    // Not ambiguous, but expands to an empty select list.
     AnalysisError("select t.* from a.a t",
-        "Expr 't.a' in select list returns a complex type 'STRUCT<a:STRUCT<a:INT>>'.\n" +
-        "Only scalar types are allowed in the select list.");
+        "The star exprs expanded to an empty select list because the referenced " +
+        "tables only have complex-typed columns.");
 
     // Star paths are ambiguous.
     AnalysisError("select a.* from a.a",
@@ -790,6 +849,22 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
    */
   @Test
   public void TestComplexTypesInSelectList() {
+    // Star only expands to the scalar-typed fields.
+    AnalyzesOk("select * from functional.allcomplextypes " +
+        "cross join functional_parquet.alltypes");
+    AnalyzesOk("select complex_struct_col.* from functional.allcomplextypes");
+    // The result exprs could be empty after star expansion.
+    addTestTable("create table only_complex_types " +
+        "(a array<int>, b struct<x:int, y:int>, c map<string, int>)");
+    AnalysisError("select * from only_complex_types",
+        "The star exprs expanded to an empty select list because the referenced " +
+        "tables only have complex-typed columns.");
+    AnalysisError("select a.* from only_complex_types a, " +
+        "functional.allcomplextypes b",
+        "The star exprs expanded to an empty select list because the referenced " +
+        "tables only have complex-typed columns.");
+    // Empty star expansion, but non empty result exprs.
+    AnalyzesOk("select 1, * from only_complex_types");
     // Illegal complex-typed expr in select list.
     AnalysisError("select int_struct_col from functional.allcomplextypes",
         "Expr 'int_struct_col' in select list returns a " +
@@ -818,16 +893,6 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "select int_struct_col from functional.allcomplextypes",
         "Expr 'int_struct_col' in select list returns a " +
         "complex type 'STRUCT<f1:INT,f2:INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
-    // Legal star expansion adds illegal complex-typed expr.
-    AnalysisError("select * from functional.allcomplextypes " +
-        "cross join functional_parquet.alltypes",
-        "Expr 'functional.allcomplextypes.int_array_col' in select list returns a " +
-        "complex type 'ARRAY<INT>'.\n" +
-        "Only scalar types are allowed in the select list.");
-    AnalysisError("select complex_struct_col.* from functional.allcomplextypes",
-        "Expr 'functional.allcomplextypes.complex_struct_col.f2' in select list " +
-        "returns a complex type 'ARRAY<INT>'.\n" +
         "Only scalar types are allowed in the select list.");
   }
 
@@ -1031,6 +1096,145 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select y x from " +
         "(select id y from functional.alltypestiny where id in " +
         "(select id from functional.alltypessmall)) a");
+  }
+
+  @Test
+  public void TestCorrelatedInlineViews() {
+    // Basic inline view with a single correlated table ref.
+    AnalyzesOk("select cnt from functional.allcomplextypes t, " +
+        "(select count(*) cnt from t.int_array_col) v");
+    AnalyzesOk("select cnt from functional.allcomplextypes t, " +
+        "(select cnt from (select count(*) cnt from t.int_array_col) v1) v2");
+    AnalyzesOk("select item from functional.allcomplextypes t, " +
+        "(select item from t.array_map_col.value) v");
+    // Multiple nesting levels.
+    AnalyzesOk("select item from functional.allcomplextypes t, " +
+        "(select * from (select * from (select item from t.int_array_col) v1) v2) v3");
+    // Mixing correlated and uncorrelated inline views in the same select block works.
+    AnalyzesOk("select v.cnt from functional.allcomplextypes t1 " +
+        "join (select * from functional.alltypes) t2 on (t1.id = t2.id) " +
+        "cross join (select count(*) cnt from t1.int_map_col) v");
+    // Multiple correlated table refs.
+    AnalyzesOk("select avg from functional.allcomplextypes t, " +
+        "(select avg(a1.item) avg from t.int_array_col a1, t.int_array_col a2) v");
+    AnalyzesOk("select item, key, value from functional.allcomplextypes t, " +
+        "(select * from t.int_array_col, t.int_map_col) v");
+    // Correlated inline view inside uncorrelated inline view.
+    AnalyzesOk("select cnt from functional.alltypes t1 inner join " +
+        "(select id, cnt from functional.allcomplextypes t2, " +
+        "(select count(1) cnt from t2.int_array_col) v1) v2");
+    // Correlated table ref has child ref itself.
+    AnalyzesOk("select key, item from functional.allcomplextypes t, " +
+        "(select a1.key, a2.item from t.array_map_col a1, a1.value a2) v");
+    AnalyzesOk("select key, av from functional.allcomplextypes t, " +
+        "(select a1.key, av from t.array_map_col a1, " +
+        "(select avg(item) av from a1.value a2) v1) v2");
+    // TOOD: Enable once we support complex-typed exprs in the select list.
+    //AnalyzesOk("select key, av from functional.allcomplextypes t, " +
+    //    "(select a1.key, a1.value from t.array_map_col a1) v1, " +
+    //    "(select avg(item) av from v1.value) v2");
+    // Multiple correlated table refs with different parents.
+    AnalyzesOk("select t1.id, t2.id, cnt, av from functional.allcomplextypes t1 " +
+        "left outer join functional.allcomplextypes t2 on (t1.id = t2.id), " +
+        "(select count(*) cnt from t1.array_map_col) v1, " +
+        "(select avg(item) av from t2.int_array_col) v2");
+    // Correlated table refs in a union.
+    AnalyzesOk("select item from functional.allcomplextypes t, " +
+        "(select * from t.int_array_col union all select * from t.int_array_col) v");
+    AnalyzesOk("select item from functional.allcomplextypes t, " +
+        "(select item from t.int_array_col union distinct " +
+        "select value from t.int_map_col) v");
+    // Correlated inline view in WITH-clause.
+    AnalyzesOk("with w as (select item from functional.allcomplextypes t, " +
+        "(select item from t.int_array_col) v) " +
+        "select * from w");
+    AnalyzesOk("with w as (select key, av from functional.allcomplextypes t, " +
+        "(select a1.key, av from t.array_map_col a1, " +
+        "(select avg(item) av from a1.value a2) v1) v2) " +
+        "select * from w");
+    // TOOD: Enable once we support complex-typed exprs in the select list.
+    //AnalyzesOk("with w as (select key, av from functional.allcomplextypes t, " +
+    //    "(select a1.key, a1.value from t.array_map_col a1) v1, " +
+    //    "(select avg(item) av from v1.value) v2) " +
+    //    "select * from w");
+
+    // Test behavior of aliases in correlated inline views.
+    // Inner reference resolves to the base table, not the implicit parent alias.
+    AnalyzesOk("select cnt from functional.allcomplextypes t, " +
+        "(select count(1) cnt from functional.allcomplextypes) v");
+    AnalyzesOk("select cnt from functional.allcomplextypes, " +
+        "(select count(1) cnt from functional.allcomplextypes) v");
+    AnalyzesOk("select cnt from functional.allcomplextypes, " +
+        "(select count(1) cnt from allcomplextypes) v", createAnalyzer("functional"));
+    // Illegal correlated reference.
+    AnalysisError("select cnt from functional.allcomplextypes t, " +
+        "(select count(1) cnt from t) v",
+        "Illegal table reference to non-collection type: 't'");
+    AnalysisError("select cnt from functional.allcomplextypes, " +
+        "(select count(1) cnt from allcomplextypes) v",
+        "Illegal table reference to non-collection type: 'allcomplextypes'");
+
+    // Un/correlated refs in a single nested query block.
+    AnalysisError("select cnt from functional.allcomplextypes t, " +
+        "(select count(1) cnt from functional.alltypes, t.int_array_col) v",
+        "Nested query is illegal because it contains a table reference " +
+        "'t.int_array_col' correlated with an outer block as well as an " +
+        "uncorrelated one 'functional.alltypes':\n" +
+        "SELECT count(1) cnt FROM functional.alltypes, t.int_array_col");
+    AnalysisError("select cnt from functional.allcomplextypes t, " +
+        "(select count(1) cnt from t.int_array_col, functional.alltypes) v",
+        "Nested query is illegal because it contains a table reference " +
+        "'t.int_array_col' correlated with an outer block as well as an " +
+        "uncorrelated one 'functional.alltypes':\n" +
+        "SELECT count(1) cnt FROM t.int_array_col, functional.alltypes");
+    // Un/correlated refs across multiple nested query blocks.
+    AnalysisError("select cnt from functional.allcomplextypes t, " +
+        "(select * from functional.alltypes, " +
+        "(select count(1) cnt from t.int_array_col) v1) v2",
+        "Nested query is illegal because it contains a table reference " +
+        "'t.int_array_col' correlated with an outer block as well as an " +
+        "uncorrelated one 'functional.alltypes':\n" +
+        "SELECT * FROM functional.alltypes, (SELECT count(1) cnt " +
+        "FROM t.int_array_col) v1");
+    // TOOD: Enable once we support complex-typed exprs in the select list.
+    // Correlated table ref has correlated inline view as parent.
+    //AnalysisError("select cnt from functional.allcomplextypes t, " +
+    //    "(select value arr from t.array_map_col) v1, " +
+    //    "(select item from v1.arr, functional.alltypestiny) v2",
+    //    "Nested query is illegal because it contains a table reference " +
+    //    "'v1.arr' correlated with an outer block as well as an " +
+    //    "uncorrelated one 'functional.alltypestiny':\n" +
+    //    "SELECT item FROM v1.arr, functional.alltypestiny");
+    // Un/correlated refs in union operands.
+    AnalysisError("select cnt from functional.allcomplextypes t, " +
+        "(select bigint_col from functional.alltypes " +
+        "union select count(1) cnt from t.int_array_col) v1",
+        "Nested query is illegal because it contains a table reference " +
+        "'t.int_array_col' correlated with an outer block as well as an " +
+        "uncorrelated one 'functional.alltypes':\n" +
+        "SELECT bigint_col FROM functional.alltypes " +
+        "UNION SELECT count(1) cnt FROM t.int_array_col");
+    // Un/correlated refs in WITH-clause view.
+    AnalysisError("with w as (select cnt from functional.allcomplextypes t, " +
+        "(select count(1) cnt from t.int_array_col, functional.alltypes) v) " +
+        "select * from w",
+        "Nested query is illegal because it contains a table reference " +
+        "'t.int_array_col' correlated with an outer block as well as an " +
+        "uncorrelated one 'functional.alltypes':\n" +
+        "SELECT count(1) cnt FROM t.int_array_col, functional.alltypes");
+
+    // Test that joins without an ON clause analyze ok if the rhs table is correlated.
+    for (JoinOperator joinOp: JoinOperator.values()) {
+      if (joinOp.isNullAwareLeftAntiJoin()) continue;
+      AnalyzesOk(String.format("select 1 from functional.allcomplextypes a %s " +
+          "(select item from a.int_array_col) v", joinOp));
+      AnalyzesOk(String.format("select 1 from functional.allcomplextypes a %s " +
+          "(select * from a.struct_array_col) v", joinOp));
+      AnalyzesOk(String.format("select 1 from functional.allcomplextypes a %s " +
+          "(select key, value from a.int_map_col) v", joinOp));
+      AnalyzesOk(String.format("select 1 from functional.allcomplextypes a %s " +
+          "(select * from a.struct_map_col) v", joinOp));
+    }
   }
 
   @Test
@@ -1578,16 +1782,12 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "'*' can only be used in conjunction with COUNT");
     AnalysisError("select max(*) from functional.testtbl",
         "'*' can only be used in conjunction with COUNT");
-    AnalysisError("select group_concat(*) from functional.testtbl",
-        "'*' can only be used in conjunction with COUNT");
 
     // multiple args
     AnalysisError("select count(id, zip) from functional.testtbl",
         "COUNT must have DISTINCT for multiple arguments: count(id, zip)");
     AnalysisError("select min(id, zip) from functional.testtbl",
         "No matching function with signature: min(BIGINT, INT).");
-    AnalysisError("select group_concat(name, '-', ',') from functional.testtbl",
-        "No matching function with signature: group_concat(STRING, STRING, STRING)");
 
     // nested aggregates
     AnalysisError("select sum(count(*)) from functional.testtbl",
@@ -1609,30 +1809,6 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // aggregate requires table in the FROM clause
     AnalysisError("select count(*)", "aggregation without a FROM clause is not allowed");
     AnalysisError("select min(1)", "aggregation without a FROM clause is not allowed");
-    AnalysisError("select group_concat('')",
-        "aggregation without a FROM clause is not allowed");
-
-    // test group_concat
-    AnalyzesOk("select group_concat(string_col) from functional.alltypes");
-    AnalyzesOk("select group_concat(string_col, '-') from functional.alltypes");
-    AnalyzesOk("select group_concat(string_col, string_col) from functional.alltypes");
-    // test all types as arguments
-    for (Type type: typeToLiteralValue_.keySet()) {
-      String literal = typeToLiteralValue_.get(type);
-      String query1 = String.format(
-          "select group_concat(%s) from functional.alltypes", literal);
-      String query2 = String.format(
-          "select group_concat(string_col, %s) from functional.alltypes", literal);
-      if (type.getPrimitiveType() == PrimitiveType.STRING || type.isNull()) {
-        AnalyzesOk(query1);
-        AnalyzesOk(query2);
-      } else {
-        AnalysisError(query1,
-            "No matching function with signature: group_concat(");
-        AnalysisError(query2,
-            "No matching function with signature: group_concat(");
-      }
-    }
 
     // Test distinct estimate
     for (Type type: typeToLiteralValue_.keySet()) {
@@ -1647,8 +1823,6 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select ndv(d1), distinctpc(d2), distinctpcsa(d3), count(distinct d4) "
         + "from functional.decimal_tbl");
     AnalyzesOk("select avg(d5) from functional.decimal_tbl");
-    AnalysisError("select group_concat(d5) from functional.decimal_tbl",
-        "No matching function with signature: group_concat(DECIMAL(10,5))");
 
     // Test select stmt avg smap.
     AnalyzesOk("select cast(avg(c1) as decimal(10,4)) as c from " +
@@ -1702,8 +1876,58 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select tinyint_col, count(distinct int_col),"
         + "min(distinct smallint_col), max(distinct string_col) "
         + "from functional.alltypesagg group by 1");
-    AnalysisError("select group_concat(distinct name) from functional.testtbl",
-            "GROUP_CONCAT() does not support DISTINCT");
+  }
+
+  @Test
+  public void TestGroupConcat() throws AnalysisException {
+    // Test valid and invalid parameters
+    AnalyzesOk("select group_concat(distinct name) from functional.testtbl");
+    AnalysisError("select group_concat(distinct name, name) from functional.testtbl",
+        "Second parameter in GROUP_CONCAT(DISTINCT) must be a constant expression" +
+        " that returns a string.");
+    AnalyzesOk("select group_concat(distinct name, cast(123 as string)) " +
+        "from functional.testtbl");
+    AnalysisError("select group_concat(distinct name, cast(id as string)) " +
+        "from functional.testtbl",
+         "Second parameter in GROUP_CONCAT(DISTINCT) must be a constant expression" +
+         " that returns a string.");
+    AnalyzesOk("select group_concat(distinct string_col, concat('-', '?')) " +
+        "from functional.alltypesagg");
+
+    AnalysisError("select group_concat(*) from functional.testtbl",
+        "'*' can only be used in conjunction with COUNT");
+
+    // test group_concat using a column as the custom separator
+    AnalyzesOk("select group_concat(string_col, string_col) from functional.alltypes");
+
+    // test group_concat without and with distinct
+    String[] keywords = new String[] {"distinct", ""};
+    for (String keyword: keywords) {
+      AnalysisError(String.format("select group_concat(%s '')", keyword), "aggregation" +
+          " without a FROM clause is not allowed");
+      AnalysisError(String.format("select group_concat(%s name, '-', ',') " +
+          "from functional.testtbl", keyword), "No matching function with signature: " +
+          "group_concat(STRING, STRING, STRING)");
+
+      // test all types as arguments
+      for (Type type: typeToLiteralValue_.keySet()) {
+        String literal = typeToLiteralValue_.get(type);
+        String query1 = String.format(
+            "select group_concat(%s %s) from functional.alltypes", keyword, literal);
+        String query2 = String.format(
+            "select group_concat(%s %s, '---') from functional.alltypes", keyword,
+            literal);
+        if (type.getPrimitiveType() == PrimitiveType.STRING || type.isNull()) {
+          AnalyzesOk(query1);
+          AnalyzesOk(query2);
+        } else {
+          AnalysisError(query1,
+              "No matching function with signature: group_concat(");
+          AnalysisError(query2,
+              "No matching function with signature: group_concat(");
+        }
+      }
+    }
   }
 
   @Test
@@ -1854,6 +2078,18 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select int_col + 0.5, count(*) from functional.alltypes group by 1");
     AnalyzesOk("select cast(int_col as double), count(*)" +
         "from functional.alltypes group by 1");
+
+    // select expression refers to column with same name as its own explicit alias and
+    // it's referred to by ordinal in group by (IMPALA-1898)
+    // Trivial example
+    AnalyzesOk("select bigint_col + 0 AS bigint_col, sum(smallint_col) " +
+               "FROM functional.alltypes " +
+               "GROUP BY 1");
+    // More complex example
+    AnalyzesOk("select extract(timestamp_col, 'hour') AS timestamp_col, string_col, " +
+               "sum(double_col) AS double_total " +
+               "FROM functional.alltypes " +
+               "GROUP BY 1, 2");
   }
 
   @Test
@@ -1929,6 +2165,20 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "select * from functional.alltypes order by int_col",
         "Ignoring ORDER BY clause without LIMIT or OFFSET: " +
         "ORDER BY int_col ASC");
+
+    // select expression refers to column with same name as its own explicit alias and
+    // it's referred to by ordinal in group by (IMPALA-1898)
+    AnalyzesOk("select extract(timestamp_col, 'hour') AS timestamp_col " +
+               "FROM functional.alltypes " +
+               "ORDER BY timestamp_col");
+
+    // Ordering by complex-typed expressions is not allowed.
+    AnalysisError("select * from functional_parquet.allcomplextypes " +
+        "order by int_struct_col", "ORDER BY expression 'int_struct_col' with " +
+        "complex type 'STRUCT<f1:INT,f2:INT>' is not supported.");
+    AnalysisError("select * from functional_parquet.allcomplextypes " +
+        "order by int_array_col", "ORDER BY expression 'int_array_col' with " +
+        "complex type 'ARRAY<INT>' is not supported.");
   }
 
   @Test
@@ -2161,12 +2411,28 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // Single view in WITH clause.
     AnalyzesOk("with t as (select int_col x, bigint_col y from functional.alltypes) " +
         "select x, y from t");
+    // Single view in WITH clause with column labels.
+    AnalyzesOk("with t(c1, c2) as (select int_col x, bigint_col y " +
+        "from functional.alltypes) " +
+        "select c1, c2 from t");
+    // Single view in WITH clause with the number of column labels less than the number
+    // of columns.
+    AnalyzesOk("with t(c1) as (select int_col, bigint_col y " +
+        "from functional.alltypes) " +
+        "select c1, y from t");
     // Multiple views in WITH clause. Only one view is used.
     AnalyzesOk("with t1 as (select int_col x, bigint_col y from functional.alltypes), " +
-        "t2 as (select 1 x , 10 y), t3 as (values(2 x , 20 y), (3, 30)), " +
+        "t2 as (select 1 x, 10 y), t3 as (values(2 x, 20 y), (3, 30)), " +
         "t4 as (select 4 x, 40 y union all select 5, 50), " +
         "t5 as (select * from (values(6 x, 60 y)) as a) " +
         "select x, y from t3");
+    // Multiple views in WITH clause with column labels. Only one view is used.
+    AnalyzesOk("with t1(c1, c2) as (select int_col, bigint_col " +
+        "from functional.alltypes), " +
+        "t2(c1, c2) as (select 1, 10), t3(a, b) as (values(2, 5), (3, 30)), " +
+        "t4(c1, c2) as (select 4, 40 union all select 5, 50), " +
+        "t5 as (select * from (values(6, 60)) as a) " +
+        "select a, b from t3");
     // Multiple views in WITH clause. All views used in a union.
     AnalyzesOk("with t1 as (select int_col x, bigint_col y from functional.alltypes), " +
         "t2 as (select 1 x , 10 y), t3 as (values(2 x , 20 y), (3, 30)), " +
@@ -2181,8 +2447,18 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "t5 as (select * from (values(6 x, 60 y)) as a) " +
         "select t1.y, t2.y, t3.y, t4.y, t5.y from t1, t2, t3, t4, t5 " +
         "where t1.y = t2.y and t2.y = t3.y and t3.y = t4.y and t4.y = t5.y");
+    // Multiple views in WITH clause with column labels. All views used in a join.
+    AnalyzesOk("with t1(c1, c2) as (select int_col x, bigint_col y " +
+        "from functional.alltypes), " +
+        "t2(c1, c2) as (select 1 x , 10 y), t3 as (values(2 x , 20 y), (3, 30)), " +
+        "t4 as (select 4 x, 40 y union all select 5, 50), " +
+        "t5 as (select * from (values(6 x, 60 y)) as a) " +
+        "select t1.c2, t2.c2, t3.y, t4.y, t5.y from t1, t2, t3, t4, t5 " +
+        "where t1.c2 = t2.c2 and t2.c2 = t3.y and t3.y = t4.y and t4.y = t5.y");
     // WITH clause in insert statement.
     AnalyzesOk("with t1 as (select * from functional.alltypestiny)" +
+        "insert into functional.alltypes partition(year, month) select * from t1");
+    AnalyzesOk("with t1(c1, c2) as (select * from functional.alltypestiny)" +
         "insert into functional.alltypes partition(year, month) select * from t1");
     // WITH clause in insert statement with a select statement that has a WITH
     // clause and an inline view (IMPALA-1100)
@@ -2201,6 +2477,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("with t1 as (select id from functional.alltypestiny) " +
         "insert into functional.alltypes partition(year, month) " +
         "with t1 as (select * from functional.alltypessmall) select * from t1");
+    AnalyzesOk("with t(c1, c2) as (select * from functional.alltypes) " +
+        "select a.c1, a.c2 from t a");
     // WITH-clause view used in inline view.
     AnalyzesOk("with t1 as (select 'a') select * from (select * from t1) as t2");
     AnalyzesOk("with t1 as (select 'a') " +
@@ -2229,6 +2507,9 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // Aliases are resolved from inner-most to the outer-most scope.
     AnalyzesOk("with t1 as (select 'a') " +
         "select t2.* from (with t1 as (select 'b') select * from t1) as t2");
+    // Column labels do not conflict because they are in different scopes.
+    AnalyzesOk("with t1(c1) as (select 'a') " +
+        "select c1 from (with t1(c1) as (select 'b') select c1 from t1) as t2");
     // Table aliases do not conflict because t1 from the inline view is never used.
     AnalyzesOk("with t1 as (select 1), t2 as (select 2)" +
         "select * from functional.alltypes as t1");
@@ -2237,6 +2518,9 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // Fully-qualified table does not conflict with WITH-clause table.
     AnalyzesOk("with alltypes as (select * from functional.alltypes) " +
         "select * from functional.alltypes union all select * from alltypes");
+    // Column labels can be used with table aliases.
+    AnalyzesOk("with t(c1) as (select id from functional.alltypes) " +
+        "select a.c1 from t a");
 
     // Use a custom analyzer to change the default db to functional.
     // Recursion is prevented because 'alltypes' in t1 refers to the table
@@ -2307,6 +2591,16 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "Duplicate table alias: 't1'");
     AnalysisError("with t1 as (select 1) select * from (select 2) as t1 inner join t1",
         "Duplicate table alias: 't1'");
+    // With clause column labels must be used intead of aliases.
+    AnalysisError("with t1(c1) as (select id cnt from functional.alltypes) "+
+        "select cnt from t1",
+        "Could not resolve column/field reference: 'cnt'");
+    // With clause column labels must not exceed the number of columns in the query.
+    AnalysisError("with t(c1, c2) as (select id from functional.alltypes) " +
+        "select * from t",
+        "WITH-clause view 't' returns 1 columns, but 2 labels were specified. The " +
+        "number of column labels must be smaller or equal to the number of returned " +
+        "columns.");
     // Multiple references in same select statement require aliases.
     AnalysisError("with t1 as (select 'a' x) select * from t1 inner join t1",
         "Duplicate table alias: 't1'");
@@ -2365,6 +2659,11 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "(select * from functional.alltypesagg t where t.id = 1 and a.id = t.id) " +
         "and not exists (select * from functional.alltypesagg b where b.id = 1 " +
         "and b.int_col = a.int_col)) select * from t");
+
+    // WITH clause with a collection table ref.
+    AnalyzesOk(
+        "with w as (select t.id, a.item from functional.allcomplextypes t, " +
+        "t.int_array_col a) select * from w");
 
     // Deeply nested WITH clauses (see IMPALA-1106)
     AnalyzesOk("with with_1 as (select 1 as int_col_1), with_2 as " +
@@ -2565,6 +2864,26 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "Unable to INSERT into target table (functional_seq.alltypes) because Impala " +
         "does not have WRITE access to at least one HDFS path: " +
         "hdfs://localhost:20500/test-warehouse/alltypes_seq/year=2009/month=");
+
+    // Insert with a correlated inline view.
+    AnalyzesOk("insert into table functional.alltypessmall " +
+        "partition (year, month)" +
+        "select a.id, bool_col, tinyint_col, smallint_col, item, bigint_col, " +
+        "float_col, double_col, date_string_col, string_col, timestamp_col, a.year, " +
+        "b.month from functional.alltypes a, functional.allcomplextypes b, " +
+        "(select item from b.int_array_col) v1 " +
+        "where a.id = b.id");
+    AnalysisError("insert into table functional.alltypessmall " +
+        "partition (year, month)" +
+        "select a.id, a.bool_col, a.tinyint_col, a.smallint_col, item, a.bigint_col, " +
+        "a.float_col, a.double_col, a.date_string_col, a.string_col, a.timestamp_col, " +
+        "a.year, b.month from functional.alltypes a, functional.allcomplextypes b, " +
+        "(select item from b.int_array_col, functional.alltypestiny) v1 " +
+        "where a.id = b.id",
+        "Nested query is illegal because it contains a table reference " +
+        "'b.int_array_col' correlated with an outer block as well as an " +
+        "uncorrelated one 'functional.alltypestiny':\n" +
+        "SELECT item FROM b.int_array_col, functional.alltypestiny");
 
     // Test plan hints for partitioned Hdfs tables.
     AnalyzesOk("insert into functional.alltypessmall " +
@@ -3063,7 +3382,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
    */
   @Test
   public void TestClone() {
-    testNumberOfMembers(QueryStmt.class, 10);
+    testNumberOfMembers(QueryStmt.class, 9);
     testNumberOfMembers(UnionStmt.class, 8);
     testNumberOfMembers(ValuesStmt.class, 0);
 

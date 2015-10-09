@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env impala-python
 # encoding=utf-8
 # Copyright 2014 Cloudera Inc.
 #
@@ -22,11 +22,11 @@ import shlex
 import shutil
 import socket
 import signal
+import sys
 
-from impala_shell_results import get_shell_cmd_result, cancellation_helper
+from impala_shell_results import get_shell_cmd_result
 from subprocess import Popen, PIPE
 from tests.common.impala_service import ImpaladService
-from tests.verifiers.metric_verifier import MetricVerifier
 from time import sleep
 
 SHELL_CMD = "%s/bin/impala-shell.sh" % os.environ['IMPALA_HOME']
@@ -45,11 +45,9 @@ class TestImpalaShellInteractive(object):
     p.stdin.write("%s;\n" % cmd)
     p.stdin.flush()
 
-  def _start_new_shell_process(self, args=None):
+  def _start_new_shell_process(self):
     """Starts a shell process and returns the process handle"""
-    cmd = "%s %s" % (SHELL_CMD, args) if args else SHELL_CMD
-    return Popen(shlex.split(SHELL_CMD), shell=True, stdout=PIPE,
-                 stdin=PIPE, stderr=PIPE)
+    return Popen([SHELL_CMD], stdout=PIPE, stdin=PIPE, stderr=PIPE)
 
   @classmethod
   def setup_class(cls):
@@ -59,6 +57,41 @@ class TestImpalaShellInteractive(object):
   @classmethod
   def teardown_class(cls):
     if os.path.exists(TMP_HISTORY_FILE): shutil.move(TMP_HISTORY_FILE, SHELL_HISTORY_FILE)
+
+  def _expect_with_cmd(self, proc, cmd, expectations=()):
+    """Executes a command on the expect process instance and verifies a set of
+    assertions defined by the expections."""
+    proc.sendline(cmd + ";")
+    proc.expect(":21000] >")
+    if not expectations: return
+    for e in expectations:
+      assert e in proc.before
+
+  @pytest.mark.execute_serially
+  def test_local_shell_options(self):
+    """Test that setting the local shell options works"""
+    proc = pexpect.spawn(SHELL_CMD)
+    proc.expect(":21000] >")
+    self._expect_with_cmd(proc, "set", ("LIVE_PROGRESS: False", "LIVE_SUMMARY: False"))
+    self._expect_with_cmd(proc, "set live_progress=true")
+    self._expect_with_cmd(proc, "set", ("LIVE_PROGRESS: True", "LIVE_SUMMARY: False"))
+    self._expect_with_cmd(proc, "set live_summary=1")
+    self._expect_with_cmd(proc, "set", ("LIVE_PROGRESS: True", "LIVE_SUMMARY: True"))
+
+  @pytest.mark.execute_serially
+  def test_compute_stats_with_live_progress_options(self):
+    """Test that setting LIVE_PROGRESS options won't cause COMPUTE STATS query fail"""
+    impalad = ImpaladService(socket.getfqdn())
+    p = self._start_new_shell_process()
+    self._send_cmd_to_shell(p, "set live_progress=True")
+    self._send_cmd_to_shell(p, "set live_summary=True")
+    self._send_cmd_to_shell(p, 'create table test_live_progress_option(col int);')
+    try:
+      self._send_cmd_to_shell(p, 'compute stats test_live_progress_option;')
+    finally:
+      self._send_cmd_to_shell(p, 'drop table if exists test_live_progress_option;')
+    result = get_shell_cmd_result(p)
+    assert "Updated 1 partition(s) and 1 column(s)" in result.stdout
 
   @pytest.mark.execute_serially
   def test_escaped_quotes(self):
@@ -81,12 +114,9 @@ class TestImpalaShellInteractive(object):
     command = "select sleep(10000);"
     p = self._start_new_shell_process()
     self._send_cmd_to_shell(p, command)
-    sleep(1)
-    # iterate through all processes with psutil
-    shell_pid = cancellation_helper()
-    sleep(2)
-    os.kill(shell_pid, signal.SIGINT)
-    result = get_shell_cmd_result(p)
+    sleep(3)
+    os.kill(p.pid, signal.SIGINT)
+    get_shell_cmd_result(p)
     assert impalad.wait_for_num_in_flight_queries(0)
 
   @pytest.mark.execute_serially
@@ -208,6 +238,20 @@ class TestImpalaShellInteractive(object):
     result = get_shell_cmd_result(p)
     for query in queries:
       assert query in result.stderr, "'%s' not in '%s'" % (query, result.stderr)
+
+  @pytest.mark.execute_serially
+  def test_tip(self):
+    """Smoke test for the TIP command"""
+    # Temporarily add impala_shell module to path to get at TIPS list for verification
+    sys.path.append("%s/shell/" % os.environ['IMPALA_HOME'])
+    try:
+      import impala_shell
+    finally:
+      sys.path = sys.path[:-1]
+    result = run_impala_shell_interactive("tip;")
+    for t in impala_shell.TIPS:
+      if t in result.stderr: return
+    assert False, "No tip found in output %s" % result.stderr
 
 def run_impala_shell_interactive(command, shell_args=''):
   """Runs a command in the Impala shell interactively."""

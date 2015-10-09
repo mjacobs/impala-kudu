@@ -28,7 +28,6 @@ from thrift.transport.TSocket import TSocket
 from thrift.transport.TTransport import TBufferedTransport, TTransportException
 from thrift.Thrift import TApplicationException
 
-
 class RpcStatus:
   """Convenience enum to describe Rpc return statuses"""
   OK = 0
@@ -122,14 +121,15 @@ class ImpalaClient(object):
       setattr(max_stats, attr, 0)
 
     node = summary.nodes[idx]
-    for stats in node.exec_stats:
-      for attr in attrs:
-        val = getattr(stats, attr)
-        if val is not None:
-          setattr(agg_stats, attr, getattr(agg_stats, attr) + val)
-          setattr(max_stats, attr, max(getattr(max_stats, attr), val))
+    if node.exec_stats is not None:
+      for stats in node.exec_stats:
+        for attr in attrs:
+          val = getattr(stats, attr)
+          if val is not None:
+            setattr(agg_stats, attr, getattr(agg_stats, attr) + val)
+            setattr(max_stats, attr, max(getattr(max_stats, attr), val))
 
-    if len(node.exec_stats) > 0:
+    if node.exec_stats is not None and node.exec_stats:
       avg_time = agg_stats.latency_ns / len(node.exec_stats)
     else:
       avg_time = 0
@@ -171,8 +171,11 @@ class ImpalaClient(object):
     def prettyprint_time(time_val):
       return prettyprint(time_val, ["ns", "us", "ms", "s"], 1000.0)
 
+    hosts = 0
+    if node.exec_stats is not None:
+      hosts = len(node.exec_stats)
     row = [ label_prefix + node.label,
-            len(node.exec_stats),
+            hosts,
             prettyprint_time(avg_time),
             prettyprint_time(max_stats.latency_ns),
             prettyprint_units(cardinality),
@@ -204,6 +207,12 @@ class ImpalaClient(object):
             summary, idx, False, indent_level + 1, True, output)
       output += first_child_output
     return idx
+
+  def test_connection(self):
+    """Checks to see if the current Impala connection is still alive. If not, an exception
+    will be raised."""
+    if self.connected:
+      self.imp_service.PingImpalaService()
 
   def connect(self):
     """Creates a connection to an Impalad instance
@@ -240,9 +249,9 @@ class ImpalaClient(object):
        is used.
     """
     if self.use_ssl:
-        # TSSLSocket needs the ssl module, which may not be standard on all Operating
-        # Systems. Only attempt to import TSSLSocket if the user wants an SSL connection.
-        from thrift.transport import TSSLSocket
+      # TSSLSocket needs the ssl module, which may not be standard on all Operating
+      # Systems. Only attempt to import TSSLSocket if the user wants an SSL connection.
+      from thrift.transport import TSSLSocket
 
     # sasl does not accept unicode strings, explicitly encode the string into ascii.
     host, port = self.impalad[0].encode('ascii', 'ignore'), int(self.impalad[1])
@@ -288,7 +297,7 @@ class ImpalaClient(object):
       raise RPCException("Error executing the query")
     return last_query_handle
 
-  def wait_to_finish(self, last_query_handle):
+  def wait_to_finish(self, last_query_handle, periodic_callback=None):
     loop_start = time.time()
     while True:
       query_state = self.get_query_state(last_query_handle)
@@ -299,6 +308,8 @@ class ImpalaClient(object):
           raise QueryStateException(self.get_warning_log(last_query_handle))
         else:
           raise DisconnectedException("Not connected to impalad.")
+
+      if periodic_callback is not None: periodic_callback()
       time.sleep(self._get_sleep_interval(loop_start))
 
   def fetch(self, query_handle):
@@ -419,7 +430,6 @@ class ImpalaClient(object):
       return 0.1
     elif elapsed < 60.0:
       return 0.5
-
     return 1.0
 
   def get_column_names(self, last_query_handle):

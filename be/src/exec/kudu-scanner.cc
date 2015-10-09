@@ -106,7 +106,9 @@ Status KuduScanner::KeepKuduScannerAlive() {
 Status KuduScanner::GetNext(RowBatch* row_batch, bool* eos) {
   int tuple_buffer_size = row_batch->capacity() * tuple_byte_size_;
   void* tuple_buffer = row_batch->tuple_data_pool()->TryAllocate(tuple_buffer_size);
-  if (tuple_buffer_size > 0 && tuple_buffer == NULL) return Status::MEM_LIMIT_EXCEEDED;
+  if (tuple_buffer_size > 0 && tuple_buffer == NULL) {
+    return Status(TErrorCode::MEM_LIMIT_EXCEEDED);
+  }
   Tuple* tuple = reinterpret_cast<Tuple*>(tuple_buffer);
 
   // Main scan loop:
@@ -271,7 +273,9 @@ Status KuduScanner::RelocateValuesFromKudu(Tuple* tuple, MemPool* mem_pool) {
     DCHECK_LE(val->len, 8 * (1 << 20));
     val->ptr = reinterpret_cast<char*>(mem_pool->TryAllocate(val->len));
     if (UNLIKELY(val->ptr == NULL)) {
-      if (UNLIKELY(val->len > 0)) return Status::MEM_LIMIT_EXCEEDED;
+      if (UNLIKELY(val->len > 0)) {
+        return Status(TErrorCode::MEM_LIMIT_EXCEEDED);
+      }
     } else {
       DCHECK(val->len > 0);
       memcpy(val->ptr, old_buf, val->len);

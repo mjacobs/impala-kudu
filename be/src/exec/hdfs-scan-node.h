@@ -32,6 +32,7 @@
 #include "runtime/descriptors.h"
 #include "runtime/disk-io-mgr.h"
 #include "runtime/string-buffer.h"
+#include "util/avro-util.h"
 #include "util/progress-updater.h"
 #include "util/spinlock.h"
 #include "util/thread.h"
@@ -69,7 +70,8 @@ struct HdfsFileDesc {
   /// Splits (i.e. raw byte ranges) for this file, assigned to this scan node.
   std::vector<DiskIoMgr::ScanRange*> splits;
   HdfsFileDesc(const std::string& filename)
-      : filename(filename), file_length(0), mtime(0), file_compression(THdfsCompression::NONE) {
+    : filename(filename), file_length(0), mtime(0),
+      file_compression(THdfsCompression::NONE) {
   }
 };
 
@@ -79,8 +81,13 @@ struct ScanRangeMetadata {
   /// The partition id that this range is part of.
   int64_t partition_id;
 
-  ScanRangeMetadata(int64_t partition_id)
-    : partition_id(partition_id) { }
+  /// For parquet scan ranges we initially create a request for the file footer for each
+  /// split; we store a pointer to the actual split so that we can recover its information
+  /// for the scanner to process.
+  const DiskIoMgr::ScanRange* original_split;
+
+  ScanRangeMetadata(int64_t partition_id, const DiskIoMgr::ScanRange* original_split)
+      : partition_id(partition_id), original_split(original_split) { }
 };
 
 /// A ScanNode implementation that is used for all tables read directly from
@@ -108,10 +115,11 @@ class HdfsScanNode : public ScanNode {
   ~HdfsScanNode();
 
   /// ExecNode methods
+  virtual Status Init(const TPlanNode& tnode);
   virtual Status Prepare(RuntimeState* state);
   virtual Status Open(RuntimeState* state);
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
-  virtual Status Reset(RuntimeState* state, RowBatch* row_batchl);
+  virtual Status Reset(RuntimeState* state);
   virtual void Close(RuntimeState* state);
 
   int limit() const { return limit_; }
@@ -133,19 +141,20 @@ class HdfsScanNode : public ScanNode {
 
   const HdfsTableDescriptor* hdfs_table() { return hdfs_table_; }
 
+  const AvroSchemaElement& avro_schema() { return *avro_schema_.get(); }
+
   RuntimeState* runtime_state() { return runtime_state_; }
 
   DiskIoMgr::RequestContext* reader_context() { return reader_context_; }
+
+  typedef std::map<TupleId, std::vector<ExprContext*> > ConjunctsMap;
+  const ConjunctsMap& conjuncts_map() const { return conjuncts_map_; }
 
   RuntimeProfile::HighWaterMarkCounter* max_compressed_text_file_length() {
     return max_compressed_text_file_length_;
   }
 
   const static int SKIP_COLUMN = -1;
-
-  /// Creates a clone of conjunct_ctxs_. 'ctxs' should be non-NULL and empty.
-  /// The returned contexts must be closed by the caller.
-  Status GetConjunctCtxs(std::vector<ExprContext*>* ctxs);
 
   /// Returns index into materialized_slots with 'path'.  Returns SKIP_COLUMN if
   /// that path is not materialized.
@@ -178,16 +187,19 @@ class HdfsScanNode : public ScanNode {
   /// This function will block if materialized_row_batches_ is full.
   void AddMaterializedRowBatch(RowBatch* row_batch);
 
-  /// Allocate a new scan range object, stored in the runtime state's object pool.  For
-  /// scan ranges that correspond to the original hdfs splits, the partition id must be set
-  /// to the range's partition id. For other ranges (e.g. columns in parquet, read past
-  /// buffers), the partition_id is unused. expected_local should be true if this scan
-  /// range is not expected to require a remote read. The range must fall within the file
-  /// bounds.  That is, the offset must be >= 0, and offset + len <= file_length.
+  /// Allocate a new scan range object, stored in the runtime state's object pool. For
+  /// scan ranges that correspond to the original hdfs splits, the partition id must be
+  /// set to the range's partition id. For other ranges (e.g. columns in parquet, read
+  /// past buffers), the partition_id is unused. expected_local should be true if this
+  /// scan range is not expected to require a remote read. The range must fall within
+  /// the file bounds. That is, the offset must be >= 0, and offset + len <= file_length.
+  /// If not NULL, the 'original_split' pointer is stored for reference in the scan range
+  /// metadata of the scan range that is to be allocated.
   /// This is thread safe.
   DiskIoMgr::ScanRange* AllocateScanRange(
       hdfsFS fs, const char* file, int64_t len, int64_t offset, int64_t partition_id,
-      int disk_id, bool try_cache, bool expected_local, int64_t mtime);
+      int disk_id, bool try_cache, bool expected_local, int64_t mtime,
+      const DiskIoMgr::ScanRange* original_split = NULL);
 
   /// Adds ranges to the io mgr queue and starts up new scanner threads if possible.
   /// 'num_files_queued' indicates how many file's scan ranges have been added
@@ -213,7 +225,7 @@ class HdfsScanNode : public ScanNode {
   /// Allocates and return an empty template tuple (i.e. with no values filled in).
   /// Scanners can use this method to initialize a template tuple even if there are no
   /// materialized partition keys (e.g. to hold Avro default values).
-  Tuple* InitEmptyTemplateTuple();
+  Tuple* InitEmptyTemplateTuple(const TupleDescriptor& tuple_desc);
 
   /// Acquires all allocations from pool into scan_node_pool_. Thread-safe.
   void TransferToScanNodePool(MemPool* pool);
@@ -249,6 +261,11 @@ class HdfsScanNode : public ScanNode {
   /// order set to conjuncts.size()
   void ComputeSlotMaterializationOrder(std::vector<int>* order) const;
 
+  /// Returns true if there are no materialized slots, such as a count(*) over the table.
+  inline bool IsZeroSlotTableScan() {
+    return materialized_slots().empty() && tuple_desc()->tuple_path().empty();
+  }
+
   /// map from volume id to <number of split, per volume split lengths>
   typedef boost::unordered_map<int32_t, std::pair<int, int64_t> > PerVolumnStats;
 
@@ -268,13 +285,9 @@ class HdfsScanNode : public ScanNode {
  private:
   friend class ScannerContext;
 
-  /// Cache of the plan node.  This is needed to be able to create a copy of
-  /// the conjuncts per scanner since our Exprs are not thread safe.
-  boost::scoped_ptr<TPlanNode> thrift_plan_node_;
-
   RuntimeState* runtime_state_;
 
-  /// Tuple id resolved in Prepare() to set tuple_desc_;
+  /// Tuple id resolved in Prepare() to set tuple_desc_
   const int tuple_id_;
 
   /// RequestContext object to use with the disk-io-mgr for reads.
@@ -287,8 +300,11 @@ class HdfsScanNode : public ScanNode {
   /// Set in Prepare, owned by RuntimeState
   const HdfsTableDescriptor* hdfs_table_;
 
-  /// If true, the warning that some disk ids are unknown was logged.  Only log
-  /// this once per scan node since it can be noisy.
+  /// The root of the table's Avro schema, if we're scanning an Avro table.
+  ScopedAvroSchemaElement avro_schema_;
+
+  /// If true, the warning that some disk ids are unknown was logged.  Only log this once
+  /// per scan node since it can be noisy.
   bool unknown_disk_id_warned_;
 
   /// Partitions scanned by this scan node.
@@ -302,9 +318,13 @@ class HdfsScanNode : public ScanNode {
   typedef std::map<THdfsFileFormat::type, std::vector<HdfsFileDesc*> > FileFormatsMap;
   FileFormatsMap per_type_files_;
 
-  /// Set to true when the initial scan ranges are issued to the IoMgr. This happens on the
-  /// first call to GetNext(). The token manager, in a different thread, will read this
-  /// variable.
+  /// Conjuncts for each materialized tuple (top-level row batch tuples and collection
+  /// item tuples). Includes a copy of ExecNode.conjuncts_.
+  ConjunctsMap conjuncts_map_;
+
+  /// Set to true when the initial scan ranges are issued to the IoMgr. This happens on
+  /// the first call to GetNext(). The token manager, in a different thread, will read
+  /// this variable.
   bool initial_ranges_issued_;
 
   /// The estimated memory required to start up a new scanner thread. If the memory
@@ -323,10 +343,6 @@ class HdfsScanNode : public ScanNode {
   /// Per scanner type codegen'd fn.
   typedef std::map<THdfsFileFormat::type, void*> CodegendFnMap;
   CodegendFnMap codegend_fn_map_;
-
-  /// Contexts for each conjunct. These are cloned by the scanners so conjuncts can be
-  /// safely evaluated in parallel.
-  std::vector<ExprContext*> conjunct_ctxs_;
 
   /// Maps from a slot's path to its index into materialized_slots_.
   typedef boost::unordered_map<std::vector<int>, int> PathToSlotIdxMap;
@@ -380,8 +396,8 @@ class HdfsScanNode : public ScanNode {
   AtomicInt<int> num_scanners_codegen_enabled_;
   AtomicInt<int> num_scanners_codegen_disabled_;
 
-  /// The size of the largest compressed text file to be scanned. This is used to estimate
-  /// scanner thread memory usage.
+  /// The size of the largest compressed text file to be scanned. This is used to
+  /// estimate scanner thread memory usage.
   RuntimeProfile::HighWaterMarkCounter* max_compressed_text_file_length_;
 
   /// Disk accessed bitmap
@@ -479,6 +495,17 @@ class HdfsScanNode : public ScanNode {
   /// This can be called multiple times, subsequent calls will be ignored.
   /// This must be called on Close() to unregister counters.
   void StopAndFinalizeCounters();
+
+  /// Recursively initializes all NULL collection slots to an empty ArrayValue in
+  /// addition to maintaining the null bit. Hack to allow UnnestNode to project out
+  /// collection slots. Assumes that the null bit has already been un/set.
+  /// TODO: remove this function once the TODOs in UnnestNode regarding projection
+  /// have been addressed.
+  void InitNullArrayValues(const TupleDescriptor* tuple_desc, Tuple* tuple) const;
+
+  /// Helper to call InitNullArrayValues() on all tuples produced by this scan
+  /// in 'row_batch'.
+  void InitNullArrayValues(RowBatch* row_batch) const;
 };
 
 }

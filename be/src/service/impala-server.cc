@@ -95,6 +95,7 @@ DECLARE_int32(be_port);
 DECLARE_string(nn);
 DECLARE_int32(nn_port);
 DECLARE_string(authorized_proxy_user_config);
+DECLARE_string(authorized_proxy_user_config_delimiter);
 DECLARE_bool(abort_on_config_error);
 DECLARE_bool(disk_spill_encryption);
 
@@ -149,6 +150,13 @@ DEFINE_string(ssl_client_ca_certificate, "", "(Advanced) The full path to a cert
     "used by Thrift clients to check the validity of a server certificate. May either be "
     "a certificate for a third-party Certificate Authority, or a copy of the certificate "
     "the client expects to receive from the server.");
+DEFINE_string(ssl_private_key_password_cmd, "", "A Unix command whose output returns the "
+    "password used to decrypt the certificate private key file specified in "
+    "--ssl_private_key. If the .PEM key file is not password-protected, this command "
+    "will not be invoked. The output of the command will be truncated to 1024 bytes, and "
+    "then all trailing whitespace will be trimmed before it is used to decrypt the "
+    "private key");
+
 
 DEFINE_int32(idle_session_timeout, 0, "The time, in seconds, that a session may be idle"
     " for before it is closed (and all running queries cancelled) by Impala. If 0, idle"
@@ -239,7 +247,7 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
     }
   }
 
-  status = TmpFileMgr::Init();
+  status = exec_env->tmp_file_mgr()->Init(exec_env->metrics());
   if (!status.ok()) {
     LOG(ERROR) << status.GetDetail();
     if (FLAGS_abort_on_config_error) {
@@ -285,7 +293,8 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
         string proxy_user = config.substr(0, pos);
         string config_str = config.substr(pos + 1);
         vector<string> parsed_allowed_users;
-        split(parsed_allowed_users, config_str, is_any_of(","), token_compress_on);
+        split(parsed_allowed_users, config_str,
+            is_any_of(FLAGS_authorized_proxy_user_config_delimiter), token_compress_on);
         unordered_set<string> allowed_users(parsed_allowed_users.begin(),
             parsed_allowed_users.end());
         authorized_proxy_user_config_.insert(make_pair(proxy_user, allowed_users));
@@ -578,14 +587,23 @@ Status ImpalaServer::GetRuntimeProfileStr(const TUniqueId& query_id,
 }
 
 Status ImpalaServer::GetExecSummary(const TUniqueId& query_id, TExecSummary* result) {
-  // Search for the query id in the active query map
+  // Search for the query id in the active query map.
   {
     shared_ptr<QueryExecState> exec_state = GetQueryExecState(query_id, true);
     if (exec_state != NULL) {
       lock_guard<mutex> l(*exec_state->lock(), adopt_lock_t());
       if (exec_state->coord() != NULL) {
-        lock_guard<SpinLock> lock(exec_state->coord()->GetExecSummaryLock());
-        *result = exec_state->coord()->exec_summary();
+        TExecProgress progress;
+        {
+          lock_guard<SpinLock> lock(exec_state->coord()->GetExecSummaryLock());
+          *result = exec_state->coord()->exec_summary();
+
+          // Update the current scan range progress for the summary.
+          progress.__set_num_completed_scan_ranges(
+              exec_state->coord()->progress().num_complete());
+          progress.__set_total_scan_ranges(exec_state->coord()->progress().total());
+        }
+        result->__set_progress(progress);
         return Status::OK();
       }
     }
@@ -862,8 +880,7 @@ Status ImpalaServer::UnregisterQuery(const TUniqueId& query_id, bool check_infli
   double duration_ms = 1000 * (exec_state->end_time().ToSubsecondUnixTime() -
       exec_state->start_time().ToSubsecondUnixTime());
 
-  // This should never happen unless we mess around with timezones during Impala's
-  // execution. Unfortunately a test does exactly that right now and triggers IMPALA-2031.
+  // duration_ms can be negative when the local timezone changes during query execution.
   if (duration_ms >= 0) {
     if (exec_state->stmt_type() == TStmtType::DDL) {
       ImpaladMetrics::DDL_DURATIONS->Update(duration_ms);
@@ -1356,7 +1373,7 @@ void ImpalaServer::MembershipCallback(
         continue;
       }
       // This is a new item - add it to the map of known backends.
-      known_backends_.insert(make_pair(item.key, backend_descriptor.address));
+      known_backends_.insert(make_pair(item.key, backend_descriptor));
     }
     // Process membership deletions.
     BOOST_FOREACH(const string& backend_id, delta.topic_deletions) {
@@ -1366,8 +1383,24 @@ void ImpalaServer::MembershipCallback(
     // Create a set of known backend network addresses. Used to test for cluster
     // membership by network address.
     set<TNetworkAddress> current_membership;
-    BOOST_FOREACH(const BackendAddressMap::value_type& backend, known_backends_) {
-      current_membership.insert(backend.second);
+    // Also reflect changes to the frontend. Initialized only if any_changes is true.
+    TUpdateMembershipRequest update_req;
+    bool any_changes = !delta.topic_entries.empty() || !delta.topic_deletions.empty() ||
+        !delta.is_delta;
+    BOOST_FOREACH(const BackendDescriptorMap::value_type& backend, known_backends_) {
+      current_membership.insert(backend.second.address);
+      if (any_changes) {
+        update_req.hostnames.insert(backend.second.address.hostname);
+        update_req.ip_addresses.insert(backend.second.ip_address);
+      }
+    }
+    if (any_changes) {
+      update_req.num_nodes = known_backends_.size();
+      Status status = exec_env_->frontend()->UpdateMembership(update_req);
+      if (!status.ok()) {
+        LOG(WARNING) << "Error updating frontend membership snapshot: "
+                     << status.GetDetail();
+      }
     }
 
     // Maps from query id (to be cancelled) to a list of failed Impalads that are
@@ -1678,8 +1711,8 @@ Status CreateImpalaServer(ExecEnv* exec_env, int beeswax_port, int hs2_port, int
     (*beeswax_server)->SetConnectionHandler(handler.get());
     if (!FLAGS_ssl_server_certificate.empty()) {
       LOG(INFO) << "Enabling SSL for Beeswax";
-      RETURN_IF_ERROR((*beeswax_server)->EnableSsl(
-              FLAGS_ssl_server_certificate, FLAGS_ssl_private_key));
+      RETURN_IF_ERROR((*beeswax_server)->EnableSsl(FLAGS_ssl_server_certificate,
+          FLAGS_ssl_private_key, FLAGS_ssl_private_key_password_cmd));
     }
 
     LOG(INFO) << "Impala Beeswax Service listening on " << beeswax_port;
@@ -1700,8 +1733,8 @@ Status CreateImpalaServer(ExecEnv* exec_env, int beeswax_port, int hs2_port, int
     (*hs2_server)->SetConnectionHandler(handler.get());
     if (!FLAGS_ssl_server_certificate.empty()) {
       LOG(INFO) << "Enabling SSL for HiveServer2";
-      RETURN_IF_ERROR((*hs2_server)->EnableSsl(
-              FLAGS_ssl_server_certificate, FLAGS_ssl_private_key));
+      RETURN_IF_ERROR((*hs2_server)->EnableSsl(FLAGS_ssl_server_certificate,
+          FLAGS_ssl_private_key, FLAGS_ssl_private_key_password_cmd));
     }
 
     LOG(INFO) << "Impala HiveServer2 Service listening on " << hs2_port;
@@ -1718,6 +1751,11 @@ Status CreateImpalaServer(ExecEnv* exec_env, int beeswax_port, int hs2_port, int
 
     *be_server = new ThriftServer("backend", be_processor, be_port, NULL,
         exec_env->metrics(), FLAGS_be_service_threads);
+    if (!FLAGS_ssl_server_certificate.empty()) {
+      LOG(INFO) << "Enabling SSL for backend";
+      RETURN_IF_ERROR((*be_server)->EnableSsl(FLAGS_ssl_server_certificate,
+          FLAGS_ssl_private_key, FLAGS_ssl_private_key_password_cmd));
+    }
 
     LOG(INFO) << "ImpalaInternalService listening on " << be_port;
   }

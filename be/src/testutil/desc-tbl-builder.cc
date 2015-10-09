@@ -31,20 +31,23 @@ TupleDescBuilder& DescriptorTblBuilder::DeclareTuple() {
   return *tuple_builder;
 }
 
+// item_id of -1 indicates no itemTupleId
 static TSlotDescriptor MakeSlotDescriptor(int id, int parent_id,
-    const TupleDescBuilder::Slot& slot, int slot_idx, int byte_offset) {
+    const Slot& slot, int slot_idx, int byte_offset, int item_id) {
   int null_byte = slot_idx / 8;
   int null_bit = slot_idx % 8;
   TSlotDescriptor slot_desc;
   slot_desc.__set_id(id);
   slot_desc.__set_parent(parent_id);
   slot_desc.__set_slotType(slot.slot_type.ToThrift());
-  slot_desc.__set_columnPath(vector<int>(1, slot_idx));
+  // For now no tests depend on the materialized path being populated correctly.
+  slot_desc.__set_materializedPath(vector<int>());
   slot_desc.__set_byteOffset(byte_offset);
   slot_desc.__set_nullIndicatorByte(null_byte);
   slot_desc.__set_nullIndicatorBit(null_bit);
   slot_desc.__set_slotIdx(slot_idx);
   slot_desc.__set_isMaterialized(slot.materialized);
+  if (item_id != -1) slot_desc.__set_itemTupleId(item_id);
   return slot_desc;
 }
 
@@ -66,42 +69,102 @@ void DescriptorTblBuilder::SetTableDescriptor(const TTableDescriptor& table_desc
 
 DescriptorTbl* DescriptorTblBuilder::Build() {
   DescriptorTbl* desc_tbl;
-  int slot_id = tuples_descs_.size(); // First ids reserved for TupleDescriptors
+//<<<<<<< HEAD
+//  int slot_id = tuples_descs_.size(); // First ids reserved for TupleDescriptors
+//
+//  for (int i = 0; i < tuples_descs_.size(); ++i) {
+//    vector<TupleDescBuilder::Slot> slots = tuples_descs_[i]->slots();
+//    int num_null_bytes = BitUtil::Ceil(slots.size(), 8);
+//    int byte_offset = num_null_bytes;
+//    int tuple_id = i;
+//
+//    for(int j = 0; j < slots.size(); ++j) {
+//      thrift_desc_tbl_.slotDescriptors.push_back(
+//          MakeSlotDescriptor(++slot_id, tuple_id, slots[j], j, byte_offset));
+//
+//      int byte_size = slots[j].slot_type.GetByteSize();
+//      if (byte_size == 0) {
+//        // can only handle strings right now
+//        DCHECK(slots[j].slot_type.type == TYPE_STRING
+//               || slots[j].slot_type.type == TYPE_VARCHAR);
+//        byte_size = q16;
+//      }
+//      byte_offset += byte_size;
+//    }
+//
+//    // If someone set a table descriptor pass that id along to the tuple descriptor.
+//    if (thrift_desc_tbl_.tableDescriptors.empty()) {
+//      thrift_desc_tbl_.tupleDescriptors.push_back(
+//          MakeTupleDescriptor(tuple_id, byte_offset, num_null_bytes));
+//    } else {
+//      thrift_desc_tbl_.tupleDescriptors.push_back(
+//          MakeTupleDescriptor(tuple_id, byte_offset, num_null_bytes,
+//              thrift_desc_tbl_.tableDescriptors[0].id));
+//    }
+//=======
+  TDescriptorTable thrift_desc_tbl;
+  int tuple_id = 0;
+  int slot_id = 0;
 
   for (int i = 0; i < tuples_descs_.size(); ++i) {
-    vector<TupleDescBuilder::Slot> slots = tuples_descs_[i]->slots();
-    int num_null_bytes = BitUtil::Ceil(slots.size(), 8);
-    int byte_offset = num_null_bytes;
-    int tuple_id = i;
-
-    for(int j = 0; j < slots.size(); ++j) {
-      thrift_desc_tbl_.slotDescriptors.push_back(
-          MakeSlotDescriptor(++slot_id, tuple_id, slots[j], j, byte_offset));
-
-      int byte_size = slots[j].slot_type.GetByteSize();
-      if (byte_size == 0) {
-        // can only handle strings right now
-        DCHECK(slots[j].slot_type.type == TYPE_STRING
-               || slots[j].slot_type.type == TYPE_VARCHAR);
-        byte_size = 16;
-      }
-      byte_offset += byte_size;
-    }
-
-    // If someone set a table descriptor pass that id along to the tuple descriptor.
-    if (thrift_desc_tbl_.tableDescriptors.empty()) {
-      thrift_desc_tbl_.tupleDescriptors.push_back(
-          MakeTupleDescriptor(tuple_id, byte_offset, num_null_bytes));
-    } else {
-      thrift_desc_tbl_.tupleDescriptors.push_back(
-          MakeTupleDescriptor(tuple_id, byte_offset, num_null_bytes,
-              thrift_desc_tbl_.tableDescriptors[0].id));
-    }
+    BuildTuple(tuples_descs_[i]->slots(), &thrift_desc_tbl, &tuple_id, &slot_id);
   }
 
   Status status = DescriptorTbl::Create(obj_pool_, thrift_desc_tbl_, &desc_tbl);
   DCHECK(status.ok());
   return desc_tbl;
+}
+
+TTupleDescriptor DescriptorTblBuilder::BuildTuple(
+    const vector<Slot>& slots, TDescriptorTable* thrift_desc_tbl,
+    int* next_tuple_id, int* slot_id) {
+  // We never materialize struct slots (there's no in-memory representation of structs,
+  // instead the materialized fields appear directly in the tuple), but array types can
+  // still have a struct item type. In this case, the array item tupstale contains the
+  // "inlined" struct fields.
+  if (slots.size() == 1 && slots[0].slot_type.type == TYPE_STRUCT) {
+    vector<Slot> child_slots;
+    BOOST_FOREACH(const ColumnType& child, slots[0].slot_type.children) {
+      child_slots.push_back(Slot(child, true));
+    }
+    return BuildTuple(child_slots, thrift_desc_tbl, next_tuple_id, slot_id);
+  }
+
+  int num_null_bytes = BitUtil::Ceil(slots.size(), 8);
+  int byte_offset = num_null_bytes;
+  int tuple_id = *next_tuple_id;
+  ++(*next_tuple_id);
+
+  for (int i = 0; i < slots.size(); ++i) {
+    DCHECK_NE(slots[i].slot_type.type, TYPE_STRUCT);
+    int item_id = -1;
+    if (slots[i].slot_type.IsCollectionType()) {
+      vector<Slot> child_slots;
+      BOOST_FOREACH(const ColumnType& child, slots[0].slot_type.children) {
+        child_slots.push_back(Slot(child, true));
+      }
+      TTupleDescriptor item_desc =
+          BuildTuple(child_slots, thrift_desc_tbl, next_tuple_id, slot_id);
+      item_id = item_desc.id;
+    }
+
+    thrift_desc_tbl->slotDescriptors.push_back(
+        MakeSlotDescriptor(*slot_id, tuple_id, slots[i], i, byte_offset, item_id));
+    byte_offset += slots[i].slot_type.GetSlotSize();
+    ++(*slot_id);
+  }
+
+  TTupleDescriptor result;
+
+  // If someone set a table descriptor pass that id along to the tuple descriptor.
+  if (thrift_desc_tbl_.tableDescriptors.empty()) {
+    result = MakeTupleDescriptor(tuple_id, byte_offset, num_null_bytes);
+  } else {
+    result = MakeTupleDescriptor(tuple_id, byte_offset, num_null_bytes,
+                                 thrift_desc_tbl_.tableDescriptors[0].id);
+  }
+  thrift_desc_tbl_.tupleDescriptors.push_back(result);
+  return result;
 }
 
 }

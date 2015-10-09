@@ -58,7 +58,7 @@ export KUDU_JAVA_VERSION=0.1.0-SNAPSHOT
 export CDH_MAJOR_VERSION=5
 export HADOOP_LZO=${HADOOP_LZO-~/hadoop-lzo}
 export IMPALA_LZO=${IMPALA_LZO-~/Impala-lzo}
-export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME-~/impala-auxiliary-tests}
+export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME-~/Impala-auxiliary-tests}
 export TARGET_FILESYSTEM=${TARGET_FILESYSTEM-"hdfs"}
 export FILESYSTEM_PREFIX=${FILESYSTEM_PREFIX-""}
 export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY-"DummySecretAccessKey"}
@@ -66,6 +66,7 @@ export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID-"DummyAccessKeyId"}
 export S3_BUCKET=${S3_BUCKET-""}
 export HDFS_REPLICATION=${HDFS_REPLICATION-3}
 export ISILON_NAMENODE=${ISILON_NAMENODE-""}
+export DEFAULT_FS=${DEFAULT_FS-"hdfs://localhost:20500"}
 
 if [ "${TARGET_FILESYSTEM}" = "s3" ]; then
   # Basic error checking
@@ -96,8 +97,8 @@ elif [ "${TARGET_FILESYSTEM}" = "isilon" ]; then
     echo "needs to be a non-empty and valid address."
     return 1
   fi
-  FILESYSTEM_PREFIX="hdfs://${ISILON_NAMENODE}:8020"
-  export FILESYSTEM_PREFIX
+  DEFAULT_FS="hdfs://${ISILON_NAMENODE}:8020"
+  export DEFAULT_FS
   # isilon manages its own replication.
   export HDFS_REPLICATION=1
 elif [ "${TARGET_FILESYSTEM}" != "hdfs" ]; then

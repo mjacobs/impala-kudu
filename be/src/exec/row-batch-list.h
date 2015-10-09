@@ -35,6 +35,8 @@ class RowBatchList {
  public:
   RowBatchList() : total_num_rows_(0) { }
 
+  typedef std::vector<RowBatch*>::iterator BatchIterator;
+
   /// A simple iterator used to scan over all the rows stored in the list.
   class TupleRowIterator {
    public:
@@ -56,6 +58,7 @@ class RowBatchList {
     /// Increments the iterator. No-op if the iterator is at the end.
     void Next() {
       if (batch_it_ == list_->row_batches_.end()) return;
+      DCHECK_GE((*batch_it_)->num_rows(), 0);
       if (++row_idx_ == (*batch_it_)->num_rows()) {
         ++batch_it_;
         row_idx_ = 0;
@@ -72,7 +75,7 @@ class RowBatchList {
     }
 
     RowBatchList* list_;
-    std::vector<RowBatch*>::iterator batch_it_;
+    BatchIterator batch_it_;
     int64_t row_idx_;
   };
 
@@ -92,7 +95,7 @@ class RowBatchList {
 
   /// Transfers the resources of all contained row batches to `row_batch`.
   void TransferResourceOwnership(RowBatch* row_batch) {
-    DCHECK_NOTNULL(row_batch);
+    DCHECK(row_batch != NULL);
     for (int i = 0; i < row_batches_.size(); ++i) {
       row_batches_[i]->TransferResourceOwnership(row_batch);
     }
@@ -119,6 +122,11 @@ class RowBatchList {
   TupleRowIterator Iterator() {
     return TupleRowIterator(this);
   }
+
+  /// Returns an iterator over the batches.
+  BatchIterator BatchesBegin() { return row_batches_.begin(); }
+
+  BatchIterator BatchesEnd() { return row_batches_.end(); }
 
  private:
   friend class TupleRowIterator;

@@ -109,7 +109,17 @@ do
     # Requires a running impalad cluster because some tests (such as DataErrorTest and
     # JdbcTest) queries against an impala cluster.
     pushd ${IMPALA_FE_DIR}
-    if ! mvn -fae test; then
+    MVN_ARGS=""
+    if [ "${TARGET_FILESYSTEM}" = "s3" ]; then
+      # When running against S3, only run the S3 frontend tests.
+      MVN_ARGS="-Dtest=S3*"
+    fi
+    # quietly resolve dependencies to avoid log spew in jenkins runs
+    if [ "${USER}" == "jenkins" ]; then
+      echo "Quietly resolving FE dependencies."
+      mvn -q dependency:resolve
+    fi
+    if ! mvn -fae test ${MVN_ARGS}; then
       TEST_RET_CODE=1
     fi
     popd
@@ -135,6 +145,11 @@ do
       --catalogd_args=--load_catalog_in_background=false \
       ${TEST_START_CLUSTER_ARGS}
     pushd ${IMPALA_FE_DIR}
+    # quietly resolve dependencies to avoid log spew in jenkins runs
+    if [ "${USER}" == "jenkins" ]; then
+      echo "Quietly resolving FE dependencies."
+      mvn -q dependency:resolve
+    fi
     if ! mvn test -Dtest=JdbcTest; then
       TEST_RET_CODE=1
     fi

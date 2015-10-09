@@ -15,9 +15,7 @@
 package com.cloudera.impala.catalog;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.net.URI;
-import java.net.URL;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -28,7 +26,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 
-import org.apache.commons.io.IOUtils;
+import org.apache.avro.Schema;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.BlockLocation;
 import org.apache.hadoop.fs.BlockStorageLocation;
@@ -43,20 +41,22 @@ import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.serde.serdeConstants;
-import org.apache.hadoop.hive.serde2.avro.AvroSerdeUtils;
 import org.apache.hadoop.util.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.cloudera.impala.analysis.ColumnDef;
 import com.cloudera.impala.analysis.Expr;
 import com.cloudera.impala.analysis.LiteralExpr;
 import com.cloudera.impala.analysis.NullLiteral;
+import com.cloudera.impala.analysis.NumericLiteral;
 import com.cloudera.impala.analysis.PartitionKeyValue;
 import com.cloudera.impala.catalog.HdfsPartition.BlockReplica;
 import com.cloudera.impala.catalog.HdfsPartition.FileBlock;
 import com.cloudera.impala.catalog.HdfsPartition.FileDescriptor;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.FileSystemUtil;
+import com.cloudera.impala.common.Pair;
 import com.cloudera.impala.common.PrintUtils;
 import com.cloudera.impala.thrift.ImpalaInternalServiceConstants;
 import com.cloudera.impala.thrift.TAccessLevel;
@@ -73,7 +73,9 @@ import com.cloudera.impala.thrift.TResultSetMetadata;
 import com.cloudera.impala.thrift.TTable;
 import com.cloudera.impala.thrift.TTableDescriptor;
 import com.cloudera.impala.thrift.TTableType;
+import com.cloudera.impala.util.AvroSchemaConverter;
 import com.cloudera.impala.util.AvroSchemaParser;
+import com.cloudera.impala.util.AvroSchemaUtils;
 import com.cloudera.impala.util.FsPermissionChecker;
 import com.cloudera.impala.util.HdfsCachingUtil;
 import com.cloudera.impala.util.ListMap;
@@ -372,8 +374,8 @@ public class HdfsTable extends Table {
       // part of the FileSystem interface, so we'll need to downcast.
       if (!(fs instanceof DistributedFileSystem)) continue;
 
-      LOG.trace("Loading disk ids for: " + getFullName() + ". nodes: " + getNumNodes() +
-          ". filesystem: " + fsKey);
+      LOG.trace("Loading disk ids for: " + getFullName() + ". nodes: " +
+          hostIndex_.size() + ". filesystem: " + fsKey);
       DistributedFileSystem dfs = (DistributedFileSystem)fs;
       FileBlocksInfo blockLists = perFsFileBlocks.get(fsKey);
       Preconditions.checkNotNull(blockLists);
@@ -1013,6 +1015,8 @@ public class HdfsTable extends Table {
           msTbl.getParameters().get(serdeConstants.SERIALIZATION_NULL_FORMAT);
       if (nullColumnValue_ == null) nullColumnValue_ = DEFAULT_NULL_COLUMN_VALUE;
 
+      // Excludes partition columns.
+      List<FieldSchema> msColDefs = msTbl.getSd().getCols();
       String inputFormat = msTbl.getSd().getInputFormat();
       if (HdfsFileFormat.fromJavaClassName(inputFormat) == HdfsFileFormat.AVRO) {
         // Look for the schema in TBLPROPERTIES and in SERDEPROPERTIES, with the latter
@@ -1022,8 +1026,14 @@ public class HdfsTable extends Table {
             getMetaStoreTable().getSd().getSerdeInfo().getParameters());
         schemaSearchLocations.add(getMetaStoreTable().getParameters());
 
-        avroSchema_ =
-            HdfsTable.getAvroSchema(schemaSearchLocations, getFullName());
+        avroSchema_ = AvroSchemaUtils.getAvroSchema(schemaSearchLocations);
+        if (avroSchema_ == null) {
+          // No Avro schema was explicitly set in the table metadata, so infer the Avro
+          // schema from the column definitions.
+          Schema inferredSchema = AvroSchemaConverter.convertFieldSchemas(
+              msTbl.getSd().getCols(), getFullName());
+          avroSchema_ = inferredSchema.toString();
+        }
         String serdeLib = msTbl.getSd().getSerdeInfo().getSerializationLib();
         if (serdeLib == null ||
             serdeLib.equals("org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe")) {
@@ -1031,32 +1041,28 @@ public class HdfsTable extends Table {
           // indicates there is an issue with the table metadata since Avro table need a
           // non-native serde. Instead of failing to load the table, fall back to
           // using the fields from the storage descriptor (same as Hive).
-          nonPartFieldSchemas_.addAll(msTbl.getSd().getCols());
+          nonPartFieldSchemas_.addAll(msColDefs);
         } else {
-          // Load the fields from the Avro schema.
-          // Since Avro does not include meta-data for CHAR or VARCHAR, an Avro type of
-          // "string" is used for CHAR, VARCHAR and STRING. Default back to the storage
-          // descriptor to determine the the type for "string"
-          List<FieldSchema> sdTypes = msTbl.getSd().getCols();
-          int i = 0;
-          List<Column> avroTypeList = AvroSchemaParser.parse(avroSchema_);
-          boolean canFallBack = sdTypes.size() == avroTypeList.size();
-          for (Column parsedCol: avroTypeList) {
-            FieldSchema fs = new FieldSchema();
-            fs.setName(parsedCol.getName());
-            String avroType = parsedCol.getType().toSql();
-            if (avroType.toLowerCase().equals("string") && canFallBack) {
-              fs.setType(sdTypes.get(i).getType());
-            } else {
-              fs.setType(avroType);
-            }
-            fs.setComment("from deserializer");
-            nonPartFieldSchemas_.add(fs);
-            i++;
+          // Generate new FieldSchemas from the Avro schema. This step reconciles
+          // differences in the column definitions and the Avro schema. For
+          // Impala-created tables this step is not necessary because the same
+          // resolution is done during table creation. But Hive-created tables
+          // store the original column definitions, and not the reconciled ones.
+          List<ColumnDef> colDefs =
+              ColumnDef.createFromFieldSchemas(msTbl.getSd().getCols());
+          List<ColumnDef> avroCols = AvroSchemaParser.parse(avroSchema_);
+          StringBuilder warning = new StringBuilder();
+          List<ColumnDef> reconciledColDefs =
+              AvroSchemaUtils.reconcileSchemas(colDefs, avroCols, warning);
+          if (warning.length() != 0) {
+            LOG.warn(String.format("Warning while loading table %s:\n%s",
+                getFullName(), warning.toString()));
           }
+          AvroSchemaUtils.setFromSerdeComment(reconciledColDefs);
+          nonPartFieldSchemas_.addAll(ColumnDef.toFieldSchemas(reconciledColDefs));
         }
       } else {
-        nonPartFieldSchemas_.addAll(msTbl.getSd().getCols());
+        nonPartFieldSchemas_.addAll(msColDefs);
       }
       // The number of clustering columns is the number of partition keys.
       numClusteringCols_ = msTbl.getPartitionKeys().size();
@@ -1158,71 +1164,6 @@ public class HdfsTable extends Table {
     }
   }
 
-  /**
-   * Gets an Avro table's JSON schema from the list of given table property search
-   * locations. The schema may be specified as a string literal or provided as a
-   * Hadoop FileSystem or http URL that points to the schema. This function does not
-   * perform any validation on the returned string (e.g., it may not be a valid
-   * schema).  If the schema was found to be specified as a SCHEMA_URL, this function
-   * will attempt to download the schema from the given URL.  Throws a
-   * TableLoadingException if no schema is found or if there was any error extracting
-   * the schema.
-   */
-  public static String getAvroSchema(List<Map<String, String>> schemaSearchLocations,
-      String tableName) throws TableLoadingException {
-    String url = null;
-    // Search all locations and break out on the first valid schema found.
-    for (Map<String, String> schemaLocation: schemaSearchLocations) {
-      if (schemaLocation == null) continue;
-
-      String literal = schemaLocation.get(AvroSerdeUtils.SCHEMA_LITERAL);
-      if (literal != null && !literal.equals(AvroSerdeUtils.SCHEMA_NONE)) return literal;
-
-      url = schemaLocation.get(AvroSerdeUtils.SCHEMA_URL);
-      if (url != null) {
-        url = url.trim();
-        break;
-      }
-    }
-    if (url == null || url.equals(AvroSerdeUtils.SCHEMA_NONE)) {
-      throw new TableLoadingException(String.format("No Avro schema provided in " +
-          "SERDEPROPERTIES or TBLPROPERTIES for table: %s ", tableName));
-    }
-    String schema = null;
-    if (url.toLowerCase().startsWith("http://")) {
-      InputStream urlStream = null;
-      try {
-        urlStream = new URL(url).openStream();
-        schema = IOUtils.toString(urlStream);
-      } catch (IOException e) {
-        throw new TableLoadingException("Problem reading Avro schema from: " + url, e);
-      } finally {
-        IOUtils.closeQuietly(urlStream);
-      }
-    } else {
-      Path path = new Path(url);
-      FileSystem fs = null;
-      try {
-        fs = path.getFileSystem(FileSystemUtil.getConfiguration());
-      } catch (Exception e) {
-        throw new TableLoadingException(String.format(
-            "Invalid avro.schema.url: %s. %s", path, e.getMessage()));
-      }
-      StringBuilder errorMsg = new StringBuilder();
-      if (!FileSystemUtil.isPathReachable(path, fs, errorMsg)) {
-        throw new TableLoadingException(String.format(
-            "Invalid avro.schema.url: %s. %s", path, errorMsg));
-      }
-      try {
-        schema = FileSystemUtil.readFile(path);
-      } catch (IOException e) {
-        throw new TableLoadingException(
-            "Problem reading Avro schema at: " + url, e);
-      }
-    }
-    return schema;
-  }
-
   @Override
   protected List<String> getColumnNamesWithHmsStats() {
     List<String> ret = Lists.newArrayList();
@@ -1261,12 +1202,9 @@ public class HdfsTable extends Table {
 
   @Override
   public TTableDescriptor toThriftDescriptor(Set<Long> referencedPartitions) {
-    // Create thrift descriptors to send to the BE.  The BE does not
-    // need any information below the THdfsPartition level.
     TTableDescriptor tableDesc = new TTableDescriptor(id_.asInt(), TTableType.HDFS_TABLE,
-        getColumns().size(), numClusteringCols_, name_, db_.getName());
+        getTColumnDescriptors(), numClusteringCols_, name_, db_.getName());
     tableDesc.setHdfsTable(getTHdfsTable(false, referencedPartitions));
-    tableDesc.setColNames(getColumnNames());
     return tableDesc;
   }
 
@@ -1313,9 +1251,6 @@ public class HdfsTable extends Table {
   public String getHdfsBaseDir() { return hdfsBaseDir_; }
   public boolean isAvroTable() { return avroSchema_ != null; }
 
-  @Override
-  public int getNumNodes() { return hostIndex_.size(); }
-
   /**
    * Get the index of hosts that store replicas of blocks of this table.
    */
@@ -1347,6 +1282,136 @@ public class HdfsTable extends Table {
     }
     Preconditions.checkNotNull(majorityFormat);
     return majorityFormat;
+  }
+
+  /**
+   * Returns the HDFS paths corresponding to HdfsTable partitions that don't exist in
+   * the metastore. An HDFS path is represented as a list of strings values, one per
+   * partition key column.
+   */
+  public List<List<String>> getPathsWithoutPartitions() throws CatalogException {
+    List<List<LiteralExpr>> existingPartitions = new ArrayList<List<LiteralExpr>>();
+    // Get the list of partition values of existing partitions in metastore.
+    for (HdfsPartition partition: partitions_) {
+      if (partition.isDefaultPartition()) continue;
+      existingPartitions.add(partition.getPartitionValues());
+    }
+
+    List<String> partitionKeys = Lists.newArrayList();
+    for (int i = 0; i < numClusteringCols_; ++i) {
+      partitionKeys.add(getColumns().get(i).getName());
+    }
+    Path basePath = new Path(hdfsBaseDir_);
+    List<List<String>> partitionsNotInHms = new ArrayList<List<String>>();
+    try {
+      getAllPartitionsNotInHms(basePath, partitionKeys, existingPartitions,
+          partitionsNotInHms);
+    } catch (Exception e) {
+      throw new CatalogException(String.format("Failed to recover partitions for %s " +
+          "with exception:%s.", getFullName(), e));
+    }
+    return partitionsNotInHms;
+  }
+
+  /**
+   * Returns all partitions which match the partition keys directory structure and pass
+   * type compatibility check. Also these partitions are not already part of the table.
+   */
+  private void getAllPartitionsNotInHms(Path path, List<String> partitionKeys,
+      List<List<LiteralExpr>> existingPartitions,
+      List<List<String>> partitionsNotInHms) throws IOException {
+    FileSystem fs = path.getFileSystem(CONF);
+    // Check whether the base directory exists.
+    if (!fs.exists(path)) return;
+
+    List<String> partitionValues = Lists.newArrayList();
+    List<LiteralExpr> partitionExprs = Lists.newArrayList();
+    getAllPartitionsNotInHms(path, partitionKeys, 0, fs, partitionValues,
+        partitionExprs, existingPartitions, partitionsNotInHms);
+  }
+
+  /**
+   * Returns all partitions which match the partition keys directory structure and pass
+   * the type compatibility check.
+   *
+   * path e.g. c1=1/c2=2/c3=3
+   * partitionKeys The ordered partition keys. e.g.("c1", "c2", "c3")
+   * depth The start position in partitionKeys to match the path name.
+   * partitionValues The partition values used to create a partition.
+   * partitionExprs The list of LiteralExprs which is used to avoid duplicate partitions.
+   * E.g. Having /c1=0001 and /c1=01, we should make sure only one partition
+   * will be added.
+   * existingPartitions All partitions which exist in metastore or newly added.
+   * partitionsNotInHms Contains all the recovered partitions.
+   */
+  private void getAllPartitionsNotInHms(Path path, List<String> partitionKeys,
+      int depth, FileSystem fs, List<String> partitionValues,
+      List<LiteralExpr> partitionExprs, List<List<LiteralExpr>> existingPartitions,
+      List<List<String>> partitionsNotInHms) throws IOException {
+    if (depth == partitionKeys.size()) {
+      if (existingPartitions.contains(partitionExprs)) {
+        LOG.trace(String.format("Skip recovery of path '%s' because it already exists " +
+            "in metastore", path.toString()));
+      } else {
+        partitionsNotInHms.add(partitionValues);
+        existingPartitions.add(partitionExprs);
+      }
+      return;
+    }
+
+    FileStatus[] statuses = fs.listStatus(path);
+    for (FileStatus status: statuses) {
+      if (!status.isDirectory()) continue;
+      Pair<String, LiteralExpr> keyValues =
+          getTypeCompatibleValue(status.getPath(), partitionKeys.get(depth));
+      if (keyValues == null) continue;
+
+      List<String> currentPartitionValues = Lists.newArrayList(partitionValues);
+      List<LiteralExpr> currentPartitionExprs = Lists.newArrayList(partitionExprs);
+      currentPartitionValues.add(keyValues.first);
+      currentPartitionExprs.add(keyValues.second);
+      getAllPartitionsNotInHms(status.getPath(), partitionKeys, depth + 1, fs,
+          currentPartitionValues, currentPartitionExprs,
+          existingPartitions, partitionsNotInHms);
+    }
+  }
+
+  /**
+   * Checks that the last component of 'path' is of the form "<partitionkey>=<v>"
+   * where 'v' is a type-compatible value from the domain of the 'partitionKey' column.
+   * If not, returns null, otherwise returns a Pair instance, the first element is the
+   * original value, the second element is the LiteralExpr created from the original
+   * value.
+   */
+  private Pair<String, LiteralExpr> getTypeCompatibleValue(Path path, String partitionKey) {
+    String partName[] = path.getName().split("=");
+    if (partName.length != 2 || !partName[0].equals(partitionKey)) return null;
+
+    // Check Type compatibility for Partition value.
+    Column column = getColumn(partName[0]);
+    Preconditions.checkNotNull(column);
+    Type type = column.getType();
+    LiteralExpr expr = null;
+    if (!partName[1].equals(getNullPartitionKeyValue())) {
+      try {
+        expr = LiteralExpr.create(partName[1], type);
+        // Skip large value which exceeds the MAX VALUE of specified Type.
+        if (expr instanceof NumericLiteral) {
+          if (NumericLiteral.isOverflow(((NumericLiteral)expr).getValue(), type)) {
+            LOG.warn(String.format("Skip the overflow value (%s) for Type (%s).",
+                partName[1], type.toSql()));
+            return null;
+          }
+        }
+      } catch (Exception ex) {
+        LOG.debug(String.format("Invalid partition value (%s) for Type (%s).",
+            partName[1], type.toSql()));
+        return null;
+      }
+    } else {
+      expr = new NullLiteral();
+    }
+    return new Pair<String, LiteralExpr>(partName[1], expr);
   }
 
   /**

@@ -100,7 +100,7 @@ Status DataSourceScanNode::Open(RuntimeState* state) {
   BOOST_FOREACH(const SlotDescriptor* slot, materialized_slots_) {
     extdatasource::TColumnDesc col;
     int col_idx = slot->col_pos();
-    col.__set_name(tuple_desc_->table_desc()->col_names()[col_idx]);
+    col.__set_name(tuple_desc_->table_desc()->col_descs()[col_idx].name());
     col.__set_type(slot->type().ToThrift());
     cols.push_back(col);
   }
@@ -293,6 +293,7 @@ Status DataSourceScanNode::MaterializeNextRow(MemPool* tuple_pool) {
 Status DataSourceScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
+  RETURN_IF_ERROR(QueryMaintenance(state));
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   if (ReachedLimit()) {
     *eos = true;
@@ -342,7 +343,7 @@ Status DataSourceScanNode::GetNext(RuntimeState* state, RowBatch* row_batch, boo
   }
 }
 
-Status DataSourceScanNode::Reset(RuntimeState* state, RowBatch* row_batch) {
+Status DataSourceScanNode::Reset(RuntimeState* state) {
   DCHECK(false) << "NYI";
   return Status("NYI");
 }

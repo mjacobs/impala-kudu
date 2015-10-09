@@ -28,7 +28,7 @@ import com.cloudera.impala.analysis.ExprSubstitutionMap;
 import com.cloudera.impala.analysis.SlotId;
 import com.cloudera.impala.analysis.TupleDescriptor;
 import com.cloudera.impala.analysis.TupleId;
-import com.cloudera.impala.common.InternalException;
+import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.common.PrintUtils;
 import com.cloudera.impala.common.TreeNode;
 import com.cloudera.impala.thrift.TExecStats;
@@ -96,6 +96,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
   // to avoid having to pass assigned conjuncts back and forth
   // (the planner uses this to save and reset the global state in between join tree
   // alternatives)
+  // TODO for 2.3: Save this state in the PlannerContext instead.
   protected Set<ExprId> assignedConjuncts_;
 
   // estimate of the output cardinality of this node; set in computeStats();
@@ -357,6 +358,7 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     msg.setLabel_detail(getDisplayLabelDetail());
     msg.setEstimated_stats(estimatedStats);
 
+    Preconditions.checkState(tupleIds_.size() > 0);
     msg.setRow_tuples(Lists.<Integer>newArrayListWithCapacity(tupleIds_.size()));
     msg.setNullable_tuples(Lists.<Boolean>newArrayListWithCapacity(tupleIds_.size()));
     for (TupleId tid: tupleIds_) {
@@ -386,10 +388,10 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
    * and computes the mem layout of all materialized tuples (with the assumption that
    * slots that are needed by ancestor PlanNodes have already been marked).
    * Also performs final expr substitution with childrens' smaps and computes internal
-   * state required for toThrift().
-   * This is called directly after construction.
+   * state required for toThrift(). This is called directly after construction.
+   * Throws if an expr substitution or evaluation fails.
    */
-  public void init(Analyzer analyzer) throws InternalException {
+  public void init(Analyzer analyzer) throws ImpalaException {
     assignConjuncts(analyzer);
     computeStats(analyzer);
     createDefaultSmap(analyzer);

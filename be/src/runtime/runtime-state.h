@@ -68,7 +68,7 @@ typedef std::map<std::string, std::string> FileMoveMap;
 /// query and shared across all execution nodes of that query.
 class RuntimeState {
  public:
-  RuntimeState(const TPlanFragmentInstanceCtx& fragment_instance_ctx,
+  RuntimeState(const TExecPlanFragmentParams& fragment_params,
       const std::string& cgroup, ExecEnv* exec_env);
 
   /// RuntimeState for executing expr in fe-support.
@@ -103,8 +103,11 @@ class RuntimeState {
     return query_ctx().request.query_options.abort_on_default_limit_exceeded;
   }
   int max_errors() const { return query_options().max_errors; }
-  const TQueryCtx& query_ctx() const { return fragment_instance_ctx_.query_ctx; }
-  const TPlanFragmentInstanceCtx& fragment_ctx() const { return fragment_instance_ctx_; }
+  const TQueryCtx& query_ctx() const { return fragment_ctx().query_ctx; }
+  const TPlanFragmentInstanceCtx& fragment_ctx() const {
+    return fragment_params_.fragment_instance_ctx;
+  }
+  const TExecPlanFragmentParams& fragment_params() const { return fragment_params_; }
   const std::string& effective_user() const {
     if (query_ctx().session.__isset.delegated_user &&
         !query_ctx().session.delegated_user.empty()) {
@@ -124,7 +127,7 @@ class RuntimeState {
   }
   const TUniqueId& query_id() const { return query_ctx().query_id; }
   const TUniqueId& fragment_instance_id() const {
-    return fragment_instance_ctx_.fragment_instance_id;
+    return fragment_ctx().fragment_instance_id;
   }
   const std::string& cgroup() const { return cgroup_; }
   ExecEnv* exec_env() { return exec_env_; }
@@ -205,7 +208,7 @@ class RuntimeState {
   /// ErrorMsg class. The runtime state aggregates log messages based on type with one
   /// exception: messages with the GENERAL type are not aggregated but are kept
   /// individually.
-  bool LogError(const ErrorMsg& msg);
+  bool LogError(const ErrorMsg& msg, int vlog_level = 1);
 
   /// Returns true if the error log has not reached max_errors_.
   bool LogHasSpace() {
@@ -254,12 +257,18 @@ class RuntimeState {
   }
 
   /// Sets query_status_ to MEM_LIMIT_EXCEEDED and logs all the registered trackers.
-  /// Subsequent calls to this will be no-ops.
-  /// If failed_allocation_size is not 0, then it is the size of the allocation (in
+  /// Subsequent calls to this will be no-ops. Returns query_status_.
+  /// If 'failed_allocation_size' is not 0, then it is the size of the allocation (in
   /// bytes) that would have exceeded the limit allocated for 'tracker'.
   /// This value and tracker are only used for error reporting.
+  /// If 'msg' is non-NULL, it will be appended to query_status_ in addition to the
+  /// generic "Memory limit exceeded" error.
   Status SetMemLimitExceeded(MemTracker* tracker = NULL,
-      int64_t failed_allocation_size = 0);
+      int64_t failed_allocation_size = 0, const ErrorMsg* msg = NULL);
+
+  Status SetMemLimitExceeded(const ErrorMsg& msg) {
+    return SetMemLimitExceeded(NULL, 0, &msg);
+  }
 
   /// Returns a non-OK status if query execution should stop (e.g., the query was cancelled
   /// or a mem limit was exceeded). Exec nodes should check this periodically so execution
@@ -294,9 +303,10 @@ class RuntimeState {
   /// Stores the number of parse errors per file.
   std::vector<std::pair<std::string, int> > file_errors_;
 
-  /// Context of this fragment instance, including its unique id, the total number
-  /// of fragment instances, the query context, the coordinator address, etc.
-  TPlanFragmentInstanceCtx fragment_instance_ctx_;
+  /// Original thrift descriptor for this fragment. Includes its unique id, the total
+  /// number of fragment instances, the query context, the coordinator address, the
+  /// descriptor table, etc.
+  TExecPlanFragmentParams fragment_params_;
 
   /// Query-global timestamp, e.g., for implementing now(). Set from query_globals_.
   /// Use pointer to avoid inclusion of timestampvalue.h and avoid clang issues.

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env impala-python
 
 # Copyright (c) 2014 Cloudera, Inc. All rights reserved.
 #
@@ -36,6 +36,7 @@ from tests.comparison.db_connector import (
     DbConnection,
     DbConnector,
     IMPALA,
+    HIVE,
     MYSQL,
     ORACLE,
     POSTGRESQL)
@@ -53,20 +54,21 @@ class QueryResultComparator(object):
   # The DECIMAL values will be rounded before comparison
   DECIMAL_PLACES = 2
 
-  def __init__(self, ref_connection, test_connection):
+  def __init__(self, query_profile, ref_connection, test_connection, query_timeout_seconds):
     '''test/ref_connection arguments should be an instance of DbConnection'''
     ref_cursor = ref_connection.create_cursor()
     test_cursor = test_connection.create_cursor()
 
     self.ref_connection = ref_connection
-    self.ref_sql_writer = SqlWriter.create(dialect=ref_connection.db_type)
+    self.ref_sql_writer = SqlWriter.create(dialect=ref_connection.db_type,
+                                           nulls_order_asc=query_profile.nulls_order_asc())
     self.test_connection = test_connection
     self.test_sql_writer = SqlWriter.create(dialect=test_connection.db_type)
 
     self.query_executor = QueryExecutor(
         [ref_cursor, test_cursor],
         [self.ref_sql_writer, self.test_sql_writer],
-        query_timeout_seconds=(3 * 60))
+        query_timeout_seconds=query_timeout_seconds)
 
   @property
   def ref_db_type(self):
@@ -101,6 +103,19 @@ class QueryResultComparator(object):
           or 'Expressions in the PARTITION BY clause must not be consta' in error_message:
         # It's too much work to avoid this bug. Just ignore it if it comes up.
         known_error = KnownError('https://issues.cloudera.org/browse/IMPALA-1354')
+      elif 'GROUP BY expression must not contain aggregate functions' in error_message \
+          or 'select list expression not produced by aggregation output' in error_message:
+        known_error = KnownError('https://issues.cloudera.org/browse/IMPALA-1423')
+      elif ('max(' in error_message or 'min(' in error_message) \
+          and 'only supported with an UNBOUNDED PRECEDING start bound' in error_message:
+        # This analytic isn't supported and ignoring this here is much easier than not
+        # generating the query...
+        known_error = KnownError('MAX UNBOUNDED PRECISION')
+      elif 'IN and/or EXISTS subquery predicates are not supported in binary predicates' \
+          in error_message:
+        known_error = KnownError('https://issues.cloudera.org/browse/IMPALA-1418')
+      elif 'Unsupported predicate with subquery' in error_message:
+        known_error = KnownError('https://issues.cloudera.org/browse/IMPALA-1950')
       if known_error:
         comparison_result.exception = known_error
       else:
@@ -158,41 +173,43 @@ class QueryResultComparator(object):
       return round(data, self.DECIMAL_PLACES)
     return data
 
-  def row_sort_cmp(self, left_row, right_row):
+  def row_sort_cmp(self, ref_row, test_row):
     '''Comparison used for sorting. '''
-    for left, right in izip(left_row, right_row):
-      if left is None and right is not None:
+    for ref_val, test_val in izip(ref_row, test_row):
+      if ref_val is None and test_val is not None:
         return -1
-      if left is not None and right is None:
+      if ref_val is not None and test_val is None:
         return 1
-      result = cmp(left, right)
+      result = cmp(ref_val, test_val)
       if result:
         return result
     return 0
 
-  def vals_are_equal(self, left, right):
+  def vals_are_equal(self, ref, test):
     '''Compares if two values are equal in two cells. Floats are considered equal if the
     difference between them is very small.'''
-    if left == right:
+    if ref == test:
       return True
-    if isinstance(left, float) and isinstance(right, float):
-      return self.floats_are_equal(left, right)
+    # For some reason Postgresql will return Decimals when using some aggregate
+    # functions such as AVG().
+    if isinstance(ref, (float, Decimal)) and isinstance(test, float):
+      return self.floats_are_equal(ref, test)
     LOG.debug("Values differ, reference: %s (%s), test: %s (%s)",
-        left, type(left),
-        right, type(right))
+        ref, type(ref),
+        test, type(test))
     return False
 
-  def floats_are_equal(self, left, right):
+  def floats_are_equal(self, ref, test):
     '''Compare two floats.'''
-    left = round(left, self.DECIMAL_PLACES)
-    right = round(right, self.DECIMAL_PLACES)
-    diff = abs(left - right)
-    if left * right == 0:
+    ref = round(ref, self.DECIMAL_PLACES)
+    test = round(test, self.DECIMAL_PLACES)
+    diff = abs(ref - test)
+    if ref * test == 0:
       return diff < self.EPSILON
-    result = diff / (abs(left) + abs(right)) < self.EPSILON
+    result = diff / (abs(ref) + abs(test)) < self.EPSILON
     if not result:
       LOG.debug("Floats differ, diff: %s, |reference|: %s, |test|: %s",
-          diff, abs(left), abs(right))
+          diff, abs(ref), abs(test))
     return result
 
 
@@ -440,7 +457,8 @@ class QueryResultDiffSearcher(object):
     self.common_tables = DbConnection.describe_common_tables(
         [ref_connection, test_connection])
 
-  def search(self, number_of_test_queries, stop_on_result_mismatch, stop_on_crash):
+  def search(self, number_of_test_queries, stop_on_result_mismatch, stop_on_crash,
+             query_timeout_seconds):
     '''Returns an instance of SearchResults, which is a summary report. This method
        oversees the generation, execution, and comparison of queries.
 
@@ -449,7 +467,7 @@ class QueryResultDiffSearcher(object):
     '''
     start_time = time()
     query_result_comparator = QueryResultComparator(
-        self.ref_connection, self.test_connection)
+        self.query_profile, self.ref_connection, self.test_connection, query_timeout_seconds)
     query_generator = QueryGenerator(self.query_profile)
     query_count = 0
     queries_resulted_in_data_count = 0
@@ -605,9 +623,10 @@ if __name__ == '__main__':
   cli_options.add_logging_options(parser)
   cli_options.add_db_name_option(parser)
   cli_options.add_connection_option_groups(parser)
+  cli_options.add_timeout_option(parser)
 
   parser.add_option('--test-db-type', default=IMPALA,
-      choices=(IMPALA, MYSQL, ORACLE, POSTGRESQL),
+      choices=(HIVE, IMPALA, MYSQL, ORACLE, POSTGRESQL),
       help='The type of the test database to use. Ex: IMPALA.')
   parser.add_option('--ref-db-type', default=POSTGRESQL,
       choices=(MYSQL, ORACLE, POSTGRESQL),
@@ -653,7 +672,8 @@ if __name__ == '__main__':
   # Create an instance of profile class (e.g. DefaultProfile)
   query_profile = profiles[options.profile]()
   diff_searcher = QueryResultDiffSearcher(query_profile, ref_connection, test_connection)
+  query_timeout_seconds = options.timeout
   search_results = diff_searcher.search(
-      options.query_count, options.stop_on_mismatch, options.stop_on_crash)
+      options.query_count, options.stop_on_mismatch, options.stop_on_crash, query_timeout_seconds)
   print(search_results)
   sys.exit(search_results.mismatch_count)

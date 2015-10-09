@@ -753,11 +753,16 @@ public class ParserTest {
   @Test
   public void TestWithClause() throws AnalysisException {
     ParsesOk("with t as (select 1 as a) select a from t");
+    ParsesOk("with t(x) as (select 1 as a) select x from t");
     ParsesOk("with t as (select c from tab) select * from t");
+    ParsesOk("with t(x, y) as (select * from tab) select * from t");
     ParsesOk("with t as (values(1, 2, 3), (4, 5, 6)) select * from t");
+    ParsesOk("with t(x, y, z) as (values(1, 2, 3), (4, 5, 6)) select * from t");
     ParsesOk("with t1 as (select 1 as a), t2 as (select 2 as a) select a from t1");
     ParsesOk("with t1 as (select c from tab), t2 as (select c from tab)" +
         "select c from t2");
+    ParsesOk("with t1(x) as (select c from tab), t2(x) as (select c from tab)" +
+        "select x from t2");
     // With clause and union statement.
     ParsesOk("with t1 as (select 1 as a), t2 as (select 2 as a)" +
         "select a from t1 union all select a from t2");
@@ -766,16 +771,19 @@ public class ParserTest {
         "select a from t1 inner join t2 on t1.a = t2.a");
     // With clause in inline view.
     ParsesOk("select * from (with t as (select 1 as a) select * from t) as a");
+    ParsesOk("select * from (with t(x) as (select 1 as a) select * from t) as a");
     // With clause in query statement of insert statement.
     ParsesOk("insert into x with t as (select * from tab) select * from t");
+    ParsesOk("insert into x with t(x, y) as (select * from tab) select * from t");
     ParsesOk("insert into x with t as (values(1, 2, 3)) select * from t");
+    ParsesOk("insert into x with t(x, y) as (values(1, 2, 3)) select * from t");
     // With clause before insert statement.
     ParsesOk("with t as (select 1) insert into x select * from t");
+    ParsesOk("with t(x) as (select 1) insert into x select * from t");
 
     // Test quoted identifier or string literal as table alias.
     ParsesOk("with `t1` as (select 1 a), 't2' as (select 2 a), \"t3\" as (select 3 a)" +
         "select a from t1 union all select a from t2 union all select a from t3");
-
     // Multiple with clauses. Operands must be in parenthesis to
     // have their own with clause.
     ParsesOk("with t as (select 1) " +
@@ -786,9 +794,14 @@ public class ParserTest {
         "(with t as (select 3) select * from t) order by 1 limit 1");
     // Multiple with clauses. One before the insert and one inside the query statement.
     ParsesOk("with t as (select 1) insert into x with t as (select 2) select * from t");
+    ParsesOk("with t(c1) as (select 1) " +
+        "insert into x with t(c2) as (select 2) select * from t");
 
     // Empty with clause.
     ParserError("with t as () select 1");
+    ParserError("with t(x) as () select 1");
+    // No labels inside parenthesis.
+    ParserError("with t() as (select 1 as a) select a from t");
     // Missing select, union or insert statement after with clause.
     ParserError("select * from (with t as (select 1 as a)) as a");
     ParserError("with t as (select 1)");
@@ -797,8 +810,11 @@ public class ParserTest {
     ParserError("with t as select 1 as a union all select a from t");
     ParserError("with t1 as (select 1 as a), t2 as select 2 as a select a from t");
     ParserError("with t as select 1 as a select a from t");
+    // Missing parenthesis around column labels.
+    ParserError("with t c1 as (select 1 as a) select c1 from t");
     // Insert in with clause is not valid.
     ParserError("with t as (insert into x select * from tab) select * from t");
+    ParserError("with t(c1) as (insert into x select * from tab) select * from t");
     // Union operands need to be parenthesized to have their own with clause.
     ParserError("select * from t union all with t as (select 2) select * from t");
   }
@@ -1048,18 +1064,23 @@ public class ParserTest {
     for (String lop: operands_) {
       for (String rop: operands_) {
         for (ArithmeticExpr.Operator op : ArithmeticExpr.Operator.values()) {
-          // Test BITNOT separately.
-          if (op == ArithmeticExpr.Operator.BITNOT) {
-            continue;
+          String expr = null;
+          switch (op.getPos()) {
+            case BINARY_INFIX:
+              expr = String.format("%s %s %s", lop, op.toString(), rop);
+              break;
+            case UNARY_POSTFIX:
+              expr = String.format("%s %s", lop, op.toString());
+              break;
+            case UNARY_PREFIX:
+              expr = String.format("%s %s", op.toString(), lop);
+              break;
+            default:
+              fail("Unknown operator kind: " + op.getPos());
           }
-          String expr = String.format("%s %s %s", lop, op.toString(), rop);
           ParsesOk(String.format("select %s from t where %s", expr, expr));
         }
       }
-      // Test BITNOT.
-      String bitNotExpr = String.format("%s %s",
-          ArithmeticExpr.Operator.BITNOT.toString(), lop);
-      ParsesOk(String.format("select %s from t where %s", bitNotExpr, bitNotExpr));
     }
     ParserError("select (i + 5)(1 - i) from t");
     ParserError("select %a from t");
@@ -1069,6 +1090,42 @@ public class ParserTest {
     ParserError("select |a from t");
     ParserError("select ^a from t");
     ParserError("select a ~ a from t");
+  }
+
+  @Test
+  public void TestFactorialPrecedenceAssociativity() {
+    // Test factorial precedence relative to other arithmetic operators.
+    // Should be parsed as 3 + (3!)
+    // TODO: disabled b/c IMPALA-2149 - low precedence of prefix ! prevents this from
+    // parsing in the expected way
+    SelectStmt stmt = (SelectStmt) ParsesOk("SELECT 3 + 3!");
+    Expr e = stmt.getSelectList().getItems().get(0).getExpr();
+    assertTrue(e instanceof ArithmeticExpr);
+    // ArithmeticExpr ae = (ArithmeticExpr) e;
+    // assertEquals("Expected ! to bind more tightly than +",
+    //              ArithmeticExpr.Operator.ADD, ae.getOp());
+    // assertEquals(2, ae.getChildren().size());
+    // assertTrue(ae.getChild(1) instanceof ArithmeticExpr);
+    // assertEquals(ArithmeticExpr.Operator.FACTORIAL,
+    //              ((ArithmeticExpr)ae.getChild(1)).getOp());
+
+    // Test factorial associativity.
+    stmt = (SelectStmt) ParsesOk("SELECT 3! = 4");
+    // Should be parsed as (3!) = (4)
+    e = stmt.getSelectList().getItems().get(0).getExpr();
+    assertTrue(e instanceof BinaryPredicate);
+    BinaryPredicate bp = (BinaryPredicate) e;
+    assertEquals(BinaryPredicate.Operator.EQ, bp.getOp());
+    assertEquals(2, bp.getChildren().size());
+
+    // Test != not broken
+    stmt = (SelectStmt) ParsesOk("SELECT 3 != 4");
+    // Should be parsed as (3) != (4)
+    e = stmt.getSelectList().getItems().get(0).getExpr();
+    assertTrue(e instanceof BinaryPredicate);
+    bp = (BinaryPredicate) e;
+    assertEquals(BinaryPredicate.Operator.NE, bp.getOp());
+    assertEquals(2, bp.getChildren().size());
   }
 
   /**
@@ -1626,6 +1683,12 @@ public class ParserTest {
     // Fully-qualified table ok
     ParsesOk("DESCRIBE databasename.tablename");
     ParsesOk("DESCRIBE FORMATTED databasename.tablename");
+
+    // Paths within table ok.
+    ParsesOk("DESCRIBE databasename.tablename.field1");
+    ParsesOk("DESCRIBE databasename.tablename.field1.field2");
+    ParsesOk("DESCRIBE FORMATTED databasename.tablename.field1");
+    ParsesOk("DESCRIBE FORMATTED databasename.tablename.field1.field2");
   }
 
   @Test
@@ -1975,6 +2038,19 @@ public class ParserTest {
       ParserError(String.format("ALTER %s Foo TO Foo2", entity));
       ParserError(String.format("ALTER %s Foo TO Foo2", entity));
     }
+  }
+
+  @Test
+  public void TestAlterTableRecoverPartitions() {
+    ParsesOk("ALTER TABLE TestDb.Foo RECOVER PARTITIONS");
+    ParsesOk("ALTER TABLE Foo RECOVER PARTITIONS");
+
+    ParserError("ALTER TABLE Foo RECOVER PARTITIONS ()");
+    ParserError("ALTER TABLE Foo RECOVER PARTITIONS (i=1)");
+    ParserError("ALTER TABLE RECOVER");
+    ParserError("ALTER TABLE RECOVER PARTITIONS");
+    ParserError("ALTER TABLE Foo RECOVER");
+    ParserError("ALTER TABLE Foo RECOVER PARTITION");
   }
 
   @Test
@@ -2372,8 +2448,12 @@ public class ParserTest {
     ParsesOk("DROP VIEW Foo.Bar");
     ParsesOk("DROP VIEW IF EXISTS Foo.Bar");
     ParsesOk("DROP DATABASE Foo");
+    ParsesOk("DROP DATABASE Foo CASCADE");
+    ParsesOk("DROP DATABASE Foo RESTRICT");
     ParsesOk("DROP SCHEMA Foo");
     ParsesOk("DROP DATABASE IF EXISTS Foo");
+    ParsesOk("DROP DATABASE IF EXISTS Foo CASCADE");
+    ParsesOk("DROP DATABASE IF EXISTS Foo RESTRICT");
     ParsesOk("DROP SCHEMA IF EXISTS Foo");
     ParsesOk("DROP FUNCTION Foo()");
     ParsesOk("DROP AGGREGATE FUNCTION Foo(INT)");
@@ -2387,6 +2467,11 @@ public class ParserTest {
     ParserError("DROP DATABASE Foo.Bar");
     ParserError("DROP SCHEMA Foo.Bar");
     ParserError("DROP DATABASE Foo Bar");
+    ParserError("DROP DATABASE CASCADE Foo");
+    ParserError("DROP DATABASE CASCADE RESTRICT Foo");
+    ParserError("DROP DATABASE RESTRICT CASCADE Foo");
+    ParserError("DROP CASCADE DATABASE IF EXISTS Foo");
+    ParserError("DROP RESTRICT DATABASE IF EXISTS Foo");
     ParserError("DROP SCHEMA Foo Bar");
     ParserError("DROP TABLE IF Foo");
     ParserError("DROP TABLE EXISTS Foo");
@@ -2882,8 +2967,27 @@ public class ParserTest {
       ParsesOk(String.format("%s INSERT ON URI 'foo' %s  myRole", formatStr));
 
       ParsesOk(String.format("%s SELECT ON TABLE foo %s myRole", formatStr));
+      ParserError(String.format("%s SELECT ON TABLE %s myRole", formatStr));
       ParsesOk(String.format("%s SELECT ON DATABASE foo %s myRole", formatStr));
-      ParsesOk(String.format("%s SELECT ON URI 'foo' %s  myRole", formatStr));
+      ParserError(String.format("%s SELECT ON DATABASE %s myRole", formatStr));
+      ParsesOk(String.format("%s SELECT ON URI 'foo' %s myRole", formatStr));
+      ParserError(String.format("%s SELECT ON URI %s myRole", formatStr));
+
+      // Column-level authorization on TABLE scope
+      ParsesOk(String.format("%s SELECT (a, b) ON TABLE foo %s myRole", formatStr));
+      ParsesOk(String.format("%s SELECT () ON TABLE foo %s myRole", formatStr));
+      ParsesOk(String.format("%s INSERT (a, b) ON TABLE foo %s myRole", formatStr));
+      ParsesOk(String.format("%s ALL (a, b) ON TABLE foo %s myRole", formatStr));
+      ParserError(String.format("%s SELECT (*) ON TABLE foo %s myRole", formatStr));
+
+      ParserError(String.format("%s SELECT (a,) ON TABLE foo %s myRole", formatStr));
+      ParserError(String.format("%s SELECT a, b ON TABLE foo %s myRole", formatStr));
+      ParserError(String.format("%s SELECT (a), b ON TABLE foo %s myRole", formatStr));
+      ParserError(String.format("%s SELECT ON TABLE (a, b) foo %s myRole", formatStr));
+      ParserError(String.format("%s SELECT ((a)) ON TABLE foo %s myRole", formatStr));
+      ParserError(String.format("%s SELECT (a, b) ON DATABASE foo %s myRole",
+          formatStr));
+      ParserError(String.format("%s SELECT (a, b) ON URI 'foo' %s myRole", formatStr));
 
       // Server scope does not accept a name.
       ParsesOk(String.format("%s ALL ON SERVER %s myRole", formatStr));

@@ -132,7 +132,7 @@ BIGINT
 ====
 ---- QUERY
 set num_nodes=0;
-set max_block_mgr_memory=45m;
+set max_block_mgr_memory=40m;
 select max(t1.total_count), max(t1.l_shipinstruct), max(t1.l_comment) from
 (select l_shipinstruct, l_comment, count(*) over () total_count from lineitem) t1
 ---- RESULTS
@@ -145,7 +145,7 @@ BIGINT, STRING, STRING
 set max_block_mgr_memory=10m;
 select a.int_col, count(*)
 from functional.alltypessmall a, functional.alltypessmall b, functional.alltypessmall c
-where a.id = b.id and b.id = c.id group by a.int_col;
+where a.id = b.id and b.id = c.id group by a.int_col
 ---- RESULTS
 0,12
 1,12
@@ -309,4 +309,27 @@ limit 100
 'Supplier#000002483',12
 ---- TYPES
 string, bigint
+====
+---- QUERY
+# Test aggregation spill with group_concat distinct
+# TODO: get this to spill.
+set num_nodes=1;
+set max_block_mgr_memory=265m;
+select l_orderkey, count(*), group_concat(distinct l_linestatus, '|')
+from lineitem
+group by 1
+order by 1 limit 10
+---- RESULTS
+1,6,'O'
+2,1,'O'
+3,6,'F'
+4,1,'O'
+5,3,'F'
+6,1,'F'
+7,7,'O'
+32,6,'O'
+33,4,'F'
+34,3,'O'
+---- TYPES
+BIGINT, BIGINT, STRING
 ====

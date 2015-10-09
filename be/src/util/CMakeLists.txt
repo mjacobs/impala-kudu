@@ -24,6 +24,7 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/util")
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/util")
 
 add_library(Util
+  avro-util.cc
   benchmark.cc
   bitmap.cc
   cgroups-mgr.cc
@@ -73,6 +74,7 @@ add_library(Util
   url-parser.cc
   url-coding.cc
 )
+add_dependencies(Util thrift-deps)
 
 add_library(Webserver STATIC
   ${SQUEASEL_SRC_DIR}/squeasel.c
@@ -89,14 +91,15 @@ add_library(loggingsupport SHARED
   logging-support.cc
 )
 
-target_link_libraries(Webserver pthread dl Util ssl crypto)
+target_link_libraries(Webserver pthread dl Util ${OPENSSL_LIBS})
 
 add_executable(network-perf-benchmark network-perf-benchmark.cc)
 add_executable(parquet-reader parquet-reader.cc)
 
 target_link_libraries(network-perf-benchmark ${IMPALA_LINK_LIBS})
 target_link_libraries(parquet-reader ${IMPALA_LINK_LIBS})
-target_link_libraries(loggingsupport ${IMPALA_LINK_LIBS_NO_TCMALLOC})
+
+target_link_libraries(loggingsupport ${IMPALA_LINK_LIBS_DYNAMIC_TARGETS})
 
 ADD_BE_TEST(runtime-profile-test)
 ADD_BE_TEST(benchmark-test)
@@ -125,3 +128,5 @@ target_link_libraries(error-util-test Util)
 ADD_BE_TEST(proc-info-test)
 ADD_BE_TEST(lru-cache-test)
 ADD_BE_TEST(filesystem-util-test)
+ADD_BE_TEST(bitmap-test)
+ADD_BE_TEST(fixed-size-hash-table-test)

@@ -25,8 +25,9 @@ namespace impala {
 inline bool BufferedTupleStream::AddRow(TupleRow* row, Status* status, uint8_t** dst) {
   DCHECK(!closed_);
   if (LIKELY(DeepCopy(row, dst))) return true;
-  bool got_block = false;
-  *status = NewBlockForWrite(ComputeRowSize(row), &got_block);
+  bool got_block;
+  int64_t row_size = ComputeRowSize(row);
+  *status = NewBlockForWrite(row_size, &got_block);
   if (!status->ok() || !got_block) return false;
   return DeepCopy(row, dst);
 }
@@ -34,7 +35,7 @@ inline bool BufferedTupleStream::AddRow(TupleRow* row, Status* status, uint8_t**
 inline uint8_t* BufferedTupleStream::AllocateRow(int size, Status *status) {
   DCHECK(!closed_);
   if (UNLIKELY(write_block_ == NULL || write_block_->BytesRemaining() < size)) {
-    bool got_block = false;
+    bool got_block;
     *status = NewBlockForWrite(size, &got_block);
     if (!status->ok() || !got_block) return NULL;
   }
@@ -47,7 +48,7 @@ inline uint8_t* BufferedTupleStream::AllocateRow(int size, Status *status) {
 }
 
 inline void BufferedTupleStream::GetTupleRow(const RowIdx& idx, TupleRow* row) const {
-  DCHECK_NOTNULL(row);
+  DCHECK(row != NULL);
   DCHECK(!closed_);
   DCHECK(is_pinned());
   DCHECK(!delete_on_read_);

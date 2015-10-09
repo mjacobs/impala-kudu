@@ -31,6 +31,7 @@ import com.cloudera.impala.analysis.StringLiteral;
 import com.cloudera.impala.analysis.TupleDescriptor;
 import com.cloudera.impala.catalog.DataSource;
 import com.cloudera.impala.catalog.DataSourceTable;
+import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.extdatasource.ExternalDataSourceExecutor;
 import com.cloudera.impala.extdatasource.thrift.TBinaryPredicate;
@@ -88,7 +89,8 @@ public class DataSourceScanNode extends ScanNode {
   }
 
   @Override
-  public void init(Analyzer analyzer) throws InternalException {
+  public void init(Analyzer analyzer) throws ImpalaException {
+    checkForSupportedFileFormats();
     assignConjuncts(analyzer);
     analyzer.createEquivConjuncts(tupleIds_.get(0), conjuncts_);
     prepareDataSource();
@@ -223,12 +225,12 @@ public class DataSourceScanNode extends ScanNode {
       TComparisonOp op = null;
       if ((conjunct.getChild(0).unwrapSlotRef(true) instanceof SlotRef) &&
           (conjunct.getChild(1) instanceof LiteralExpr)) {
-        slotRef = (SlotRef) conjunct.getChild(0).unwrapSlotRef(true);
+        slotRef = conjunct.getChild(0).unwrapSlotRef(true);
         literalExpr = (LiteralExpr) conjunct.getChild(1);
         op = ((BinaryPredicate) conjunct).getOp().getThriftOp();
       } else if ((conjunct.getChild(1).unwrapSlotRef(true) instanceof SlotRef) &&
                  (conjunct.getChild(0) instanceof LiteralExpr)) {
-        slotRef = (SlotRef) conjunct.getChild(1).unwrapSlotRef(true);
+        slotRef = conjunct.getChild(1).unwrapSlotRef(true);
         literalExpr = (LiteralExpr) conjunct.getChild(0);
         op = ((BinaryPredicate) conjunct).getOp().converse().getThriftOp();
       } else {
@@ -260,12 +262,12 @@ public class DataSourceScanNode extends ScanNode {
     inputCardinality_ = numRowsEstimate_;
     cardinality_ = numRowsEstimate_;
     cardinality_ *= computeSelectivity();
-    cardinality_ = Math.max(0, cardinality_);
+    cardinality_ = Math.max(1, cardinality_);
     cardinality_ = capAtLimit(cardinality_);
 
     LOG.debug("computeStats DataSourceScan: cardinality=" + Long.toString(cardinality_));
 
-    numNodes_ = desc_.getTable().getNumNodes();
+    numNodes_ = table_.getNumNodes();
     LOG.debug("computeStats DataSourceScan: #nodes=" + Integer.toString(numNodes_));
   }
 

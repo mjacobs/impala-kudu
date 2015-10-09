@@ -38,6 +38,7 @@ class TPlan;
 class TupleRow;
 class DataSink;
 class MemTracker;
+class SubplanNode;
 
 /// Superclass of all executor nodes.
 /// All subclasses need to make sure to check RuntimeState::is_cancelled()
@@ -69,6 +70,8 @@ class ExecNode {
   /// If overridden in subclass, must first call superclass's Open().
   /// If a parent exec node adds slot filters (see RuntimeState::AddBitmapFilter()),
   /// they need to be added before calling Open() on the child that will consume them.
+  /// Open() is called after Prepare() or Reset(), i.e., possibly multiple times
+  /// throughout the lifetime of this node.
   virtual Status Open(RuntimeState* state);
 
   /// Retrieves rows and returns them via row_batch. Sets eos to true
@@ -86,18 +89,20 @@ class ExecNode {
   /// TODO: AggregationNode and HashJoinNode cannot be "re-opened" yet.
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) = 0;
 
-  /// Resets all data-specific state, returning this node to the state it was in after
-  /// calling Prepare() and before calling Open().
-  /// If `row_batch` is not-NULL, this function transfers the ownership of row-batch
-  /// resources held by the exec node to the given `row_batch`. Otherwise, those
-  /// resources are just freed.
-  /// Prepare() must have already been called before calling Reset(). Open() and GetNext()
-  /// may have optionally been called. Close() must not have been called.
+  /// Resets the stream of row batches to be retrieved by subsequent GetNext() calls.
+  /// Clears all internal state, returning this node to the state it was in after calling
+  /// Prepare() and before calling Open(). This function must not clear memory
+  /// still owned by this node that is backing rows returned in GetNext().
+  /// Prepare() and Open() must have already been called before calling Reset().
+  /// GetNext() may have optionally been called (not necessarily until eos).
+  /// Close() must not have been called.
+  /// Reset() is not idempotent. Calling it multiple times in a row without a preceding
+  /// call to Open() is invalid.
   /// If overridden in a subclass, must call superclass's Reset() at the end. The default
   /// implementation calls Reset() on children.
-  /// Note that this function may be called many times, so should be fast. For example,
-  /// accumulated memory does not need to be freed on every call if it's expensive.
-  virtual Status Reset(RuntimeState* state, RowBatch* row_batch);
+  /// Note that this function may be called many times (proportional to the input data),
+  /// so should be fast.
+  virtual Status Reset(RuntimeState* state);
 
   /// Close() will get called for every exec node, regardless of what else is called and
   /// the status of these calls (i.e. Prepare() may never have been called, or
@@ -115,7 +120,7 @@ class ExecNode {
   virtual void Close(RuntimeState* state);
 
   /// Creates exec node tree from list of nodes contained in plan via depth-first
-  /// traversal. All nodes are placed in pool.
+  /// traversal. All nodes are placed in pool and have Init() called on them.
   /// Returns error if 'plan' is corrupted, otherwise success.
   static Status CreateTree(ObjectPool* pool, const TPlan& plan,
                            const DescriptorTbl& descs, ExecNode** root);
@@ -152,11 +157,18 @@ class ExecNode {
   /// Output parameters:
   ///   out: Stream to accumulate debug string.
   virtual void DebugString(int indentation_level, std::stringstream* out) const;
-  const std::vector<ExprContext*>& conjunct_ctxs() const { return conjunct_ctxs_; }
 
+  const std::vector<ExprContext*>& conjunct_ctxs() const { return conjunct_ctxs_; }
   int id() const { return id_; }
   TPlanNodeType::type type() const { return type_; }
   const RowDescriptor& row_desc() const { return row_descriptor_; }
+  ExecNode* child(int i) { return children_[i]; }
+  int num_children() const { return children_.size(); }
+  SubplanNode* get_containing_subplan() const { return containing_subplan_; }
+  void set_containing_subplan(SubplanNode* sp) {
+    DCHECK(containing_subplan_ == NULL);
+    containing_subplan_ = sp;
+  }
   int64_t rows_returned() const { return num_rows_returned_; }
   int64_t limit() const { return limit_; }
   bool ReachedLimit() { return limit_ != -1 && num_rows_returned_ >= limit_; }
@@ -216,7 +228,9 @@ class ExecNode {
     std::list<RowBatch*> cleanup_queue_;
   };
 
-  int id_;  // unique w/in single plan tree
+  /// Unique within a single plan tree.
+  int id_;
+
   TPlanNodeType::type type_;
   ObjectPool* pool_;
   std::vector<ExprContext*> conjunct_ctxs_;
@@ -248,8 +262,15 @@ class ExecNode {
   boost::mutex exec_options_lock_;
   std::string runtime_exec_options_;
 
-  ExecNode* child(int i) { return children_[i]; }
-  bool is_closed() { return is_closed_; }
+  bool is_closed() const { return is_closed_; }
+
+  /// Pointer to the containing SubplanNode or NULL if not inside a subplan.
+  /// Set by SubplanNode::Init(). Not owned.
+  SubplanNode* containing_subplan_;
+
+  /// Returns true if this node is inside the right-hand side plan tree of a SubplanNode.
+  /// Valid to call in or after Prepare().
+  bool IsInSubplan() const { return containing_subplan_ != NULL; }
 
   /// Create a single exec node derived from thrift node; place exec node in 'pool'.
   static Status CreateNode(ObjectPool* pool, const TPlanNode& tnode,

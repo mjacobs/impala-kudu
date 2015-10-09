@@ -14,6 +14,8 @@
 
 #include "exec/scanner-context.h"
 
+#include <gutil/strings/substitute.h>
+
 #include "exec/hdfs-scan-node.h"
 #include "runtime/row-batch.h"
 #include "runtime/mem-pool.h"
@@ -24,6 +26,7 @@
 #include "common/names.h"
 
 using namespace impala;
+using namespace strings;
 
 static const int64_t DEFAULT_READ_PAST_SIZE = 1024; // in bytes
 
@@ -68,7 +71,7 @@ ScannerContext::Stream* ScannerContext::AddStream(DiskIoMgr::ScanRange* range) {
   stream->output_buffer_pos_ = NULL;
   stream->output_buffer_bytes_left_ =
       const_cast<int64_t*>(&OUTPUT_BUFFER_BYTES_LEFT_INIT);
-  stream->contains_tuple_data_ = !scan_node_->tuple_desc()->string_slots().empty();
+  stream->contains_tuple_data_ = scan_node_->tuple_desc()->ContainsStringData();
   streams_.push_back(stream);
   return stream;
 }
@@ -225,6 +228,15 @@ Status ScannerContext::Stream::GetBytesInternal(int64_t requested_len,
       boundary_buffer_->Clear();
     }
   }
+  // Workaround IMPALA-1619. Fail the request if requested_len is more than 1GB.
+  // StringBuffer can only handle 32-bit allocations and StringBuffer::Append()
+  // will allocate twice the current buffer size, cause int overflow.
+  // TODO: Revert once IMPALA-1619 is fixed.
+  if (UNLIKELY(requested_len > StringValue::MAX_LENGTH)) {
+    LOG(WARNING) << "Requested buffer size " << requested_len << "B > 1GB."
+        << GetStackTrace();
+    return Status(Substitute("Requested buffer size $0B > 1GB", requested_len));
+  }
 
   while (requested_len > boundary_buffer_bytes_left_ + io_buffer_bytes_left_) {
     // We need to fetch more bytes. Copy the end of the current buffer and fetch the next
@@ -284,16 +296,10 @@ bool ScannerContext::cancelled() const {
 }
 
 Status ScannerContext::Stream::ReportIncompleteRead(int64_t length, int64_t bytes_read) {
-  stringstream ss;
-  ss << "Tried to read " << length << " bytes but could only read "
-     << bytes_read << " bytes. This may indicate data file corruption. "
-     << "(file " << filename() << ", byte offset: " << file_offset() << ")";
-  return Status(ss.str());
+  return Status(TErrorCode::SCANNER_INCOMPLETE_READ, length, bytes_read,
+      filename(), file_offset());
 }
 
 Status ScannerContext::Stream::ReportInvalidRead(int64_t length) {
-  stringstream ss;
-  ss << "Invalid read of " << length << " bytes. This may indicate data file corruption. "
-     << "(file " << filename() << ", byte offset: " << file_offset() << ")";
-  return Status(ss.str());
+  return Status(TErrorCode::SCANNER_INVALID_READ, length, filename(), file_offset());
 }

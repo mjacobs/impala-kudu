@@ -233,8 +233,8 @@ parser code {:
 terminal
   KW_ADD, KW_AGGREGATE, KW_ALL, KW_ALTER, KW_ANALYTIC, KW_AND, KW_ANTI, KW_API_VERSION,
   KW_ARRAY, KW_AS, KW_ASC, KW_AVRO, KW_BETWEEN, KW_BIGINT, KW_BINARY, KW_BOOLEAN,
-  KW_BUCKETS, KW_BY,
-  KW_CACHED, KW_CASE, KW_CAST, KW_CHANGE, KW_CHAR, KW_CLASS, KW_CLOSE_FN, KW_COLUMN,
+  KW_BUCKETS, KW_BY, KW_CACHED, KW_CASCADE, KW_CASE, KW_CAST, KW_CHANGE, KW_CHAR,
+  KW_CLASS, KW_CLOSE_FN, KW_COLUMN,
   KW_COLUMNS, KW_COMMENT, KW_COMPUTE, KW_CREATE, KW_CROSS, KW_CURRENT, KW_DATA,
   KW_DATABASE, KW_DATABASES, KW_DATE, KW_DATETIME, KW_DECIMAL, KW_DELETE, KW_DELIMITED,
   KW_DESC, KW_DESCRIBE, KW_DISTINCT, KW_DISTRIBUTE, KW_DIV, KW_DOUBLE, KW_DROP, KW_ELSE,
@@ -248,8 +248,9 @@ terminal
   KW_LOAD, KW_LOCATION, KW_MAP, KW_MERGE_FN, KW_METADATA, KW_NOT, KW_NULL, KW_NULLS,
   KW_OFFSET, KW_ON, KW_OR, KW_ORDER, KW_OUTER, KW_OVER, KW_OVERWRITE, KW_PARQUET,
   KW_PARQUETFILE, KW_PARTITION, KW_PARTITIONED, KW_PARTITIONS, KW_PRECEDING,
-  KW_PREPARE_FN, KW_PRODUCED, KW_RANGE, KW_RCFILE, KW_REFRESH, KW_REGEXP, KW_RENAME,
-  KW_REPLACE, KW_REPLICATION, KW_RETURNS, KW_REVOKE, KW_RIGHT, KW_RLIKE, KW_ROLE,
+  KW_PREPARE_FN, KW_PRODUCED, KW_RANGE, KW_RCFILE, KW_RECOVER, KW_REFRESH, KW_REGEXP, KW_RENAME,
+  KW_REPLACE, KW_REPLICATION, KW_RESTRICT, KW_RETURNS,
+  KW_REVOKE, KW_RIGHT, KW_RLIKE, KW_ROLE,
   KW_ROLES, KW_ROW, KW_ROWS, KW_SCHEMA, KW_SCHEMAS, KW_SELECT, KW_SEMI, KW_SEQUENCEFILE,
   KW_SERDEPROPERTIES, KW_SERIALIZE_FN, KW_SET, KW_SHOW, KW_SMALLINT, KW_SPLIT, KW_STORED,
   KW_STRAIGHT_JOIN, KW_STRING, KW_STRUCT, KW_SYMBOL, KW_TABLE, KW_TABLES,
@@ -261,7 +262,8 @@ terminal
 terminal COLON, SEMICOLON, COMMA, DOT, DOTDOTDOT, STAR, LPAREN, RPAREN, LBRACKET,
   RBRACKET, DIVIDE, MOD, ADD, SUBTRACT;
 terminal BITAND, BITOR, BITXOR, BITNOT;
-terminal EQUAL, NOT, LESSTHAN, GREATERTHAN;
+terminal EQUAL, NOT, NOTEQUAL, LESSTHAN, GREATERTHAN;
+terminal FACTORIAL; // Placeholder terminal for postfix factorial operator
 terminal String IDENT;
 terminal String EMPTY_IDENT;
 terminal String NUMERIC_OVERFLOW;
@@ -423,6 +425,7 @@ nonterminal String opt_kw_column;
 // Used to simplify commands where KW_TABLE is optional
 nonterminal String opt_kw_table;
 nonterminal Boolean overwrite_val;
+nonterminal Boolean cascade_val;
 
 // For GRANT/REVOKE/AUTH DDL statements
 nonterminal ShowRolesStmt show_roles_stmt;
@@ -468,10 +471,11 @@ precedence left KW_AND;
 precedence right KW_NOT, NOT;
 precedence left KW_BETWEEN, KW_IN, KW_IS, KW_EXISTS;
 precedence left KW_LIKE, KW_RLIKE, KW_REGEXP;
-precedence left EQUAL, LESSTHAN, GREATERTHAN;
+precedence left EQUAL, NOTEQUAL, LESSTHAN, GREATERTHAN;
 precedence left ADD, SUBTRACT;
 precedence left STAR, DIVIDE, MOD, KW_DIV;
 precedence left BITAND, BITOR, BITXOR, BITNOT;
+precedence left FACTORIAL;
 precedence left KW_ORDER, KW_BY, KW_LIMIT;
 precedence left LPAREN, RPAREN;
 // Support chaining of timestamp arithmetic exprs.
@@ -818,6 +822,8 @@ privilege_spec ::=
   {: RESULT = PrivilegeSpec.createDbScopedPriv(priv, db_name); :}
   | privilege:priv KW_ON KW_TABLE table_name:tbl_name
   {: RESULT = PrivilegeSpec.createTableScopedPriv(priv, tbl_name); :}
+  | privilege:priv LPAREN opt_ident_list:cols RPAREN KW_ON KW_TABLE table_name:tbl_name
+  {: RESULT = PrivilegeSpec.createColumnScopedPriv(priv, tbl_name, cols); :}
   | privilege:priv KW_ON uri_ident:uri_kw STRING_LITERAL:uri
   {: RESULT = PrivilegeSpec.createUriScopedPriv(priv, new HdfsUri(uri)); :}
   ;
@@ -888,6 +894,8 @@ alter_tbl_stmt ::=
     }
     RESULT = new AlterTableSetCachedStmt(table, partition, cache_op);
   :}
+  | KW_ALTER KW_TABLE table_name:table KW_RECOVER KW_PARTITIONS
+  {: RESULT = new AlterTableRecoverPartitionsStmt(table); :}
   ;
 
 table_property_type ::=
@@ -1408,6 +1416,15 @@ alter_view_stmt ::=
   {: RESULT = new AlterTableOrViewRenameStmt(before_table, new_table, false); :}
   ;
 
+cascade_val ::=
+  KW_CASCADE
+  {: RESULT = true; :}
+  | KW_RESTRICT
+  {: RESULT = false; :}
+  |
+  {: RESULT = false; :}
+  ;
+
 compute_stats_stmt ::=
   KW_COMPUTE KW_STATS table_name:table
   {: RESULT = new ComputeStatsStmt(table); :}
@@ -1425,8 +1442,8 @@ drop_stats_stmt ::=
   ;
 
 drop_db_stmt ::=
-  KW_DROP db_or_schema_kw if_exists_val:if_exists IDENT:db_name
-  {: RESULT = new DropDbStmt(db_name, if_exists); :}
+  KW_DROP db_or_schema_kw if_exists_val:if_exists IDENT:db_name cascade_val:cascade
+  {: RESULT = new DropDbStmt(db_name, if_exists, cascade); :}
   ;
 
 drop_tbl_or_view_stmt ::=
@@ -1660,9 +1677,14 @@ opt_with_clause ::=
 
 with_view_def ::=
   IDENT:alias KW_AS LPAREN query_stmt:query RPAREN
-  {: RESULT = new View(alias, query); :}
+  {: RESULT = new View(alias, query, null); :}
   | STRING_LITERAL:alias KW_AS LPAREN query_stmt:query RPAREN
-  {: RESULT = new View(alias, query); :}
+  {: RESULT = new View(alias, query, null); :}
+  | IDENT:alias LPAREN ident_list:col_names RPAREN KW_AS LPAREN query_stmt:query RPAREN
+  {: RESULT = new View(alias, query, col_names); :}
+  | STRING_LITERAL:alias LPAREN ident_list:col_names RPAREN
+    KW_AS LPAREN query_stmt:query RPAREN
+  {: RESULT = new View(alias, query, col_names); :}
   ;
 
 with_view_def_list ::=
@@ -1866,8 +1888,8 @@ show_files_stmt ::=
   ;
 
 describe_stmt ::=
-  KW_DESCRIBE describe_output_style:style table_name:table
-  {: RESULT = new DescribeStmt(table, style); :}
+  KW_DESCRIBE describe_output_style:style dotted_path:path
+  {: RESULT = new DescribeStmt(path, style); :}
   ;
 
 describe_output_style ::=
@@ -2411,6 +2433,9 @@ arithmetic_expr ::=
   {: RESULT = new ArithmeticExpr(ArithmeticExpr.Operator.BITXOR, e1, e2); :}
   | BITNOT expr:e
   {: RESULT = new ArithmeticExpr(ArithmeticExpr.Operator.BITNOT, e, null); :}
+  | expr:e NOT
+  {: RESULT = new ArithmeticExpr(ArithmeticExpr.Operator.FACTORIAL, e, null); :}
+  %prec FACTORIAL
   ;
 
 // We use IDENT for the temporal unit to avoid making DAY, YEAR, etc. keywords.
@@ -2525,7 +2550,9 @@ predicate ::=
 comparison_predicate ::=
   expr:e1 EQUAL expr:e2
   {: RESULT = new BinaryPredicate(BinaryPredicate.Operator.EQ, e1, e2); :}
-  | expr:e1 NOT EQUAL expr:e2
+  | expr:e1 NOTEQUAL expr:e2 // single != token
+  {: RESULT = new BinaryPredicate(BinaryPredicate.Operator.NE, e1, e2); :}
+  | expr:e1 NOT EQUAL expr:e2 // separate ! and = tokens
   {: RESULT = new BinaryPredicate(BinaryPredicate.Operator.NE, e1, e2); :}
   | expr:e1 LESSTHAN GREATERTHAN expr:e2
   {: RESULT = new BinaryPredicate(BinaryPredicate.Operator.NE, e1, e2); :}

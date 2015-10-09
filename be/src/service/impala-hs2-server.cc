@@ -44,6 +44,7 @@
 
 using boost::adopt_lock_t;
 using boost::algorithm::join;
+using boost::algorithm::iequals;
 using boost::uuids::uuid;
 using namespace apache::hive::service::cli::thrift;
 using namespace apache::hive::service::cli;
@@ -70,6 +71,9 @@ const TProtocolVersion::type MAX_SUPPORTED_HS2_VERSION =
       return; \
     } \
   } while (false)
+
+DECLARE_string(hostname);
+DECLARE_int32(webserver_port);
 
 namespace impala {
 
@@ -597,8 +601,11 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
     state->connected_user = request.username;
   }
 
-  // TODO: request.configuration might specify database.
   state->database = "default";
+  typedef map<string, string> ConfigurationMap;
+  BOOST_FOREACH(const ConfigurationMap::value_type& v, request.configuration) {
+    if (iequals(v.first, "use:database")) state->database = v.second;
+  }
 
   // Convert request.configuration to session default query options.
   state->default_query_options = default_query_options_;
@@ -619,6 +626,11 @@ void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
     }
   }
   TQueryOptionsToMap(state->default_query_options, &return_val.configuration);
+
+  // OpenSession() should return the coordinator's HTTP server address.
+  const string& http_addr = lexical_cast<string>(
+      MakeNetworkAddress(FLAGS_hostname, FLAGS_webserver_port));
+  return_val.configuration.insert(make_pair("http_addr", http_addr));
 
   // Put the session state in session_state_map_
   {
@@ -998,7 +1010,7 @@ void ImpalaServer::GetResultSetMetadata(TGetResultSetMetadataResp& return_val,
             result_set_md->columns[i].columnName);
         return_val.schema.columns[i].position = i;
         return_val.schema.columns[i].typeDesc.types.resize(1);
-        ColumnType t(result_set_md->columns[i].columnType);
+        ColumnType t = ColumnType::FromThrift(result_set_md->columns[i].columnType);
         return_val.schema.columns[i].typeDesc.types[0] = t.ToHs2Type();
       }
     }

@@ -526,7 +526,7 @@ Status HdfsRCFileScanner::ProcessRange() {
           if (state_->LogHasSpace()) {
             stringstream ss;
             ss << "file: " << stream_->filename();
-            state_->LogError(ErrorMsg(TErrorCode::GENERAL, ss.str()));
+            state_->LogError(ErrorMsg(TErrorCode::GENERAL, ss.str()), 2);
           }
           if (state_->abort_on_error()) {
             state_->ReportFileErrors(stream_->filename(), 1);
@@ -539,7 +539,7 @@ Status HdfsRCFileScanner::ProcessRange() {
         if (EvalConjuncts(current_row)) {
           ++num_to_commit;
           current_row = next_row(current_row);
-          tuple = next_tuple(tuple);
+          tuple = next_tuple(tuple_byte_size_, tuple);
         }
       }
       COUNTER_ADD(scan_node_->rows_read_counter(), max_tuples);

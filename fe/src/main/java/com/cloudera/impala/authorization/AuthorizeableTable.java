@@ -19,6 +19,7 @@ import java.util.List;
 import org.apache.sentry.core.model.db.DBModelAuthorizable;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 
 /**
@@ -26,7 +27,7 @@ import com.google.common.collect.Lists;
  * Even though Hive's spec includes an authorizable object 'view', we chose
  * to treat views the same way as tables for the sake of authorization.
  */
-public class AuthorizeableTable implements Authorizeable {
+public class AuthorizeableTable extends Authorizeable {
   // Constant to represent privileges in the policy for "ANY" table in a
   // a database.
   public final static String ANY_TABLE_NAME =
@@ -36,8 +37,8 @@ public class AuthorizeableTable implements Authorizeable {
   private final org.apache.sentry.core.model.db.Database database_;
 
   public AuthorizeableTable(String dbName, String tableName) {
-    Preconditions.checkState(tableName != null && !tableName.isEmpty());
-    Preconditions.checkState(dbName != null && !dbName.isEmpty());
+    Preconditions.checkState(!Strings.isNullOrEmpty(tableName));
+    Preconditions.checkState(!Strings.isNullOrEmpty(dbName));
     table_ = new org.apache.sentry.core.model.db.Table(tableName);
     database_ = new org.apache.sentry.core.model.db.Database(dbName);
   }
@@ -49,6 +50,11 @@ public class AuthorizeableTable implements Authorizeable {
 
   @Override
   public String getName() { return database_.getName() + "." + table_.getName(); }
+
+  @Override
   public String getDbName() { return database_.getName(); }
   public String getTblName() { return table_.getName(); }
+
+  @Override
+  public String getFullTableName() { return getName(); }
 }

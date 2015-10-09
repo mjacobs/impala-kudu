@@ -19,6 +19,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
 
@@ -39,15 +40,21 @@ import com.cloudera.impala.analysis.SlotDescriptor;
 import com.cloudera.impala.analysis.SlotId;
 import com.cloudera.impala.analysis.SlotRef;
 import com.cloudera.impala.analysis.TupleDescriptor;
+import com.cloudera.impala.analysis.TupleId;
+import com.cloudera.impala.catalog.Column;
 import com.cloudera.impala.catalog.HdfsFileFormat;
 import com.cloudera.impala.catalog.HdfsPartition;
 import com.cloudera.impala.catalog.HdfsPartition.FileBlock;
 import com.cloudera.impala.catalog.HdfsTable;
+import com.cloudera.impala.catalog.Type;
 import com.cloudera.impala.common.AnalysisException;
+import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.common.InternalException;
+import com.cloudera.impala.common.NotImplementedException;
 import com.cloudera.impala.common.PrintUtils;
 import com.cloudera.impala.common.RuntimeEnv;
 import com.cloudera.impala.thrift.TExplainLevel;
+import com.cloudera.impala.thrift.TExpr;
 import com.cloudera.impala.thrift.THdfsFileBlock;
 import com.cloudera.impala.thrift.THdfsFileSplit;
 import com.cloudera.impala.thrift.THdfsScanNode;
@@ -58,11 +65,14 @@ import com.cloudera.impala.thrift.TQueryOptions;
 import com.cloudera.impala.thrift.TScanRange;
 import com.cloudera.impala.thrift.TScanRangeLocation;
 import com.cloudera.impala.thrift.TScanRangeLocations;
+import com.cloudera.impala.util.MembershipSnapshot;
+import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
 import com.google.common.base.Objects.ToStringHelper;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
 /**
@@ -100,6 +110,16 @@ public class HdfsScanNode extends ScanNode {
   // Total number of bytes from partitions_
   private long totalBytes_ = 0;
 
+  // Conjuncts that can be evaluated while materializing the items (tuples) of
+  // collection-typed slots. Maps from tuple descriptor to the conjuncts bound by that
+  // tuple. Uses a linked hash map for consistent display in explain.
+  private final Map<TupleDescriptor, List<Expr>> collectionConjuncts_ =
+      Maps.newLinkedHashMap();
+
+  // Indicates corrupt table stats based on the number of non-empty scan ranges and
+  // numRows set to 0. Set in computeStats().
+  private boolean hasCorruptTableStats_;
+
   /**
    * Constructs node to scan given data files of table 'tbl_'.
    */
@@ -118,10 +138,10 @@ public class HdfsScanNode extends ScanNode {
   }
 
   /**
-   * Populate conjuncts_, partitions_, and scanRanges_.
+   * Populate conjuncts_, collectionConjuncts_, partitions_, and scanRanges_.
    */
   @Override
-  public void init(Analyzer analyzer) throws InternalException {
+  public void init(Analyzer analyzer) throws ImpalaException {
     ArrayList<Expr> bindingPredicates = analyzer.getBoundPredicates(tupleIds_.get(0));
     conjuncts_.addAll(bindingPredicates);
 
@@ -133,19 +153,120 @@ public class HdfsScanNode extends ScanNode {
     // do partition pruning before deciding which slots to materialize,
     // we might end up removing some predicates
     prunePartitions(analyzer);
+    checkForSupportedFileFormats();
 
     // mark all slots referenced by the remaining conjuncts as materialized
     markSlotsMaterialized(analyzer, conjuncts_);
-    computeMemLayout(analyzer);
 
-    // do this at the end so it can take all conjuncts into account
-    computeStats(analyzer);
+    assignCollectionConjuncts(analyzer);
+
+    computeMemLayout(analyzer);
 
     // compute scan range locations
     computeScanRangeLocations(analyzer);
 
+    // do this at the end so it can take all conjuncts and scan ranges into account
+    computeStats(analyzer);
+
     // TODO: do we need this?
     assignedConjuncts_ = analyzer.getAssignedConjuncts();
+  }
+
+  /**
+   * Throws if the table schema contains a complex type and we need to scan
+   * a partition that has a format for which we do not support complex types,
+   * regardless of whether a complex-typed column is actually referenced
+   * in the query.
+   */
+  @Override
+  protected void checkForSupportedFileFormats() throws NotImplementedException {
+    Preconditions.checkNotNull(desc_);
+    Preconditions.checkNotNull(desc_.getTable());
+    Column firstComplexTypedCol = null;
+    for (Column col: desc_.getTable().getColumns()) {
+      if (col.getType().isComplexType()) {
+        firstComplexTypedCol = col;
+        break;
+      }
+    }
+    if (firstComplexTypedCol == null) return;
+
+    for (HdfsPartition part: partitions_) {
+      HdfsFileFormat format = part.getInputFormatDescriptor().getFileFormat();
+      if (format.isComplexTypesSupported()) continue;
+      String errSuffix = String.format(
+          "Complex types are supported for these file formats: %s",
+          Joiner.on(", ").join(HdfsFileFormat.complexTypesFormats()));
+      if (desc_.getTable().getNumClusteringCols() == 0) {
+        throw new NotImplementedException(String.format(
+            "Scan of table '%s' in format '%s' is not supported because the table " +
+            "has a column '%s' with a complex type '%s'.\n%s.",
+            desc_.getAlias(), format, firstComplexTypedCol.getName(),
+            firstComplexTypedCol.getType().toSql(), errSuffix));
+      }
+      throw new NotImplementedException(String.format(
+          "Scan of partition '%s' in format '%s' of table '%s' is not supported " +
+          "because the table has a column '%s' with a complex type '%s'.\n%s.",
+          part.getPartitionName(), format, desc_.getAlias(),
+          firstComplexTypedCol.getName(), firstComplexTypedCol.getType().toSql(),
+          errSuffix));
+    }
+  }
+
+  /**
+   * Populates the collection conjuncts, materializes their required slots, and marks
+   * the conjuncts as assigned, if it is correct to do so. Some conjuncts may have to
+   * also be evaluated at a subsequent semi or outer join.
+   */
+  private void assignCollectionConjuncts(Analyzer analyzer) {
+    collectionConjuncts_.clear();
+    assignCollectionConjuncts(desc_, analyzer);
+  }
+
+  /**
+   * Recursively collects and assigns conjuncts bound by tuples materialized in a
+   * collection-typed slot.
+   *
+   * Limitation: Conjuncts that must first be migrated into inline views and that cannot
+   * be captured by slot binding will not be assigned here, but in an UnnestNode.
+   * This limitation applies to conjuncts bound by inline-view slots that are backed by
+   * non-SlotRef exprs in the inline-view's select list. We only capture value transfers
+   * between slots, and not between arbitrary exprs.
+   *
+   * TODO for 2.3: The logic for gathering conjuncts and deciding which ones should be
+   * marked as assigned needs to be clarified and consolidated in one place. The code
+   * below is rather different from the code for assigning the top-level conjuncts in
+   * init() although the performed tasks is conceptually identical. Refactoring the
+   * assignment code is tricky/risky for now.
+   */
+  private void assignCollectionConjuncts(TupleDescriptor tupleDesc, Analyzer analyzer) {
+    for (SlotDescriptor slotDesc: tupleDesc.getSlots()) {
+      if (!slotDesc.getType().isCollectionType()) continue;
+      Preconditions.checkNotNull(slotDesc.getItemTupleDesc());
+      TupleDescriptor itemTupleDesc = slotDesc.getItemTupleDesc();
+      TupleId itemTid = itemTupleDesc.getId();
+      // First collect unassigned and binding predicates. Then remove redundant
+      // predicates based on slot equivalences and enforce slot equivalences by
+      // generating new predicates.
+      List<Expr> collectionConjuncts =
+          analyzer.getUnassignedConjuncts(Lists.newArrayList(itemTid), false);
+      ArrayList<Expr> bindingPredicates = analyzer.getBoundPredicates(itemTid);
+      for (Expr boundPred: bindingPredicates) {
+        if (!collectionConjuncts.contains(boundPred)) collectionConjuncts.add(boundPred);
+      }
+      analyzer.createEquivConjuncts(itemTid, collectionConjuncts);
+      // Mark those conjuncts as assigned that do not also need to be evaluated by a
+      // subsequent semi or outer join.
+      for (Expr conjunct: collectionConjuncts) {
+        if (!analyzer.evalByJoin(conjunct)) analyzer.markConjunctAssigned(conjunct);
+      }
+      if (!collectionConjuncts.isEmpty()) {
+        markSlotsMaterialized(analyzer, collectionConjuncts);
+        collectionConjuncts_.put(itemTupleDesc, collectionConjuncts);
+      }
+      // Recursively look for collection-typed slots in nested tuple descriptors.
+      assignCollectionConjuncts(itemTupleDesc, analyzer);
+    }
   }
 
   /**
@@ -577,12 +698,19 @@ public class HdfsScanNode extends ScanNode {
     numPartitionsMissingStats_ = 0;
     if (tbl_.getPartitions().isEmpty()) {
       cardinality_ = tbl_.getNumRows();
+      if ((cardinality_ < -1 || cardinality_ == 0) && tbl_.getTotalHdfsBytes() > 0) {
+        hasCorruptTableStats_ = true;
+      }
     } else {
       cardinality_ = 0;
       totalFiles_ = 0;
       totalBytes_ = 0;
       boolean hasValidPartitionCardinality = false;
       for (HdfsPartition p: partitions_) {
+        // Check for corrupt table stats
+        if ((p.getNumRows() == 0 || p.getNumRows() < -1) && p.getSize() > 0)  {
+          hasCorruptTableStats_ = true;
+        }
         // ignore partitions with missing stats in the hope they don't matter
         // enough to change the planning outcome
         if (p.getNumRows() > -1) {
@@ -601,29 +729,98 @@ public class HdfsScanNode extends ScanNode {
         cardinality_ = tbl_.getNumRows();
       }
     }
+    // Adjust cardinality for all collections referenced along the tuple's path.
+    if (cardinality_ != -1) {
+      for (Type t: desc_.getPath().getMatchedTypes()) {
+        if (t.isCollectionType()) cardinality_ *= PlannerContext.AVG_COLLECTION_SIZE;
+      }
+    }
     inputCardinality_ = cardinality_;
     Preconditions.checkState(cardinality_ >= 0 || cardinality_ == -1,
         "Internal error: invalid scan node cardinality: " + cardinality_);
     if (cardinality_ > 0) {
       LOG.debug("cardinality_=" + Long.toString(cardinality_) +
                 " sel=" + Double.toString(computeSelectivity()));
-      cardinality_ = Math.round((double) cardinality_ * computeSelectivity());
+      cardinality_ = Math.round(cardinality_ * computeSelectivity());
+      // IMPALA-2165: Avoid setting the cardinality to 0 after rounding.
+      cardinality_ = Math.max(cardinality_, 1);
     }
     cardinality_ = capAtLimit(cardinality_);
     LOG.debug("computeStats HdfsScan: cardinality_=" + Long.toString(cardinality_));
 
-    // TODO: take actual partitions into account
+    computeNumNodes(analyzer, cardinality_);
+    LOG.debug("computeStats HdfsScan: #nodes=" + Integer.toString(numNodes_));
+  }
+
+  /**
+   * Estimate the number of impalad nodes that this scan node will execute on (which is
+   * ultimately determined by the scheduling done by the backend's SimpleScheduler).
+   * Assume that scan ranges that can be scheduled locally will be, and that scan
+   * ranges that cannot will be round-robined across the cluster.
+   */
+  protected void computeNumNodes(Analyzer analyzer, long cardinality) {
+    Preconditions.checkNotNull(scanRanges_);
+    MembershipSnapshot cluster = MembershipSnapshot.getCluster();
+    HashSet<TNetworkAddress> localHostSet = Sets.newHashSet();
+    int totalNodes = 0;
+    int numLocalRanges = 0;
+    int numRemoteRanges = 0;
+    for (TScanRangeLocations range: scanRanges_) {
+      boolean anyLocal = false;
+      for (TScanRangeLocation loc: range.locations) {
+        TNetworkAddress dataNode = analyzer.getHostIndex().getEntry(loc.getHost_idx());
+        if (cluster.contains(dataNode)) {
+          anyLocal = true;
+          // Use the full datanode address (including port) to account for the test
+          // minicluster where there are multiple datanodes and impalads on a single
+          // host.  This assumes that when an impalad is colocated with a datanode,
+          // there are the same number of impalads as datanodes on this host in this
+          // cluster.
+          localHostSet.add(dataNode);
+        }
+      }
+      // This range has at least one replica with a colocated impalad, so assume it
+      // will be scheduled on one of those nodes.
+      if (anyLocal) {
+        ++numLocalRanges;
+      } else {
+        ++numRemoteRanges;
+      }
+      // Approximate the number of nodes that will execute locally assigned ranges to
+      // be the smaller of the number of locally assigned ranges and the number of
+      // hosts that hold block replica for those ranges.
+      int numLocalNodes = Math.min(numLocalRanges, localHostSet.size());
+      // The remote ranges are round-robined across all the impalads.
+      int numRemoteNodes = Math.min(numRemoteRanges, cluster.numNodes());
+      // The local and remote assignments may overlap, but we don't know by how much so
+      // conservatively assume no overlap.
+      totalNodes = Math.min(numLocalNodes + numRemoteNodes, cluster.numNodes());
+      // Exit early if all hosts have a scan range assignment, to avoid extraneous work
+      // in case the number of scan ranges dominates the number of nodes.
+      if (totalNodes == cluster.numNodes()) break;
+    }
     // Tables can reside on 0 nodes (empty table), but a plan node must always be
     // executed on at least one node.
-    numNodes_ = (cardinality_ == 0 || tbl_.getNumNodes() == 0) ? 1 : tbl_.getNumNodes();
-    LOG.debug("computeStats HdfsScan: #nodes=" + Integer.toString(numNodes_));
+    numNodes_ = (cardinality == 0 || totalNodes == 0) ? 1 : totalNodes;
+    LOG.debug("computeNumNodes totalRanges=" + scanRanges_.size() +
+        " localRanges=" + numLocalRanges + " remoteRanges=" + numRemoteRanges +
+        " localHostSet.size=" + localHostSet.size() +
+        " clusterNodes=" + cluster.numNodes());
   }
 
   @Override
   protected void toThrift(TPlanNode msg) {
-    // TODO: retire this once the migration to the new plan is complete
     msg.hdfs_scan_node = new THdfsScanNode(desc_.getId().asInt());
     msg.node_type = TPlanNodeType.HDFS_SCAN_NODE;
+    if (!collectionConjuncts_.isEmpty()) {
+      Map<Integer, List<TExpr>> tcollectionConjuncts = Maps.newLinkedHashMap();
+      for (Map.Entry<TupleDescriptor, List<Expr>> entry:
+        collectionConjuncts_.entrySet()) {
+        tcollectionConjuncts.put(entry.getKey().getId().asInt(),
+            Expr.treesToThrift(entry.getValue()));
+      }
+      msg.hdfs_scan_node.setCollection_conjuncts(tcollectionConjuncts);
+    }
   }
 
   @Override
@@ -663,6 +860,14 @@ public class HdfsScanNode extends ScanNode {
         output.append(
             detailPrefix + "predicates: " + getExplainString(conjuncts_) + "\n");
       }
+      if (!collectionConjuncts_.isEmpty()) {
+        for (Map.Entry<TupleDescriptor, List<Expr>> entry:
+          collectionConjuncts_.entrySet()) {
+          String alias = entry.getKey().getAlias();
+          output.append(String.format("%spredicates on %s: %s\n",
+              detailPrefix, alias, getExplainString(entry.getValue())));
+        }
+      }
     }
     if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
       output.append(getStatsExplainString(detailPrefix, detailLevel));
@@ -678,18 +883,7 @@ public class HdfsScanNode extends ScanNode {
       perHostMemCost_ = 0;
       return;
     }
-
-    // Number of nodes for the purpose of resource estimation adjusted
-    // for the special cases listed below.
-    long adjNumNodes = numNodes_;
-    if (numNodes_ <= 0) {
-      adjNumNodes = 1;
-    } else if (scanRanges_.size() < numNodes_) {
-      // TODO: Empirically evaluate whether there is more Hdfs block skew for relatively
-      // small files, i.e., whether this estimate is too optimistic.
-      adjNumNodes = scanRanges_.size();
-    }
-
+    Preconditions.checkState(0 < numNodes_ && numNodes_ <= scanRanges_.size());
     Preconditions.checkNotNull(desc_);
     Preconditions.checkNotNull(desc_.getTable() instanceof HdfsTable);
     HdfsTable table = (HdfsTable) desc_.getTable();
@@ -706,7 +900,7 @@ public class HdfsScanNode extends ScanNode {
       }
     } else {
       perHostScanRanges = (int) Math.ceil((
-          (double) scanRanges_.size() / (double) adjNumNodes) * SCAN_RANGE_SKEW_FACTOR);
+          (double) scanRanges_.size() / (double) numNodes_) * SCAN_RANGE_SKEW_FACTOR);
     }
 
     // TODO: The total memory consumption for a particular query depends on the number
@@ -750,6 +944,9 @@ public class HdfsScanNode extends ScanNode {
     // THREADS_PER_CORE each using a default of
     // MAX_IO_BUFFERS_PER_THREAD * IO_MGR_BUFFER_SIZE bytes.
     return (long) RuntimeEnv.INSTANCE.getNumCores() * (long) THREADS_PER_CORE *
-        (long) MAX_IO_BUFFERS_PER_THREAD * IO_MGR_BUFFER_SIZE;
+        MAX_IO_BUFFERS_PER_THREAD * IO_MGR_BUFFER_SIZE;
   }
+
+  @Override
+  public boolean hasCorruptTableStats() { return hasCorruptTableStats_; }
 }

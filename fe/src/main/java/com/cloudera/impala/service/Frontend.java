@@ -17,6 +17,7 @@ package com.cloudera.impala.service;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -42,6 +43,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.cloudera.impala.analysis.AnalysisContext;
+import com.cloudera.impala.analysis.Analyzer;
 import com.cloudera.impala.analysis.CreateDataSrcStmt;
 import com.cloudera.impala.analysis.CreateDropRoleStmt;
 import com.cloudera.impala.analysis.CreateUdaStmt;
@@ -60,10 +62,10 @@ import com.cloudera.impala.analysis.ShowGrantRoleStmt;
 import com.cloudera.impala.analysis.ShowRolesStmt;
 import com.cloudera.impala.analysis.TableName;
 import com.cloudera.impala.analysis.TruncateStmt;
+import com.cloudera.impala.analysis.TupleDescriptor;
 import com.cloudera.impala.authorization.AuthorizationChecker;
 import com.cloudera.impala.authorization.AuthorizationConfig;
 import com.cloudera.impala.authorization.ImpalaInternalAdminUser;
-import com.cloudera.impala.authorization.Privilege;
 import com.cloudera.impala.authorization.PrivilegeRequest;
 import com.cloudera.impala.authorization.PrivilegeRequestBuilder;
 import com.cloudera.impala.authorization.User;
@@ -79,7 +81,9 @@ import com.cloudera.impala.catalog.Function;
 import com.cloudera.impala.catalog.HBaseTable;
 import com.cloudera.impala.catalog.HdfsTable;
 import com.cloudera.impala.catalog.ImpaladCatalog;
+import com.cloudera.impala.catalog.StructType;
 import com.cloudera.impala.catalog.Table;
+import com.cloudera.impala.catalog.TableId;
 import com.cloudera.impala.catalog.Type;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.FileSystemUtil;
@@ -94,6 +98,7 @@ import com.cloudera.impala.thrift.TCatalogOpRequest;
 import com.cloudera.impala.thrift.TCatalogOpType;
 import com.cloudera.impala.thrift.TCatalogServiceRequestHeader;
 import com.cloudera.impala.thrift.TColumn;
+import com.cloudera.impala.thrift.TColumnType;
 import com.cloudera.impala.thrift.TColumnValue;
 import com.cloudera.impala.thrift.TCreateDropRoleParams;
 import com.cloudera.impala.thrift.TDdlExecRequest;
@@ -124,7 +129,9 @@ import com.cloudera.impala.thrift.TStmtType;
 import com.cloudera.impala.thrift.TTableName;
 import com.cloudera.impala.thrift.TUpdateCatalogCacheRequest;
 import com.cloudera.impala.thrift.TUpdateCatalogCacheResponse;
+import com.cloudera.impala.thrift.TUpdateMembershipRequest;
 import com.cloudera.impala.util.EventSequence;
+import com.cloudera.impala.util.MembershipSnapshot;
 import com.cloudera.impala.util.PatternMatcher;
 import com.cloudera.impala.util.TResultRowBuilder;
 import com.cloudera.impala.util.TSessionStateUtil;
@@ -225,6 +232,13 @@ public class Frontend {
           impaladCatalog_.getAuthPolicy()));
     }
     return response;
+  }
+
+  /**
+   * Update the cluster membership snapshot with the latest snapshot from the backend.
+   */
+  public void updateMembership(TUpdateMembershipRequest req) {
+    MembershipSnapshot.update(req);
   }
 
   /**
@@ -375,12 +389,7 @@ public class Frontend {
       ddl.setDdl_params(req);
       metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isDropTableOrViewStmt()) {
-      ddl.op_type = TCatalogOpType.DDL;
-      TDdlExecRequest req = new TDdlExecRequest();
-      DropTableOrViewStmt stmt = analysis.getDropTableOrViewStmt();
-      req.setDdl_type(stmt.isDropTable() ? TDdlType.DROP_TABLE : TDdlType.DROP_VIEW);
-      req.setDrop_table_or_view_params(stmt.toThrift());
-      ddl.setDdl_params(req);
+      createDropRequestHelper(ddl, analysis.getDropTableOrViewStmt());
       metadata.setColumns(Collections.<TColumn>emptyList());
     } else if (analysis.isTruncateStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
@@ -489,6 +498,29 @@ public class Frontend {
     }
   }
 
+  private void createDropRequestHelper(TCatalogOpRequest ddl, DropTableOrViewStmt stmt) {
+    ddl.op_type = TCatalogOpType.DDL;
+    TDdlExecRequest req = new TDdlExecRequest();
+    req.setDdl_type(stmt.isDropTable() ? TDdlType.DROP_TABLE : TDdlType.DROP_VIEW);
+    req.setDrop_table_or_view_params(stmt.toThrift());
+    ddl.setDdl_params(req);
+  }
+
+  /**
+   * Constructs a TCatalogOpRequest object for cleanup request and attaches it to 'result'.
+   */
+  private void createCatalogCleanupRequest(AnalysisContext.AnalysisResult analysis,
+      TExecRequest result) {
+    Preconditions.checkState(analysis.isCreateTableAsSelectStmt());
+    Preconditions.checkNotNull(analysis.getCleanupStmt());
+    TCatalogOpRequest ddl = new TCatalogOpRequest();
+    createDropRequestHelper(ddl, analysis.getCleanupStmt());
+    TCatalogServiceRequestHeader header = new TCatalogServiceRequestHeader();
+    header.setRequesting_user(analysis.getAnalyzer().getUser().getName());
+    ddl.getDdl_params().setHeader(header);
+    result.setCatalog_cleanup_request(ddl);
+  }
+
   /**
    * Loads a table or partition with one or more data files. If the "overwrite" flag
    * in the request is true, all existing data in the table/partition will be replaced.
@@ -567,13 +599,35 @@ public class Frontend {
       Iterator<String> iter = tblNames.iterator();
       while (iter.hasNext()) {
         PrivilegeRequest privilegeRequest = new PrivilegeRequestBuilder()
-            .allOf(Privilege.ANY).onTable(dbName, iter.next()).toRequest();
+            .any().onAnyColumn(dbName, iter.next()).toRequest();
         if (!authzChecker_.get().hasAccess(user, privilegeRequest)) {
           iter.remove();
         }
       }
     }
     return tblNames;
+  }
+
+  /**
+   * Returns all columns of a table that match a pattern and are accessible to
+   * the given user. If pattern is null, it matches all columns.
+   */
+  public List<Column> getColumns(Table table, PatternMatcher columnPattern,
+      User user) {
+    Preconditions.checkNotNull(table);
+    List<Column> columns = Lists.newArrayList();
+    for (Column column: table.getColumnsInHiveOrder()) {
+      String colName = column.getName();
+      if (!columnPattern.matches(colName)) continue;
+      if (authzConfig_.isEnabled()) {
+        PrivilegeRequest privilegeRequest = new PrivilegeRequestBuilder()
+            .any().onColumn(table.getTableName().getDb(), table.getTableName().getTbl(),
+            colName).toRequest();
+        if (!authzChecker_.get().hasAccess(user, privilegeRequest)) continue;
+      }
+      columns.add(column);
+    }
+    return columns;
   }
 
   /**
@@ -683,9 +737,16 @@ public class Frontend {
    * loading the table metadata.
    */
   public TDescribeTableResult describeTable(String dbName, String tableName,
-      TDescribeTableOutputStyle outputStyle) throws ImpalaException {
-    Table table = impaladCatalog_.getTable(dbName, tableName);
-    return DescribeResultFactory.buildDescribeTableResult(table, outputStyle);
+      TDescribeTableOutputStyle outputStyle, TColumnType tResultStruct)
+          throws ImpalaException {
+    if (outputStyle == TDescribeTableOutputStyle.MINIMAL) {
+      StructType resultStruct = (StructType)Type.fromThrift(tResultStruct);
+      return DescribeResultFactory.buildDescribeMinimalResult(resultStruct);
+    } else {
+      Preconditions.checkArgument(outputStyle == TDescribeTableOutputStyle.FORMATTED);
+      Table table = impaladCatalog_.getTable(dbName, tableName);
+      return DescribeResultFactory.buildDescribeFormattedResult(table);
+    }
   }
 
   /**
@@ -803,7 +864,7 @@ public class Frontend {
       // Authorize all accesses.
       // AuthorizationExceptions must take precedence over any AnalysisException
       // that has been thrown, so perform the authorization first.
-      analysisCtx.getAnalyzer().authorize(getAuthzChecker());
+      analysisCtx.authorize(getAuthzChecker());
     }
   }
 
@@ -831,6 +892,8 @@ public class Frontend {
       }
       // All DDL operations except for CTAS are done with analysis at this point.
       if (!analysisResult.isCreateTableAsSelectStmt()) return result;
+      // Create cleanup request for CTAS.
+      createCatalogCleanupRequest(analysisResult, result);
     } else if (analysisResult.isLoadDataStmt()) {
       result.stmt_type = TStmtType.LOAD;
       result.setResult_set_metadata(new TResultSetMetadata(Arrays.asList(
@@ -881,6 +944,8 @@ public class Frontend {
     // Also assemble list of tables names missing stats for assembling a warning message.
     LOG.debug("get scan range locations");
     Set<TTableName> tablesMissingStats = Sets.newTreeSet();
+    // Assemble a similar list for corrupt stats
+    Set<TTableName> tablesWithCorruptStats = Sets.newTreeSet();
     for (ScanNode scanNode: scanNodes) {
       queryExecRequest.putToPer_node_scan_ranges(
           scanNode.getId().asInt(),
@@ -888,10 +953,17 @@ public class Frontend {
       if (scanNode.isTableMissingStats()) {
         tablesMissingStats.add(scanNode.getTupleDesc().getTableName().toThrift());
       }
+      if (scanNode.hasCorruptTableStats()) {
+        tablesWithCorruptStats.add(scanNode.getTupleDesc().getTableName().toThrift());
+      }
     }
+
     queryExecRequest.setHost_list(analysisResult.getAnalyzer().getHostIndex().getList());
     for (TTableName tableName: tablesMissingStats) {
       queryCtx.addToTables_missing_stats(tableName);
+    }
+    for (TTableName tableName: tablesWithCorruptStats) {
+      queryCtx.addToTables_with_corrupt_stats(tableName);
     }
 
     // Optionally disable spilling in the backend. Allow spilling if there are plan hints
@@ -991,9 +1063,38 @@ public class Frontend {
       result.query_exec_request.stmt_type = TStmtType.DML;
     }
 
+    validateTableIds(analysisResult.getAnalyzer(), result);
+
     timeline.markEvent("Planning finished");
     result.setTimeline(analysisResult.getAnalyzer().getTimeline().toThrift());
     return result;
+  }
+
+  /**
+   * Check that we don't have any duplicate table IDs (see IMPALA-1702).
+   * To be removed when IMPALA-1702 is resolved.
+   */
+  private void validateTableIds(Analyzer analyzer, TExecRequest result)
+      throws InternalException {
+    Map<TableId, Table> tableIds = Maps.newHashMap();
+    Collection<TupleDescriptor> tupleDescs = analyzer.getDescTbl().getTupleDescs();
+    for (TupleDescriptor desc: tupleDescs) {
+      // Skip if tuple descriptor did not come from materializing scan.
+      if (!desc.isMaterialized()) continue;
+      Table table = desc.getTable();
+      if (table == null) continue;
+      Table otherTable = tableIds.get(table.getId());
+      if (otherTable == table) continue; // Same table referenced twice
+      if (otherTable == null) {
+        tableIds.put(table.getId(), table);
+        continue;
+      }
+      LOG.error("Found duplicate table ID! id=" + table.getId() + "\ntable1=\n"
+          + table.toTCatalogObject() + "\ntable2=\n" + otherTable.toTCatalogObject()
+          + "\nexec_request=\n" + result);
+      throw new InternalException("Query encountered invalid metadata, likely due to " +
+          "IMPALA-1702. Please try rerunning the query.");
+    }
   }
 
   /**

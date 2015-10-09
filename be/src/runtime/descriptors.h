@@ -47,6 +47,21 @@ class Expr;
 class ExprContext;
 class RuntimeState;
 
+/// A path into a table schema (e.g. a vector of ColumnTypes) pointing to a particular
+/// column/field. The i-th element of the path is the ordinal position of the column/field
+/// of the schema at level i. For example, the path [0] would be the first column of the
+/// table, and path [1,0] would be the first field in the second column of the table.
+///
+/// Arrays are represented as having two fields. The first is the item element in the
+/// schema. The second is an artifical position element, which does not actually exist in
+/// the table schema. For example, if path [0] is an array, path [0,0] would refer to the
+/// array's item, and path [0,1] would refer to the position element, which is the item
+/// count of the array.
+///
+/// Likewise, maps are represented as having three fields: the key element, the value
+/// element, and the artifical position element.
+typedef std::vector<int> SchemaPath;
+
 struct LlvmTupleStruct {
   llvm::StructType* tuple_struct;
   llvm::PointerType* tuple_ptr;
@@ -60,7 +75,7 @@ struct LlvmTupleStruct {
 /// This is more efficient than branching to check if the slot is non-nullable.
 struct NullIndicatorOffset {
   int byte_offset;
-  uint8_t bit_mask;  // to extract null indicator
+  uint8_t bit_mask;  /// to extract null indicator
 
   NullIndicatorOffset(int byte_offset, int bit_offset)
     : byte_offset(byte_offset),
@@ -79,12 +94,15 @@ class SlotDescriptor {
   SlotId id() const { return id_; }
   const ColumnType& type() const { return type_; }
   const TupleDescriptor* parent() const { return parent_; }
+  const TupleDescriptor* collection_item_descriptor() const {
+    return collection_item_descriptor_;
+  }
   /// Returns the column index of this slot, including partition keys.
   /// (e.g., col_pos - num_partition_keys = the table column this slot corresponds to)
   /// TODO: This function should eventually be replaced by col_path(). It is currently
   /// convenient for table formats for which we only support flat data.
   int col_pos() const { return col_path_[0]; }
-  const std::vector<int>& col_path() const { return col_path_; }
+  const SchemaPath& col_path() const { return col_path_; }
   /// Returns the field index in the generated llvm struct for this slot's tuple
   int field_idx() const { return field_idx_; }
   int tuple_offset() const { return tuple_offset_; }
@@ -120,7 +138,10 @@ class SlotDescriptor {
   const SlotId id_;
   const ColumnType type_;
   const TupleDescriptor* parent_;
-  const std::vector<int> col_path_;
+  /// Non-NULL only for collection slots
+  const TupleDescriptor* collection_item_descriptor_;
+  // TODO for 2.3: rename to materialized_path_
+  const SchemaPath col_path_;
   const int tuple_offset_;
   const NullIndicatorOffset null_indicator_offset_;
 
@@ -143,7 +164,21 @@ class SlotDescriptor {
   llvm::Function* set_not_null_fn_;
   llvm::Function* set_null_fn_;
 
-  SlotDescriptor(const TSlotDescriptor& tdesc, const TupleDescriptor* parent);
+  /// collection_item_descriptor should be non-NULL iff this is a collection slot
+  SlotDescriptor(const TSlotDescriptor& tdesc, const TupleDescriptor* parent,
+                 const TupleDescriptor* collection_item_descriptor);
+};
+
+class ColumnDescriptor {
+ public:
+  ColumnDescriptor(const TColumnDescriptor& tdesc);
+  const std::string& name() const { return name_; }
+  const ColumnType& type() const { return type_; }
+  std::string DebugString() const;
+
+ private:
+  std::string name_;
+  ColumnType type_;
 };
 
 /// Base class for table descriptors.
@@ -151,7 +186,7 @@ class TableDescriptor {
  public:
   TableDescriptor(const TTableDescriptor& tdesc);
   virtual ~TableDescriptor() {}
-  int num_cols() const { return num_cols_; }
+  int num_cols() const { return col_descs_.size(); }
   int num_clustering_cols() const { return num_clustering_cols_; }
   virtual std::string DebugString() const;
 
@@ -164,15 +199,18 @@ class TableDescriptor {
 
   const std::string& name() const { return name_; }
   const std::string& database() const { return database_; }
-  const std::vector<std::string>& col_names() const { return col_names_; }
+  int id() const { return id_; }
+  const std::vector<ColumnDescriptor>& col_descs() const { return col_descs_; }
+
+  /// Returns "<database>.<name>"
+  std::string fully_qualified_name() const;
 
  protected:
   std::string name_;
   std::string database_;
   TableId id_;
-  int num_cols_;
   int num_clustering_cols_;
-  std::vector<std::string> col_names_;
+  std::vector<ColumnDescriptor> col_descs_;
 };
 
 /// Metadata for a single partition inside an Hdfs table.
@@ -321,12 +359,19 @@ class TupleDescriptor {
   int num_null_bytes() const { return num_null_bytes_; }
   const std::vector<SlotDescriptor*>& slots() const { return slots_; }
   const std::vector<SlotDescriptor*>& string_slots() const { return string_slots_; }
-  const std::vector<int>& tuple_path() const { return tuple_path_; }
+  const std::vector<SlotDescriptor*>& collection_slots() const {
+    return collection_slots_;
+  }
+  bool HasVarlenSlots() const { return has_varlen_slots_; }
+  const SchemaPath& tuple_path() const { return tuple_path_; }
 
   const TableDescriptor* table_desc() const { return table_desc_; }
 
   TupleId id() const { return id_; }
   std::string DebugString() const;
+
+  /// Returns true if this tuple or any nested collection item tuples have string slots.
+  bool ContainsStringData() const;
 
   /// Creates a typed struct description for llvm.  The layout of the struct is computed
   /// by the FE which includes the order of the fields in the resulting struct.
@@ -349,15 +394,26 @@ class TupleDescriptor {
   const int byte_size_;
   const int num_null_bytes_;
   int num_materialized_slots_;
-  std::vector<SlotDescriptor*> slots_;  // contains all slots
-  std::vector<SlotDescriptor*> string_slots_;  // contains only materialized string slots
 
-  // Absolute path into the table schema pointing to the collection whose fields
-  // are materialized into this tuple. Non-empty if this tuple belongs to a
-  // nested collection, empty otherwise.
-  std::vector<int> tuple_path_;
+  /// Contains all slots.
+  std::vector<SlotDescriptor*> slots_;
 
-  llvm::StructType* llvm_struct_; // cache for the llvm struct type for this tuple desc
+  /// Contains only materialized string slots.
+  std::vector<SlotDescriptor*> string_slots_;
+
+  /// Contains only materialized map and array slots.
+  std::vector<SlotDescriptor*> collection_slots_;
+
+  /// Provide quick way to check if there are variable length slots.
+  /// True if string_slots_ or collection_slots_ have entries.
+  bool has_varlen_slots_;
+
+  /// Absolute path into the table schema pointing to the collection whose fields are
+  /// materialized into this tuple. Non-empty if this tuple belongs to a nested
+  /// collection, empty otherwise.
+  SchemaPath tuple_path_;
+
+  llvm::StructType* llvm_struct_; /// cache for the llvm struct type for this tuple desc
 
   TupleDescriptor(const TTupleDescriptor& tdesc);
   void AddSlot(SlotDescriptor* slot);
@@ -406,7 +462,8 @@ class RowDescriptor {
   /// standard copy c'tor, made explicit here
   RowDescriptor(const RowDescriptor& desc)
     : tuple_desc_map_(desc.tuple_desc_map_),
-      tuple_idx_map_(desc.tuple_idx_map_) {
+      tuple_idx_map_(desc.tuple_idx_map_),
+      has_varlen_slots_(desc.has_varlen_slots_) {
   }
 
   /// c'tor for a row assembled from two rows
@@ -436,6 +493,9 @@ class RowDescriptor {
   /// Return true if any Tuple of the row is nullable.
   bool IsAnyTupleNullable() const;
 
+  /// Return true if any Tuple has variable length slots.
+  bool HasVarlenSlots() const { return has_varlen_slots_; }
+
   /// Return descriptors for all tuples in this row, in order of appearance.
   const std::vector<TupleDescriptor*>& tuple_descriptors() const {
     return tuple_desc_map_;
@@ -457,6 +517,9 @@ class RowDescriptor {
   /// Initializes tupleIdxMap during c'tor using the tuple_desc_map_.
   void InitTupleIdxMap();
 
+  /// Initializes has_varlen_slots_ during c'tor using the tuple_desc_map_.
+  void InitHasVarlenSlots();
+
   /// map from position of tuple w/in row to its descriptor
   std::vector<TupleDescriptor*> tuple_desc_map_;
 
@@ -465,6 +528,9 @@ class RowDescriptor {
 
   /// map from TupleId to position of tuple w/in row
   std::vector<int> tuple_idx_map_;
+
+  /// Provide quick way to check if there are variable length slots.
+  bool has_varlen_slots_;
 };
 
 }

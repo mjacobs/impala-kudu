@@ -18,7 +18,6 @@
 #include <map>
 
 #include <boost/foreach.hpp>
-#include <boost/scoped_ptr.hpp>
 #include <boost/unordered_map.hpp>
 
 #include "exec/parquet-common.h"
@@ -172,7 +171,7 @@ class DictDecoderBase {
     DCHECK_GE(bit_width, 0);
     ++buffer;
     --buffer_len;
-    data_decoder_.reset(new RleDecoder(buffer, buffer_len, bit_width));
+    data_decoder_.Reset(buffer, buffer_len, bit_width);
   }
 
   virtual ~DictDecoderBase() {}
@@ -180,7 +179,7 @@ class DictDecoderBase {
   virtual int num_entries() const = 0;
 
  protected:
-  boost::scoped_ptr<RleDecoder> data_decoder_;
+  RleDecoder data_decoder_;
 };
 
 template<typename T>
@@ -193,6 +192,12 @@ class DictDecoder : public DictDecoderBase {
   /// fixed_len_size is the size that must be passed to decode fixed-length
   /// dictionary values (values stored using FIXED_LEN_BYTE_ARRAY).
   DictDecoder(uint8_t* dict_buffer, int dict_len, int fixed_len_size);
+
+  /// Construct empty dictionary.
+  DictDecoder() {}
+
+  /// Reset decoder to fresh state.
+  void Reset(uint8_t* dict_buffer, int dict_len, int fixed_len_size);
 
   virtual int num_entries() const { return dict_.size(); }
 
@@ -262,20 +267,20 @@ inline int DictEncoder<StringValue>::AddToTable(const StringValue& value,
 
 template<typename T>
 inline bool DictDecoder<T>::GetValue(T* value) {
-  DCHECK(data_decoder_.get() != NULL);
-  int index;
-  bool result = data_decoder_->Get(&index);
-  if (!result) return false;
-  if (index >= dict_.size()) return false;
-  *value = dict_[index];
-  return true;
+  int index = -1; // Initialize to avoid compiler warning.
+  bool result = data_decoder_.Get(&index);
+  // Use & to avoid branches.
+  if (LIKELY(result & (index >= 0) & (index < dict_.size()))) {
+    *value = dict_[index];
+    return true;
+  }
+  return false;
 }
 
 template<>
 inline bool DictDecoder<Decimal16Value>::GetValue(Decimal16Value* value) {
-  DCHECK(data_decoder_.get() != NULL);
   int index;
-  bool result = data_decoder_->Get(&index);
+  bool result = data_decoder_.Get(&index);
   if (!result) return false;
   if (index >= dict_.size()) return false;
   // Workaround for IMPALA-959. Use memcpy instead of '=' so addresses
@@ -310,6 +315,13 @@ inline int DictEncoderBase::WriteData(uint8_t* buffer, int buffer_len) {
 template<typename T>
 inline DictDecoder<T>::DictDecoder(uint8_t* dict_buffer, int dict_len,
     int fixed_len_size) {
+  Reset(dict_buffer, dict_len, fixed_len_size);
+}
+
+template<typename T>
+inline void DictDecoder<T>::Reset(uint8_t* dict_buffer, int dict_len,
+    int fixed_len_size) {
+  dict_.clear();
   uint8_t* end = dict_buffer + dict_len;
   while (dict_buffer < end) {
     T value;

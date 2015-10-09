@@ -23,6 +23,7 @@ add_library(Exprs
   agg-fn-evaluator.cc
   aggregate-functions.cc
   anyval-util.cc
+  bit-byte-functions.cc
   case-expr.cc
   cast-functions.cc
   compound-predicates.cc
@@ -51,6 +52,7 @@ add_library(Exprs
   udf-builtins.cc
   utility-functions.cc
 )
+add_dependencies(Exprs thrift-deps)
 
 add_executable(expr-benchmark expr-benchmark.cc)
 target_link_libraries(expr-benchmark ${IMPALA_TEST_LINK_LIBS})
@@ -60,6 +62,7 @@ ADD_BE_TEST(expr-codegen-test)
 
 # expr-codegen-test includes test IR functions
 COMPILE_TO_IR(expr-codegen-test.cc)
+add_dependencies(expr-codegen-test-ir thrift-deps)
 
 ADD_EXECUTABLE(aggregate-functions-test aggregate-functions-test.cc)
 TARGET_LINK_LIBRARIES(aggregate-functions-test ${UDF_TEST_LINK_LIBS})

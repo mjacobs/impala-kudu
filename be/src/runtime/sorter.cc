@@ -33,8 +33,12 @@ const int BLOCKS_REQUIRED_FOR_MERGE = 3;
 // Error message when pinning fixed or variable length blocks failed.
 // TODO: Add the node id that iniated the sort
 const string PIN_FAILED_ERROR_MSG = "Failed to pin block for $0-length data needed "
-    "for sorting. Reducing query concurrency or increasing the memory available to "
-    "Impala may help running this query.";
+    "for sorting. Reducing query concurrency or increasing the memory limit may help "
+    "this query to complete successfully.";
+
+const string MEM_ALLOC_FAILED_ERROR_MSG = "Failed to allocate block for $0-length "
+    "data needed for sorting. Reducing query concurrency or increasing the "
+    "memory limit may help this query to complete successfully.";
 
 // A run is a sequence of blocks containing tuples that are or will eventually be in
 // sorted order.
@@ -50,6 +54,8 @@ class Sorter::Run {
   // materialized so materialize_slots is false.
   Run(Sorter* parent, TupleDescriptor* sort_tuple_desc, bool materialize_slots);
 
+  ~Run() { DeleteAllBlocks(); }
+
   // Initialize the run for input rows by allocating the minimum number of required
   // blocks - one block for fixed-len data added to fixed_len_blocks_, one for the
   // initially unsorted var-len data added to var_len_blocks_, and one to copy sorted
@@ -63,6 +69,9 @@ class Sorter::Run {
   // in sorter_->sort_tuple_slot_expr_ctxs_, else just copies the input rows.
   template <bool has_var_len_data>
   Status AddBatch(RowBatch* batch, int start_index, int* num_processed);
+
+  /// Attaches all fixed-len and var-len blocks to the given row batch.
+  void TransferResources(RowBatch* row_batch);
 
   // Unpins all the blocks in a sorted run. Var-length column data is copied into new
   // blocks in sorted order. Pointers in the original tuples are converted to offsets
@@ -127,6 +136,11 @@ class Sorter::Run {
   void CopyVarLenDataConvertOffset(char* dest, int64_t offset,
       const vector<StringValue*>& var_values);
 
+  /// Returns true if we have var-len slots and there are var-len blocks.
+  inline bool HasVarLenBlocks() const {
+    return has_var_len_slots_ && !var_len_blocks_.empty();
+  }
+
   // Parent sorter object.
   const Sorter* sorter_;
 
@@ -186,7 +200,7 @@ class Sorter::Run {
   int var_len_blocks_index_;
 
   // If true, pin the next fixed and var-len blocks and delete the previous ones
-  // during in the next call to GetNext(). Set during the previous call to GetNext().
+  // in the next call to GetNext(). Set during the previous call to GetNext().
   // Not used if a run is already pinned.
   bool pin_next_fixed_len_block_;
   bool pin_next_var_len_block_;
@@ -339,7 +353,7 @@ Sorter::Run::Run(Sorter* parent, TupleDescriptor* sort_tuple_desc,
     sort_tuple_desc_(sort_tuple_desc),
     sort_tuple_size_(sort_tuple_desc->byte_size()),
     block_size_(parent->block_mgr_->max_block_size()),
-    has_var_len_slots_(sort_tuple_desc->string_slots().size() > 0),
+    has_var_len_slots_(sort_tuple_desc->HasVarlenSlots()),
     materialize_slots_(materialize_slots),
     is_sorted_(!materialize_slots),
     is_pinned_(true),
@@ -351,17 +365,29 @@ Status Sorter::Run::Init() {
   BufferedBlockMgr::Block* block = NULL;
   RETURN_IF_ERROR(
       sorter_->block_mgr_->GetNewBlock(sorter_->block_mgr_client_, NULL, &block));
-  DCHECK_NOTNULL(block);
+  if (block == NULL) {
+    Status status = Status::MemLimitExceeded();
+    status.AddDetail(Substitute(MEM_ALLOC_FAILED_ERROR_MSG, "fixed"));
+    return status;
+  }
   fixed_len_blocks_.push_back(block);
   if (has_var_len_slots_) {
     RETURN_IF_ERROR(
         sorter_->block_mgr_->GetNewBlock(sorter_->block_mgr_client_, NULL, &block));
-    DCHECK_NOTNULL(block);
+    if (block == NULL) {
+      Status status = Status::MemLimitExceeded();
+      status.AddDetail(Substitute(MEM_ALLOC_FAILED_ERROR_MSG, "variable"));
+      return status;
+    }
     var_len_blocks_.push_back(block);
     if (!is_sorted_) {
       RETURN_IF_ERROR(sorter_->block_mgr_->GetNewBlock(
           sorter_->block_mgr_client_, NULL, &var_len_copy_block_));
-      DCHECK_NOTNULL(var_len_copy_block_);
+      if (var_len_copy_block_ == NULL) {
+        Status status = Status::MemLimitExceeded();
+        status.AddDetail(Substitute(MEM_ALLOC_FAILED_ERROR_MSG, "variable"));
+        return status;
+      }
     }
   }
   if (!is_sorted_) sorter_->initial_runs_counter_->Add(1);
@@ -393,8 +419,8 @@ Status Sorter::Run::AddBatch(RowBatch* batch, int start_index, int* num_processe
   // cur_input_index is the index into the input 'batch' of the current input row being
   // processed.
   int cur_input_index = start_index;
-  vector<StringValue*> var_values;
-  var_values.reserve(sort_tuple_desc_->string_slots().size());
+  vector<StringValue*> string_values;
+  string_values.reserve(sort_tuple_desc_->string_slots().size());
   while (cur_input_index < batch->num_rows()) {
     // tuples_remaining is the number of tuples to copy/materialize into
     // cur_fixed_len_block.
@@ -407,7 +433,7 @@ Status Sorter::Run::AddBatch(RowBatch* batch, int start_index, int* num_processe
       Tuple* new_tuple = cur_fixed_len_block->Allocate<Tuple>(sort_tuple_size_);
       if (materialize_slots_) {
         new_tuple->MaterializeExprs<has_var_len_data>(input_row, *sort_tuple_desc_,
-            sorter_->sort_tuple_slot_expr_ctxs_, NULL, &var_values, &total_var_len);
+            sorter_->sort_tuple_slot_expr_ctxs_, NULL, &string_values, &total_var_len);
         if (total_var_len > sorter_->block_mgr_->max_block_size()) {
           return Status(ErrorMsg(TErrorCode::INTERNAL_ERROR, Substitute(
               "Variable length data in a single tuple larger than block size $0 > $1",
@@ -416,7 +442,7 @@ Status Sorter::Run::AddBatch(RowBatch* batch, int start_index, int* num_processe
       } else {
         memcpy(new_tuple, input_row->GetTuple(0), sort_tuple_size_);
         if (has_var_len_data) {
-          CollectNonNullVarSlots(new_tuple, &var_values, &total_var_len);
+          CollectNonNullVarSlots(new_tuple, &string_values, &total_var_len);
         }
       }
 
@@ -436,13 +462,20 @@ Status Sorter::Run::AddBatch(RowBatch* batch, int start_index, int* num_processe
           }
         }
 
+        // Sorting of tuples containing array values is not implemented. The planner
+        // combined with projection should guarantee that none are in each tuple.
+        BOOST_FOREACH(const SlotDescriptor* collection_slot,
+            sort_tuple_desc_->collection_slots()) {
+          DCHECK(new_tuple->IsNull(collection_slot->null_indicator_offset()));
+        }
+
         char* var_data_ptr = cur_var_len_block->Allocate<char>(total_var_len);
         if (materialize_slots_) {
-          CopyVarLenData(var_data_ptr, var_values);
+          CopyVarLenData(var_data_ptr, string_values);
         } else {
           int64_t offset = (var_len_blocks_.size() - 1) * block_size_;
           offset += var_data_ptr - reinterpret_cast<char*>(cur_var_len_block->buffer());
-          CopyVarLenDataConvertOffset(var_data_ptr, offset, var_values);
+          CopyVarLenDataConvertOffset(var_data_ptr, offset, string_values);
         }
       }
       ++num_tuples_;
@@ -465,40 +498,62 @@ Status Sorter::Run::AddBatch(RowBatch* batch, int start_index, int* num_processe
   return Status::OK();
 }
 
+void Sorter::Run::TransferResources(RowBatch* row_batch) {
+  DCHECK(row_batch != NULL);
+  BOOST_FOREACH(BufferedBlockMgr::Block* block, fixed_len_blocks_) {
+    if (block != NULL) row_batch->AddBlock(block);
+  }
+  fixed_len_blocks_.clear();
+  BOOST_FOREACH(BufferedBlockMgr::Block* block, var_len_blocks_) {
+    if (block != NULL) row_batch->AddBlock(block);
+  }
+  var_len_blocks_.clear();
+  if (var_len_copy_block_ != NULL) {
+    row_batch->AddBlock(var_len_copy_block_);
+    var_len_copy_block_ = NULL;
+  }
+}
+
 void Sorter::Run::DeleteAllBlocks() {
   BOOST_FOREACH(BufferedBlockMgr::Block* block, fixed_len_blocks_) {
     if (block != NULL) block->Delete();
   }
+  fixed_len_blocks_.clear();
   BOOST_FOREACH(BufferedBlockMgr::Block* block, var_len_blocks_) {
     if (block != NULL) block->Delete();
   }
-  if (var_len_copy_block_ != NULL) var_len_copy_block_->Delete();
+  var_len_blocks_.clear();
+  if (var_len_copy_block_ != NULL) {
+    var_len_copy_block_->Delete();
+    var_len_copy_block_ = NULL;
+  }
 }
 
 Status Sorter::Run::UnpinAllBlocks() {
   vector<BufferedBlockMgr::Block*> sorted_var_len_blocks;
   sorted_var_len_blocks.reserve(var_len_blocks_.size());
-  vector<StringValue*> var_values;
+  vector<StringValue*> string_values;
   int64_t var_data_offset = 0;
   int total_var_len;
-  var_values.reserve(sort_tuple_desc_->string_slots().size());
+  string_values.reserve(sort_tuple_desc_->string_slots().size());
   BufferedBlockMgr::Block* cur_sorted_var_len_block = NULL;
-  if (has_var_len_slots_ && var_len_blocks_.size() > 0) {
-    DCHECK_NOTNULL(var_len_copy_block_);
+  if (HasVarLenBlocks()) {
+    DCHECK(var_len_copy_block_ != NULL);
     sorted_var_len_blocks.push_back(var_len_copy_block_);
-    cur_sorted_var_len_block = sorted_var_len_blocks.back();
+    cur_sorted_var_len_block = var_len_copy_block_;
   } else {
     DCHECK(var_len_copy_block_ == NULL);
   }
 
   for (int i = 0; i < fixed_len_blocks_.size(); ++i) {
     BufferedBlockMgr::Block* cur_fixed_block = fixed_len_blocks_[i];
-    if (has_var_len_slots_) {
+    if (HasVarLenBlocks()) {
       for (int block_offset = 0; block_offset < cur_fixed_block->valid_data_len();
           block_offset += sort_tuple_size_) {
         Tuple* cur_tuple =
             reinterpret_cast<Tuple*>(cur_fixed_block->buffer() + block_offset);
-        CollectNonNullVarSlots(cur_tuple, &var_values, &total_var_len);
+        CollectNonNullVarSlots(cur_tuple, &string_values, &total_var_len);
+        DCHECK(cur_sorted_var_len_block != NULL);
         if (cur_sorted_var_len_block->BytesRemaining() < total_var_len) {
           bool added;
           RETURN_IF_ERROR(TryAddBlock(&sorted_var_len_blocks, &added));
@@ -508,7 +563,7 @@ Status Sorter::Run::UnpinAllBlocks() {
         char* var_data_ptr = cur_sorted_var_len_block->Allocate<char>(total_var_len);
         var_data_offset = block_size_ * (sorted_var_len_blocks.size() - 1) +
             (var_data_ptr - reinterpret_cast<char*>(cur_sorted_var_len_block->buffer()));
-        CopyVarLenDataConvertOffset(var_data_ptr, var_data_offset, var_values);
+        CopyVarLenDataConvertOffset(var_data_ptr, var_data_offset, string_values);
       }
     }
     RETURN_IF_ERROR(cur_fixed_block->Unpin());
@@ -549,20 +604,24 @@ Status Sorter::Run::PrepareRead() {
   // Attempt to pin the first fixed and var-length blocks. In either case, pinning may
   // fail if the number of reserved blocks is oversubscribed, see IMPALA-1590.
   if (fixed_len_blocks_.size() > 0) {
-    bool pinned = false;
+    bool pinned;
     RETURN_IF_ERROR(fixed_len_blocks_[0]->Pin(&pinned));
+    // Temporary work-around for IMPALA-1868. Fail the query with OOM rather than
+    // DCHECK in case block pin fails.
     if (!pinned) {
-      Status status = Status::MEM_LIMIT_EXCEEDED;
+      Status status = Status::MemLimitExceeded();
       status.AddDetail(Substitute(PIN_FAILED_ERROR_MSG, "fixed"));
       return status;
     }
   }
 
   if (has_var_len_slots_ && var_len_blocks_.size() > 0) {
-    bool pinned = false;
+    bool pinned;
     RETURN_IF_ERROR(var_len_blocks_[0]->Pin(&pinned));
+    // Temporary work-around for IMPALA-1590. Fail the query with OOM rather than
+    // DCHECK in case block pin fails.
     if (!pinned) {
-      Status status = Status::MEM_LIMIT_EXCEEDED;
+      Status status = Status::MemLimitExceeded();
       status.AddDetail(Substitute(PIN_FAILED_ERROR_MSG, "variable"));
       return status;
     }
@@ -593,7 +652,7 @@ Status Sorter::Run::GetNextBatch(RowBatch** output_batch) {
       // The merge is complete. Delete the last blocks in the run.
       RETURN_IF_ERROR(fixed_len_blocks_.back()->Delete());
       fixed_len_blocks_[fixed_len_blocks_.size() - 1] = NULL;
-      if (has_var_len_slots_) {
+      if (HasVarLenBlocks()) {
         RETURN_IF_ERROR(var_len_blocks_.back()->Delete());
         var_len_blocks_[var_len_blocks_.size() - 1] = NULL;
       }
@@ -625,7 +684,13 @@ Status Sorter::Run::GetNext(RowBatch* output_batch, bool* eos) {
       fixed_len_blocks_[fixed_len_blocks_index_ - 1] = NULL;
       bool pinned;
       RETURN_IF_ERROR(fixed_len_block->Pin(&pinned));
-      DCHECK(pinned);
+      // Temporary work-around for IMPALA-2344. Fail the query with OOM rather than
+      // DCHECK in case block pin fails.
+      if (!pinned) {
+        Status status = Status::MemLimitExceeded();
+        status.AddDetail(Substitute(PIN_FAILED_ERROR_MSG, "fixed"));
+        return status;
+      }
       pin_next_fixed_len_block_ = false;
     }
     if (pin_next_var_len_block_) {
@@ -633,7 +698,13 @@ Status Sorter::Run::GetNext(RowBatch* output_batch, bool* eos) {
       var_len_blocks_[var_len_blocks_index_ - 1] = NULL;
       bool pinned;
       RETURN_IF_ERROR(var_len_blocks_[var_len_blocks_index_]->Pin(&pinned));
-      DCHECK(pinned);
+      // Temporary work-around for IMPALA-2344. Fail the query with OOM rather than
+      // DCHECK in case block pin fails.
+      if (!pinned) {
+        Status status = Status::MemLimitExceeded();
+        status.AddDetail(Substitute(PIN_FAILED_ERROR_MSG, "variable"));
+        return status;
+      }
       pin_next_var_len_block_ = false;
     }
   }
@@ -646,12 +717,12 @@ Status Sorter::Run::GetNext(RowBatch* output_batch, bool* eos) {
 
     if (convert_offset_to_ptr) {
       // Convert the offsets in the var-len slots in input_tuple back to pointers.
-      const vector<SlotDescriptor*>& var_slots = sort_tuple_desc_->string_slots();
-      for (int i = 0; i < var_slots.size(); ++i) {
-        SlotDescriptor* slot_desc = var_slots[i];
+      const vector<SlotDescriptor*>& string_slots = sort_tuple_desc_->string_slots();
+      for (int i = 0; i < string_slots.size(); ++i) {
+        SlotDescriptor* slot_desc = string_slots[i];
         if (input_tuple->IsNull(slot_desc->null_indicator_offset())) continue;
 
-        DCHECK_EQ(slot_desc->type().type, TYPE_STRING);
+        DCHECK(slot_desc->type().IsVarLenStringType());
         StringValue* value = reinterpret_cast<StringValue*>(
             input_tuple->GetSlot(slot_desc->tuple_offset()));
         int64_t data_offset = reinterpret_cast<int64_t>(value->ptr);
@@ -677,7 +748,7 @@ Status Sorter::Run::GetNext(RowBatch* output_batch, bool* eos) {
           value->ptr = reinterpret_cast<char*>(
               var_len_blocks_[var_len_blocks_index_]->buffer() + block_offset);
         } // if (block_index > var_len_blocks_index_)
-      } // for (int i = 0; i < var_slots.size(); ++i)
+      } // for (int i = 0; i < string_slots.size(); ++i)
 
       // The var-len data is in the next block, so end this call to GetNext().
       if (pin_next_var_len_block_) break;
@@ -690,24 +761,24 @@ Status Sorter::Run::GetNext(RowBatch* output_batch, bool* eos) {
     ++num_tuples_returned_;
   }
 
+  // Reached the block boundary, need to move to the next block.
   if (fixed_len_block_offset_ >= fixed_len_block->valid_data_len()) {
     pin_next_fixed_len_block_ = true;
     ++fixed_len_blocks_index_;
     fixed_len_block_offset_ = 0;
   }
-
   return Status::OK();
 }
 
 void Sorter::Run::CollectNonNullVarSlots(Tuple* src,
-    vector<StringValue*>* var_len_values, int* total_var_len) {
-  var_len_values->clear();
+    vector<StringValue*>* string_values, int* total_var_len) {
+  string_values->clear();
   *total_var_len = 0;
-  BOOST_FOREACH(const SlotDescriptor* var_slot, sort_tuple_desc_->string_slots()) {
-    if (!src->IsNull(var_slot->null_indicator_offset())) {
+  BOOST_FOREACH(const SlotDescriptor* string_slot, sort_tuple_desc_->string_slots()) {
+    if (!src->IsNull(string_slot->null_indicator_offset())) {
       StringValue* string_val =
-          reinterpret_cast<StringValue*>(src->GetSlot(var_slot->tuple_offset()));
-      var_len_values->push_back(string_val);
+          reinterpret_cast<StringValue*>(src->GetSlot(string_slot->tuple_offset()));
+      string_values->push_back(string_val);
       *total_var_len += string_val->len;
     }
   }
@@ -736,21 +807,21 @@ Status Sorter::Run::TryAddBlock(vector<BufferedBlockMgr::Block*>* block_sequence
   return Status::OK();
 }
 
-void Sorter::Run::CopyVarLenData(char* dest, const vector<StringValue*>& var_values) {
-  BOOST_FOREACH(StringValue* var_val, var_values) {
-    memcpy(dest, var_val->ptr, var_val->len);
-    var_val->ptr = dest;
-    dest += var_val->len;
+void Sorter::Run::CopyVarLenData(char* dest, const vector<StringValue*>& string_values) {
+  BOOST_FOREACH(StringValue* string_val, string_values) {
+    memcpy(dest, string_val->ptr, string_val->len);
+    string_val->ptr = dest;
+    dest += string_val->len;
   }
 }
 
 void Sorter::Run::CopyVarLenDataConvertOffset(char* dest, int64_t offset,
-    const vector<StringValue*>& var_values) {
-  BOOST_FOREACH(StringValue* var_val, var_values) {
-    memcpy(dest, var_val->ptr, var_val->len);
-    var_val->ptr = reinterpret_cast<char*>(offset);
-    dest += var_val->len;
-    offset += var_val->len;
+    const vector<StringValue*>& string_values) {
+  BOOST_FOREACH(StringValue* string_val, string_values) {
+    memcpy(dest, string_val->ptr, string_val->len);
+    string_val->ptr = reinterpret_cast<char*>(offset);
+    dest += string_val->len;
+    offset += string_val->len;
   }
 }
 
@@ -846,8 +917,8 @@ void Sorter::TupleSorter::SortHelper(TupleIterator first, TupleIterator last) {
   if (UNLIKELY(state_->is_cancelled())) return;
   // Use insertion sort for smaller sequences.
   while (last.index_ - first.index_ > INSERTION_THRESHOLD) {
-    TupleIterator iter(this, first.index_ + (last.index_ - first.index_)/2);
-    DCHECK_NOTNULL(iter.current_tuple_);
+    TupleIterator iter(this, first.index_ + (last.index_ - first.index_) / 2);
+    DCHECK(iter.current_tuple_ != NULL);
     // Partition() splits the tuples in [first, last) into two groups (<= pivot
     // and >= pivot) in-place. 'cut' is the index of the first tuple in the second group.
     TupleIterator cut = Partition(first, last,
@@ -873,20 +944,29 @@ Sorter::Sorter(const TupleRowComparator& compare_less_than,
     RuntimeProfile* profile, RuntimeState* state)
   : state_(state),
     compare_less_than_(compare_less_than),
+    in_mem_tuple_sorter_(NULL),
     block_mgr_(state->block_mgr()),
-    unsorted_run_(NULL),
-    output_row_desc_(output_row_desc),
+    block_mgr_client_(NULL),
+    has_var_len_slots_(false),
     sort_tuple_slot_expr_ctxs_(slot_materialize_expr_ctxs),
     mem_tracker_(mem_tracker),
-    profile_(profile) {
+    output_row_desc_(output_row_desc),
+    unsorted_run_(NULL),
+    profile_(profile),
+    initial_runs_counter_(NULL),
+    num_merges_counter_(NULL),
+    in_mem_sort_timer_(NULL),
+    sorted_data_size_(NULL) {
 }
 
 Sorter::~Sorter() {
-  // Delete all blocks from the block mgr.
-  for (list<Run*>::iterator it = sorted_runs_.begin(); it != sorted_runs_.end(); ++it) {
+  // Delete blocks from the block mgr.
+  for (deque<Run*>::iterator it = sorted_runs_.begin();
+      it != sorted_runs_.end(); ++it) {
     (*it)->DeleteAllBlocks();
   }
-  for (list<Run*>::iterator it = merging_runs_.begin(); it != merging_runs_.end(); ++it) {
+  for (deque<Run*>::iterator it = merging_runs_.begin();
+      it != merging_runs_.end(); ++it) {
     (*it)->DeleteAllBlocks();
   }
   if (unsorted_run_ != NULL) unsorted_run_->DeleteAllBlocks();
@@ -896,7 +976,7 @@ Sorter::~Sorter() {
 Status Sorter::Init() {
   DCHECK(unsorted_run_ == NULL) << "Already initialized";
   TupleDescriptor* sort_tuple_desc = output_row_desc_->tuple_descriptors()[0];
-  has_var_len_slots_ = sort_tuple_desc->string_slots().size() > 0;
+  has_var_len_slots_ = sort_tuple_desc->HasVarlenSlots();
   in_mem_tuple_sorter_.reset(new TupleSorter(compare_less_than_,
       block_mgr_->max_block_size(), sort_tuple_desc->byte_size(), state_));
   unsorted_run_ = obj_pool_.Add(new Run(this, sort_tuple_desc, true));
@@ -909,20 +989,20 @@ Status Sorter::Init() {
   int min_blocks_required = BLOCKS_REQUIRED_FOR_MERGE;
   // Fixed and var-length blocks are separate, so we need BLOCKS_REQUIRED_FOR_MERGE
   // blocks for both if there is var-length data.
-  if (output_row_desc_->tuple_descriptors()[0]->string_slots().size() > 0) {
+  if (output_row_desc_->tuple_descriptors()[0]->HasVarlenSlots()) {
     min_blocks_required *= 2;
   }
   RETURN_IF_ERROR(block_mgr_->RegisterClient(min_blocks_required, mem_tracker_, state_,
       &block_mgr_client_));
 
-  DCHECK_NOTNULL(unsorted_run_);
+  DCHECK(unsorted_run_ != NULL);
   RETURN_IF_ERROR(unsorted_run_->Init());
   return Status::OK();
 }
 
 Status Sorter::AddBatch(RowBatch* batch) {
-  DCHECK_NOTNULL(unsorted_run_);
-  DCHECK_NOTNULL(batch);
+  DCHECK(unsorted_run_ != NULL);
+  DCHECK(batch != NULL);
   int num_processed = 0;
   int cur_batch_index = 0;
   while (cur_batch_index < batch->num_rows()) {
@@ -940,7 +1020,7 @@ Status Sorter::AddBatch(RowBatch* batch) {
       RETURN_IF_ERROR(sorted_runs_.back()->UnpinAllBlocks());
       unsorted_run_ = obj_pool_.Add(
           new Run(this, output_row_desc_->tuple_descriptors()[0], true));
-      unsorted_run_->Init();
+      RETURN_IF_ERROR(unsorted_run_->Init());
     }
   }
   return Status::OK();
@@ -996,10 +1076,23 @@ Status Sorter::GetNext(RowBatch* output_batch, bool* eos) {
     // In this case, only TupleRows are copied into output_batch. Sorted tuples are left
     // in the pinned blocks in the single sorted run.
     RETURN_IF_ERROR(sorted_runs_.back()->GetNext<false>(output_batch, eos));
+    if (*eos) sorted_runs_.back()->TransferResources(output_batch);
   } else {
     // In this case, rows are deep copied into output_batch.
     RETURN_IF_ERROR(merger_->GetNext(output_batch, eos));
   }
+  return Status::OK();
+}
+
+Status Sorter::Reset() {
+  merger_.reset();
+  merging_runs_.clear();
+  sorted_runs_.clear();
+  obj_pool_.Clear();
+  DCHECK(unsorted_run_ == NULL);
+  unsorted_run_ = obj_pool_.Add(
+      new Run(this, output_row_desc_->tuple_descriptors()[0], true));
+  RETURN_IF_ERROR(unsorted_run_->Init());
   return Status::OK();
 }
 
@@ -1012,7 +1105,7 @@ Status Sorter::SortRun() {
     unsorted_run_->fixed_len_blocks_.pop_back();
   }
   if (has_var_len_slots_) {
-    DCHECK_NOTNULL(unsorted_run_->var_len_copy_block_);
+    DCHECK(unsorted_run_->var_len_copy_block_ != NULL);
     last_block = unsorted_run_->var_len_blocks_.back();
     if (last_block->valid_data_len() > 0) {
       sorted_data_size_->Add(last_block->valid_data_len());
@@ -1037,7 +1130,7 @@ Status Sorter::SortRun() {
 
 uint64_t Sorter::EstimateMergeMem(uint64_t available_blocks,
     RowDescriptor* row_desc, int merge_batch_size) {
-  bool has_var_len_slots = row_desc->tuple_descriptors()[0]->string_slots().size() > 0;
+  bool has_var_len_slots = row_desc->tuple_descriptors()[0]->HasVarlenSlots();
   int blocks_per_run = has_var_len_slots ? 2 : 1;
   int max_input_runs_per_merge = (available_blocks / blocks_per_run) - 1;
   // During a merge, the batches corresponding to the input runs contain only TupleRows.
@@ -1124,7 +1217,8 @@ Status Sorter::CreateMerger(int num_runs) {
   DCHECK_GT(num_runs, 1);
 
   // Clean up the runs from the previous merge.
-  for (list<Run*>::iterator it = merging_runs_.begin(); it != merging_runs_.end(); ++it) {
+  for (deque<Run*>::iterator it = merging_runs_.begin();
+      it != merging_runs_.end(); ++it) {
     (*it)->DeleteAllBlocks();
   }
   merging_runs_.clear();

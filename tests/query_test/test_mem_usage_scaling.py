@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # Copyright (c) 2012 Cloudera, Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -75,31 +74,10 @@ class TestExprMemUsage(ImpalaTestSuite):
       "select count(*) from lineitem where lower(l_comment) = 'hello'", exec_options,
       table_format=vector.get_value('table_format'))
 
-class TestTpchMemLimitError(ImpalaTestSuite):
+
+class TestLowMemoryLimits(ImpalaTestSuite):
+  '''Super class for the memory limit tests with the TPC-H and TPC-DS queries'''
   EXPECTED_ERROR_MSG = "Memory limit exceeded"
-
-  # The mem limits that will be used.
-  MEM_IN_MB = [100, 150, 180, 420, 700, 780, 960, 980, 1050, 1100]
-
-  # Different values of mem limits and minimum mem limit (in MBs) each query is expected
-  # to run without problem. Those values were determined by manual testing.
-  MIN_MEM_FOR_TPCH = { 'Q1' : 145, 'Q2' : 105, 'Q3' : 645, 'Q4' : 160, 'Q5' : 375,\
-                       'Q6' : 25, 'Q7' : 685, 'Q8' : 740, 'Q9' : 650, 'Q18' : 1100,\
-                       'Q20' : 420, 'Q21' : 975}
-
-  @classmethod
-  def get_workload(self):
-    return 'tpch'
-
-  @classmethod
-  def add_test_dimensions(cls):
-    super(TestTpchMemLimitError, cls).add_test_dimensions()
-
-    cls.TestMatrix.add_dimension(
-      TestDimension('mem_limit', *TestTpchMemLimitError.MEM_IN_MB))
-
-    cls.TestMatrix.add_constraint(lambda v:\
-        v.get_value('table_format').file_format in ['parquet'])
 
   def low_memory_limit_test(self, vector, tpch_query, limit):
     mem = vector.get_value('mem_limit')
@@ -114,9 +92,36 @@ class TestTpchMemLimitError(ImpalaTestSuite):
     try:
       self.run_test_case(tpch_query, new_vector)
     except ImpalaBeeswaxException as e:
-      if (expects_error == 0):
-        raise
-      assert TestTpchMemLimitError.EXPECTED_ERROR_MSG in str(e)
+      if not expects_error: raise
+      assert TestLowMemoryLimits.EXPECTED_ERROR_MSG in str(e)
+
+
+class TestTpchMemLimitError(TestLowMemoryLimits):
+  # TODO: After we stabilize the mem usage test, we should move this test to exhaustive.
+  # The mem limits that will be used.
+  MEM_IN_MB = [20, 140, 180, 275, 450, 700, 980]
+
+  # Different values of mem limits and minimum mem limit (in MBs) each query is expected
+  # to run without problem. Those values were determined by manual testing.
+  MIN_MEM_FOR_TPCH = { 'Q1' : 140, 'Q2' : 120, 'Q3' : 240, 'Q4' : 125, 'Q5' : 235,\
+                       'Q6' : 25, 'Q7' : 265, 'Q8' : 250, 'Q9' : 400, 'Q10' : 240,\
+                       'Q11' : 110, 'Q12' : 125, 'Q13' : 110, 'Q14' : 105, 'Q15' : 125,\
+                       'Q16' : 125, 'Q17' : 130, 'Q18' : 425, 'Q19' : 240, 'Q20' : 250,\
+                       'Q21' : 620, 'Q22' : 125}
+
+  @classmethod
+  def get_workload(self):
+    return 'tpch'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestTpchMemLimitError, cls).add_test_dimensions()
+
+    cls.TestMatrix.add_dimension(
+      TestDimension('mem_limit', *TestTpchMemLimitError.MEM_IN_MB))
+
+    cls.TestMatrix.add_constraint(lambda v:\
+        v.get_value('table_format').file_format in ['parquet'])
 
   def test_low_mem_limit_q1(self, vector):
     self.low_memory_limit_test(vector, 'tpch-q1', self.MIN_MEM_FOR_TPCH['Q1']);
@@ -145,11 +150,67 @@ class TestTpchMemLimitError(ImpalaTestSuite):
   def test_low_mem_limit_q9(self, vector):
     self.low_memory_limit_test(vector, 'tpch-q9', self.MIN_MEM_FOR_TPCH['Q9']);
 
+  def test_low_mem_limit_q10(self, vector):
+    self.low_memory_limit_test(vector, 'tpch-q10', self.MIN_MEM_FOR_TPCH['Q10']);
+
+  def test_low_mem_limit_q11(self, vector):
+    self.low_memory_limit_test(vector, 'tpch-q11', self.MIN_MEM_FOR_TPCH['Q11']);
+
+  def test_low_mem_limit_q12(self, vector):
+    self.low_memory_limit_test(vector, 'tpch-q12', self.MIN_MEM_FOR_TPCH['Q12']);
+
+  def test_low_mem_limit_q13(self, vector):
+    self.low_memory_limit_test(vector, 'tpch-q13', self.MIN_MEM_FOR_TPCH['Q13']);
+
+  def test_low_mem_limit_q14(self, vector):
+    self.low_memory_limit_test(vector, 'tpch-q14', self.MIN_MEM_FOR_TPCH['Q14']);
+
+  def test_low_mem_limit_q15(self, vector):
+    self.low_memory_limit_test(vector, 'tpch-q15', self.MIN_MEM_FOR_TPCH['Q15']);
+
+  def test_low_mem_limit_q16(self, vector):
+    self.low_memory_limit_test(vector, 'tpch-q16', self.MIN_MEM_FOR_TPCH['Q16']);
+
+  def test_low_mem_limit_q17(self, vector):
+    self.low_memory_limit_test(vector, 'tpch-q17', self.MIN_MEM_FOR_TPCH['Q17']);
+
   def test_low_mem_limit_q18(self, vector):
     self.low_memory_limit_test(vector, 'tpch-q18', self.MIN_MEM_FOR_TPCH['Q18']);
+
+  def test_low_mem_limit_q19(self, vector):
+    self.low_memory_limit_test(vector, 'tpch-q19', self.MIN_MEM_FOR_TPCH['Q19']);
 
   def test_low_mem_limit_q20(self, vector):
     self.low_memory_limit_test(vector, 'tpch-q20', self.MIN_MEM_FOR_TPCH['Q20']);
 
   def test_low_mem_limit_q21(self, vector):
     self.low_memory_limit_test(vector, 'tpch-q21', self.MIN_MEM_FOR_TPCH['Q21']);
+
+  def test_low_mem_limit_q22(self, vector):
+    self.low_memory_limit_test(vector, 'tpch-q22', self.MIN_MEM_FOR_TPCH['Q22']);
+
+
+class TestTpcdsMemLimitError(TestLowMemoryLimits):
+  # The mem limits that will be used.
+  MEM_IN_MB = [20, 100, 110, 150]
+
+  # Different values of mem limits and minimum mem limit (in MBs) each query is expected
+  # to run without problem. Those values were determined by manual testing.
+  MIN_MEM_FOR_TPCDS = { 'q53' : 110}
+
+  @classmethod
+  def get_workload(self):
+    return 'tpcds'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestTpcdsMemLimitError, cls).add_test_dimensions()
+
+    cls.TestMatrix.add_dimension(
+      TestDimension('mem_limit', *TestTpcdsMemLimitError.MEM_IN_MB))
+
+    cls.TestMatrix.add_constraint(lambda v:\
+        v.get_value('table_format').file_format in ['parquet'])
+
+  def test_low_mem_limit_q53(self, vector):
+    self.low_memory_limit_test(vector, 'tpcds-q53', self.MIN_MEM_FOR_TPCDS['q53']);

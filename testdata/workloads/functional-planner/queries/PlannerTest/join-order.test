@@ -137,44 +137,40 @@ limit 10
    partitions=1/1 files=1 size=23.08MB
    predicates: c.c_mktsegment = 'BUILDING'
 ---- DISTRIBUTEDPLAN
-13:MERGING-EXCHANGE [UNPARTITIONED]
+11:MERGING-EXCHANGE [UNPARTITIONED]
 |  order by: round(sum(l_extendedprice * (1 - l_discount)), 5) DESC, o_orderdate ASC
 |  limit: 10
 |
 06:TOP-N [LIMIT=10]
 |  order by: round(sum(l_extendedprice * (1 - l_discount)), 5) DESC, o_orderdate ASC
 |
-12:AGGREGATE [FINALIZE]
+10:AGGREGATE [FINALIZE]
 |  output: sum:merge(l_extendedprice * (1 - l_discount))
 |  group by: l_orderkey, o_orderdate, o_shippriority
 |
-11:EXCHANGE [HASH(l_orderkey,o_orderdate,o_shippriority)]
+09:EXCHANGE [HASH(l_orderkey,o_orderdate,o_shippriority)]
 |
 05:AGGREGATE
 |  output: sum(l_extendedprice * (1 - l_discount))
 |  group by: l_orderkey, o_orderdate, o_shippriority
 |
-04:HASH JOIN [INNER JOIN, PARTITIONED]
+04:HASH JOIN [INNER JOIN, BROADCAST]
 |  hash predicates: o.o_orderkey = l.l_orderkey
 |
-|--10:EXCHANGE [HASH(l.l_orderkey)]
+|--08:EXCHANGE [BROADCAST]
 |  |
 |  02:SCAN HDFS [tpch.lineitem l]
 |     partitions=1/1 files=1 size=718.94MB
 |     predicates: l_shipdate > '1995-03-15'
 |
-09:EXCHANGE [HASH(o.o_orderkey)]
-|
-03:HASH JOIN [INNER JOIN, PARTITIONED]
+03:HASH JOIN [INNER JOIN, BROADCAST]
 |  hash predicates: c.c_custkey = o.o_custkey
 |
-|--08:EXCHANGE [HASH(o.o_custkey)]
+|--07:EXCHANGE [BROADCAST]
 |  |
 |  01:SCAN HDFS [tpch.orders o]
 |     partitions=1/1 files=1 size=162.56MB
 |     predicates: o_orderdate < '1995-03-15'
-|
-07:EXCHANGE [HASH(c.c_custkey)]
 |
 00:SCAN HDFS [tpch.customer c]
    partitions=1/1 files=1 size=23.08MB
@@ -215,23 +211,23 @@ limit 100
 |  group by: n_name
 |
 10:HASH JOIN [INNER JOIN]
+|  hash predicates: l_suppkey = s_suppkey, c_nationkey = s_nationkey
+|
+|--03:SCAN HDFS [tpch.supplier s]
+|     partitions=1/1 files=1 size=1.33MB
+|
+09:HASH JOIN [INNER JOIN]
 |  hash predicates: n_regionkey = r_regionkey
 |
 |--05:SCAN HDFS [tpch.region]
 |     partitions=1/1 files=1 size=384B
 |     predicates: r_name = 'ASIA'
 |
-09:HASH JOIN [INNER JOIN]
-|  hash predicates: s_nationkey = n_nationkey
+08:HASH JOIN [INNER JOIN]
+|  hash predicates: tpch.customer.c_nationkey = tpch.nation.n_nationkey
 |
 |--04:SCAN HDFS [tpch.nation]
 |     partitions=1/1 files=1 size=2.15KB
-|
-08:HASH JOIN [INNER JOIN]
-|  hash predicates: l_suppkey = s_suppkey, c_nationkey = s_nationkey
-|
-|--03:SCAN HDFS [tpch.supplier s]
-|     partitions=1/1 files=1 size=1.33MB
 |
 07:HASH JOIN [INNER JOIN]
 |  hash predicates: o_custkey = c_custkey
@@ -267,29 +263,29 @@ limit 100
 |  group by: n_name
 |
 10:HASH JOIN [INNER JOIN, BROADCAST]
-|  hash predicates: n_regionkey = r_regionkey
+|  hash predicates: l_suppkey = s_suppkey, c_nationkey = s_nationkey
 |
 |--17:EXCHANGE [BROADCAST]
+|  |
+|  03:SCAN HDFS [tpch.supplier s]
+|     partitions=1/1 files=1 size=1.33MB
+|
+09:HASH JOIN [INNER JOIN, BROADCAST]
+|  hash predicates: n_regionkey = r_regionkey
+|
+|--16:EXCHANGE [BROADCAST]
 |  |
 |  05:SCAN HDFS [tpch.region]
 |     partitions=1/1 files=1 size=384B
 |     predicates: r_name = 'ASIA'
 |
-09:HASH JOIN [INNER JOIN, BROADCAST]
-|  hash predicates: s_nationkey = n_nationkey
-|
-|--16:EXCHANGE [BROADCAST]
-|  |
-|  04:SCAN HDFS [tpch.nation]
-|     partitions=1/1 files=1 size=2.15KB
-|
 08:HASH JOIN [INNER JOIN, BROADCAST]
-|  hash predicates: l_suppkey = s_suppkey, c_nationkey = s_nationkey
+|  hash predicates: tpch.customer.c_nationkey = tpch.nation.n_nationkey
 |
 |--15:EXCHANGE [BROADCAST]
 |  |
-|  03:SCAN HDFS [tpch.supplier s]
-|     partitions=1/1 files=1 size=1.33MB
+|  04:SCAN HDFS [tpch.nation]
+|     partitions=1/1 files=1 size=2.15KB
 |
 07:HASH JOIN [INNER JOIN, BROADCAST]
 |  hash predicates: o_custkey = c_custkey
@@ -649,7 +645,7 @@ where n_name = 'x'
 05:AGGREGATE [FINALIZE]
 |  output: count(*)
 |
-04:CROSS JOIN
+04:NESTED LOOP JOIN [CROSS JOIN]
 |
 |--01:SCAN HDFS [tpch.orders]
 |     partitions=1/1 files=1 size=162.56MB
@@ -672,7 +668,7 @@ where n_name = 'x'
 05:AGGREGATE
 |  output: count(*)
 |
-04:CROSS JOIN [BROADCAST]
+04:NESTED LOOP JOIN [CROSS JOIN, BROADCAST]
 |
 |--07:EXCHANGE [BROADCAST]
 |  |
@@ -699,9 +695,9 @@ select c.int_col from functional.alltypestiny a
 cross join functional.alltypestiny b
 cross join functional.alltypes c
 ---- PLAN
-04:CROSS JOIN
+04:NESTED LOOP JOIN [CROSS JOIN]
 |
-|--03:CROSS JOIN
+|--03:NESTED LOOP JOIN [CROSS JOIN]
 |  |
 |  |--01:SCAN HDFS [functional.alltypestiny b]
 |  |     partitions=4/4 files=4 size=460B
@@ -1143,8 +1139,13 @@ WHERE `$a$2`.`$c$1` > t4.id
 |--06:SCAN HDFS [functional.alltypestiny tt1]
 |     partitions=4/4 files=4 size=460B
 |
-08:CROSS JOIN
+08:NESTED LOOP JOIN [INNER JOIN]
 |  predicates: sum(t1.int_col) > t4.id
+|
+|--00:SCAN HDFS [functional.alltypestiny t4]
+|     partitions=4/4 files=4 size=460B
+|
+07:NESTED LOOP JOIN [CROSS JOIN]
 |
 |--05:AGGREGATE [FINALIZE]
 |  |  output: sum(t1.int_col)
@@ -1152,11 +1153,6 @@ WHERE `$a$2`.`$c$1` > t4.id
 |  |
 |  04:SCAN HDFS [functional.alltypesagg t1]
 |     partitions=11/11 files=11 size=814.73KB
-|
-07:CROSS JOIN
-|
-|--00:SCAN HDFS [functional.alltypestiny t4]
-|     partitions=4/4 files=4 size=460B
 |
 03:HASH JOIN [INNER JOIN]
 |  hash predicates: t1.bigint_col = t2.smallint_col

@@ -611,3 +611,289 @@ limit 1
 00:SCAN HDFS [functional.alltypesagg t1]
    partitions=11/11 files=11 size=814.73KB
 ====
+# IMPALA-2089: Tests correct elimination of redundant predicates.
+# The equivalences between inline-view slots are enforced inside the inline-view plan.
+# Equivalences between simple grouping slots (with SlotRef grouping exprs) are enforced
+# at the scan, and equivalences between grouping slots with complex grouping exprs are
+# enforced at the aggregation.
+# a, b, c, d are in the same equivalence class and some predicates are redundant.
+select * from
+  (select tinyint_col a, smallint_col b, int_col + int_col c, coalesce(bigint_col, year) d
+   from functional.alltypes
+   group by 1, 2, 3, 4) v
+where v.a = v.b and v.b = v.c and v.c = v.d and v.a = v.c and v.a = v.d
+---- PLAN
+01:AGGREGATE [FINALIZE]
+|  group by: tinyint_col, smallint_col, int_col + int_col, coalesce(bigint_col, year)
+|  having: int_col + int_col = coalesce(bigint_col, year), smallint_col = int_col + int_col
+|
+00:SCAN HDFS [functional.alltypes]
+   partitions=24/24 files=24 size=478.45KB
+   predicates: functional.alltypes.tinyint_col = functional.alltypes.smallint_col
+====
+# IMPALA-1917: Test NULL literals inside inline view with grouping aggregation.
+select cnt from
+  (select bool_col, count(*) cnt, cast(NULL as int) as x, cast(NULL as int) as y
+   from functional.alltypestiny
+   group by bool_col, x) v
+---- PLAN
+01:AGGREGATE [FINALIZE]
+|  output: count(*)
+|  group by: bool_col, CAST(NULL AS INT)
+|
+00:SCAN HDFS [functional.alltypestiny]
+   partitions=4/4 files=4 size=460B
+====
+# IMPALA-1917: Test NULL literals inside inline view with grouping aggregation.
+select cnt from
+  (select bool_col, count(distinct int_col) cnt, NULL as x, NULL as y
+   from functional.alltypestiny
+   group by bool_col, x) v
+---- PLAN
+02:AGGREGATE [FINALIZE]
+|  output: count(int_col)
+|  group by: bool_col, NULL
+|
+01:AGGREGATE
+|  group by: bool_col, NULL, int_col
+|
+00:SCAN HDFS [functional.alltypestiny]
+   partitions=4/4 files=4 size=460B
+====
+# test simple group_concat with distinct
+select group_concat(distinct string_col) from functional.alltypesagg
+---- PLAN
+02:AGGREGATE [FINALIZE]
+|  output: group_concat(string_col)
+|
+01:AGGREGATE
+|  group by: string_col
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+---- DISTRIBUTEDPLAN
+06:AGGREGATE [FINALIZE]
+|  output: group_concat:merge(string_col)
+|
+05:EXCHANGE [UNPARTITIONED]
+|
+02:AGGREGATE
+|  output: group_concat(string_col)
+|
+04:AGGREGATE
+|  group by: string_col
+|
+03:EXCHANGE [HASH(string_col)]
+|
+01:AGGREGATE
+|  group by: string_col
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+====
+# test group_concat and a group by
+select day, group_concat(distinct string_col)
+from (select * from functional.alltypesagg where id % 100 = day order by id limit 99999) a
+group by day
+---- PLAN
+03:AGGREGATE [FINALIZE]
+|  output: group_concat(string_col)
+|  group by: day
+|
+02:AGGREGATE
+|  group by: day, string_col
+|
+01:TOP-N [LIMIT=99999]
+|  order by: id ASC
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+   predicates: id % 100 = day
+---- DISTRIBUTEDPLAN
+03:AGGREGATE [FINALIZE]
+|  output: group_concat(string_col)
+|  group by: day
+|
+02:AGGREGATE
+|  group by: day, string_col
+|
+04:MERGING-EXCHANGE [UNPARTITIONED]
+| order by: id ASC
+| limit: 99999
+|
+01:TOP-N [LIMIT=99999]
+|  order by: id ASC
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+   predicates: id % 100 = day
+====
+# test group_concat with distinct together with another distinct aggregate function
+select count(distinct cast(timestamp_col as string)),
+group_concat(distinct cast(timestamp_col as string))
+from functional.alltypesagg group by year
+---- PLAN
+02:AGGREGATE [FINALIZE]
+|  output: count(CAST(timestamp_col AS STRING)), group_concat(CAST(timestamp_col AS STRING))
+|  group by: year
+|
+01:AGGREGATE
+|  group by: year, CAST(timestamp_col AS STRING)
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+---- DISTRIBUTEDPLAN
+05:EXCHANGE [UNPARTITIONED]
+|
+02:AGGREGATE [FINALIZE]
+|  output: count(CAST(timestamp_col AS STRING)), group_concat(CAST(timestamp_col AS STRING))
+|  group by: year
+|
+04:AGGREGATE
+|  group by: year, CAST(timestamp_col AS STRING)
+|
+03:EXCHANGE [HASH(year)]
+|
+01:AGGREGATE
+|  group by: year, CAST(timestamp_col AS STRING)
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+====
+# test group_concat distinct with other non-distinct aggregate functions
+ select group_concat(distinct string_col), count(*) from functional.alltypesagg
+---- PLAN
+02:AGGREGATE [FINALIZE]
+|  output: group_concat(string_col), count:merge(*)
+|
+01:AGGREGATE
+|  output: count(*)
+|  group by: string_col
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+---- DISTRIBUTEDPLAN
+06:AGGREGATE [FINALIZE]
+|  output: group_concat:merge(string_col), count:merge(*)
+|
+05:EXCHANGE [UNPARTITIONED]
+|
+02:AGGREGATE
+|  output: group_concat(string_col), count:merge(*)
+|
+04:AGGREGATE
+|  output: count:merge(*)
+|  group by: string_col
+|
+03:EXCHANGE [HASH(string_col)]
+|
+01:AGGREGATE
+|  output: count(*)
+|  group by: string_col
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+====
+# test group_concat distinct with other aggregate functions, with custom separator
+select group_concat(distinct string_col, '-'), sum(int_col), count(distinct string_col)
+from functional.alltypesagg
+---- PLAN
+02:AGGREGATE [FINALIZE]
+|  output: group_concat(string_col, '-'), count(string_col), sum:merge(int_col)
+|
+01:AGGREGATE
+|  output: sum(int_col)
+|  group by: string_col
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+---- DISTRIBUTEDPLAN
+06:AGGREGATE [FINALIZE]
+|  output: group_concat:merge(string_col, '-'), count:merge(string_col), sum:merge(int_col)
+|
+05:EXCHANGE [UNPARTITIONED]
+|
+02:AGGREGATE
+|  output: group_concat(string_col, '-'), count(string_col), sum:merge(int_col)
+|
+04:AGGREGATE
+|  output: sum:merge(int_col)
+|  group by: string_col
+|
+03:EXCHANGE [HASH(string_col)]
+|
+01:AGGREGATE
+|  output: sum(int_col)
+|  group by: string_col
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+====
+# test group_concat distinct with other aggregate functions, with custom separator
+# and a group by
+select month, year, count(*), count(distinct date_string_col),
+group_concat(distinct date_string_col, '-') from functional.alltypesagg
+group by month, year
+---- PLAN
+02:AGGREGATE [FINALIZE]
+|  output: count(date_string_col), group_concat(date_string_col, '-'), count:merge(*)
+|  group by: month, year
+|
+01:AGGREGATE
+|  output: count(*)
+|  group by: month, year, date_string_col
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+---- DISTRIBUTEDPLAN
+05:EXCHANGE [UNPARTITIONED]
+|
+02:AGGREGATE [FINALIZE]
+|  output: count(date_string_col), group_concat(date_string_col, '-'), count:merge(*)
+|  group by: month, year
+|
+04:AGGREGATE
+|  output: count:merge(*)
+|  group by: month, year, date_string_col
+|
+03:EXCHANGE [HASH(month,year)]
+|
+01:AGGREGATE
+|  output: count(*)
+|  group by: month, year, date_string_col
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+====
+# test multiple group_concat distinct, each with a different separator
+select group_concat(distinct string_col), group_concat(distinct string_col, '-'),
+group_concat(distinct string_col, '---')  from functional.alltypesagg
+---- PLAN
+02:AGGREGATE [FINALIZE]
+|  output: group_concat(string_col), group_concat(string_col, '-'), group_concat(string_col, '---')
+|
+01:AGGREGATE
+|  group by: string_col
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+---- DISTRIBUTEDPLAN
+06:AGGREGATE [FINALIZE]
+|  output: group_concat:merge(string_col), group_concat:merge(string_col, '-'), group_concat:merge(string_col, '---')
+|
+05:EXCHANGE [UNPARTITIONED]
+|
+02:AGGREGATE
+|  output: group_concat(string_col), group_concat(string_col, '-'), group_concat(string_col, '---')
+|
+04:AGGREGATE
+|  group by: string_col
+|
+03:EXCHANGE [HASH(string_col)]
+|
+01:AGGREGATE
+|  group by: string_col
+|
+00:SCAN HDFS [functional.alltypesagg]
+   partitions=11/11 files=11 size=814.73KB
+====

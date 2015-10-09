@@ -43,23 +43,18 @@ import com.google.common.collect.Lists;
  * Views defined within the same WITH-clause may not use the same alias.
  */
 public class WithClause implements ParseNode {
+  /////////////////////////////////////////
+  // BEGIN: Members that need to be reset()
+
   private final ArrayList<View> views_;
+
+  // END: Members that need to be reset()
+  /////////////////////////////////////////
 
   public WithClause(ArrayList<View> views) {
     Preconditions.checkNotNull(views);
     Preconditions.checkState(!views.isEmpty());
     views_ = views;
-  }
-
-  /**
-   * Copy c'tor.
-   */
-  public WithClause(WithClause other) {
-    Preconditions.checkNotNull(other);
-    views_ = Lists.newArrayList();
-    for (View view: other.views_) {
-      views_.add(new View(view.getName(), view.getQueryStmt().clone()));
-    }
   }
 
   /**
@@ -74,6 +69,7 @@ public class WithClause implements ParseNode {
     // during analysis of the WITH clause. withClauseAnalyzer is a child of 'analyzer' so
     // that local views registered in parent blocks are visible here.
     Analyzer withClauseAnalyzer = Analyzer.createWithNewGlobalState(analyzer);
+    withClauseAnalyzer.setIsWithClause();
     if (analyzer.isExplain()) withClauseAnalyzer.setIsExplain();
     try {
       for (View view: views_) {
@@ -102,6 +98,22 @@ public class WithClause implements ParseNode {
     }
   }
 
+  /**
+   * C'tor for cloning.
+   */
+  private WithClause(WithClause other) {
+    Preconditions.checkNotNull(other);
+    views_ = Lists.newArrayList();
+    for (View view: other.views_) {
+      views_.add(new View(view.getName(), view.getQueryStmt().clone(),
+          view.getOriginalColLabels()));
+    }
+  }
+
+  public void reset() {
+    for (View view: views_) view.getQueryStmt().reset();
+  }
+
   @Override
   public WithClause clone() { return new WithClause(this); }
 
@@ -109,11 +121,17 @@ public class WithClause implements ParseNode {
   public String toSql() {
     List<String> viewStrings = Lists.newArrayList();
     for (View view: views_) {
-      // Enclose the view alias in quotes if Hive cannot parse it without quotes.
-      // This is needed for view compatibility between Impala and Hive.
+      // Enclose the view alias and explicit labels in quotes if Hive cannot parse it
+      // without quotes. This is needed for view compatibility between Impala and Hive.
       String aliasSql = ToSqlUtils.getIdentSql(view.getName());
+      if (view.hasColLabels()) {
+        aliasSql += "(" + Joiner.on(", ").join(
+            ToSqlUtils.getIdentSqlList(view.getOriginalColLabels())) + ")";
+      }
       viewStrings.add(aliasSql + " AS (" + view.getQueryStmt().toSql() + ")");
     }
     return "WITH " + Joiner.on(",").join(viewStrings);
   }
+
+  public List<View> getViews() { return views_; }
 }

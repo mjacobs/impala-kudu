@@ -40,7 +40,7 @@ class UnionNode : public ExecNode {
   virtual Status Prepare(RuntimeState* state);
   virtual Status Open(RuntimeState* state);
   virtual Status GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos);
-  virtual Status Reset(RuntimeState* state, RowBatch* row_batch);
+  virtual Status Reset(RuntimeState* state);
   virtual void Close(RuntimeState* state);
 
  private:
@@ -56,11 +56,14 @@ class UnionNode : public ExecNode {
   /// Const exprs materialized by this node. These exprs don't refer to any children.
   std::vector<std::vector<ExprContext*> > const_result_expr_ctx_lists_;
 
-  /// Index of current const result expr list.
-  int const_result_expr_idx_;
-
   /// Exprs materialized by this node. The i-th result expr list refers to the i-th child.
   std::vector<std::vector<ExprContext*> > result_expr_ctx_lists_;
+
+  /////////////////////////////////////////
+  /// BEGIN: Members that must be Reset()
+
+  /// Index of current const result expr list.
+  int const_result_expr_idx_;
 
   /// Index of current child.
   int child_idx_;
@@ -69,11 +72,14 @@ class UnionNode : public ExecNode {
   /// when switching to a different child.
   boost::scoped_ptr<RowBatch> child_row_batch_;
 
+  /// Index of current row in child_row_batch_.
+  int child_row_idx_;
+
   /// Saved from the last to GetNext() on the current child.
   bool child_eos_;
 
-  /// Index of current row in child_row_batch_.
-  int child_row_idx_;
+  /// END: Members that must be Reset()
+  /////////////////////////////////////////
 
   /// Opens the child at child_idx_, fetches the first batch into child_row_batch_,
   /// and sets child_row_idx_ to 0. May set child_eos_.
@@ -85,10 +91,9 @@ class UnionNode : public ExecNode {
   /// If const_exprs is true, then the exprs are evaluated exactly once without
   /// fetching rows from child_row_batch_.
   /// Only commits tuples to row_batch if they are not filtered by conjuncts.
-  /// Returns true if row_batch should be returned to caller or limit has been
-  /// reached, false otherwise.
-  bool EvalAndMaterializeExprs( const std::vector<ExprContext*>& ctxs,
-                                bool const_exprs, Tuple** tuple, RowBatch* row_batch);
+  /// Returns an error status if evaluating an expression results in one.
+  Status EvalAndMaterializeExprs(const std::vector<ExprContext*>& ctxs,
+      bool const_exprs, Tuple** tuple, RowBatch* row_batch);
 };
 
 }

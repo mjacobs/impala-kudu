@@ -19,6 +19,8 @@
 #include <string>
 #include <sstream>
 
+#include <thrift/protocol/TDebugProtocol.h>
+
 #include "gen-cpp/JniCatalog_types.h"
 #include "gen-cpp/Descriptors_types.h"
 #include "gen-cpp/Exprs_types.h"
@@ -27,10 +29,14 @@
 #include "gen-cpp/RuntimeProfile_types.h"
 #include "gen-cpp/ImpalaService_types.h"
 #include "gen-cpp/parquet_types.h"
+#include "gen-cpp/Llama_types.h"
+
+#include "runtime/descriptors.h" // for SchemaPath
 
 namespace impala {
 
 class RowDescriptor;
+class TableDescriptor;
 class TupleDescriptor;
 class Tuple;
 class TupleRow;
@@ -63,7 +69,15 @@ std::string PrintEncoding(const parquet::Encoding::type& type);
 std::string PrintAsHex(const char* bytes, int64_t len);
 std::string PrintTMetricKind(const TMetricKind::type& type);
 std::string PrintTUnit(const TUnit::type& type);
-std::string PrintPath(const std::vector<int>& path);
+/// Returns the fully qualified path, e.g. "database.table.array_col.item.field"
+std::string PrintPath(const TableDescriptor& tbl_desc, const SchemaPath& path);
+/// Returns the numeric path without column/field names, e.g. "[0,1,2]"
+std::string PrintNumericPath(const SchemaPath& path);
+
+// Convenience wrapper around Thrift's debug string function
+template<typename ThriftStruct> std::string PrintThrift(const ThriftStruct& t) {
+  return apache::thrift::ThriftDebugString(t);
+}
 
 /// Parse 's' into a TUniqueId object.  The format of s needs to be the output format
 /// from PrintId.  (<hi_part>:<low_part>)

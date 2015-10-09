@@ -61,15 +61,15 @@ static const int64_t BLOCK_MGR_MEM_MIN_REMAINING = 100 * 1024 * 1024;
 
 namespace impala {
 
-RuntimeState::RuntimeState(const TPlanFragmentInstanceCtx& fragment_instance_ctx,
+RuntimeState::RuntimeState(const TExecPlanFragmentParams& fragment_params,
     const string& cgroup, ExecEnv* exec_env)
   : obj_pool_(new ObjectPool()),
-    fragment_instance_ctx_(fragment_instance_ctx),
-    now_(new TimestampValue(fragment_instance_ctx_.query_ctx.now_string.c_str(),
-        fragment_instance_ctx_.query_ctx.now_string.size())),
+    fragment_params_(fragment_params),
+    now_(new TimestampValue(fragment_ctx().query_ctx.now_string.c_str(),
+        fragment_ctx().query_ctx.now_string.size())),
     cgroup_(cgroup),
     profile_(obj_pool_.get(),
-        "Fragment " + PrintId(fragment_instance_ctx_.fragment_instance_id)),
+        "Fragment " + PrintId(fragment_ctx().fragment_instance_id)),
     is_cancelled_(false),
     query_resource_mgr_(NULL),
     root_node_id_(-1) {
@@ -86,9 +86,9 @@ RuntimeState::RuntimeState(const TQueryCtx& query_ctx)
     is_cancelled_(false),
     query_resource_mgr_(NULL),
     root_node_id_(-1) {
-  fragment_instance_ctx_.__set_query_ctx(query_ctx);
-  fragment_instance_ctx_.query_ctx.request.query_options.__set_batch_size(
-      DEFAULT_BATCH_SIZE);
+  fragment_params_.fragment_instance_ctx.__set_query_ctx(query_ctx);
+  fragment_params_.fragment_instance_ctx.query_ctx.request.query_options
+      .__set_batch_size(DEFAULT_BATCH_SIZE);
 }
 
 RuntimeState::~RuntimeState() {
@@ -121,7 +121,7 @@ Status RuntimeState::Init(ExecEnv* exec_env) {
   SCOPED_TIMER(profile_.total_time_counter());
   exec_env_ = exec_env;
   TQueryOptions& query_options =
-      fragment_instance_ctx_.query_ctx.request.query_options;
+      fragment_params_.fragment_instance_ctx.query_ctx.request.query_options;
 
   // max_errors does not indicate how many errors in total have been recorded, but rather
   // how many are distinct. It is defined as the sum of the number of generic errors and
@@ -175,13 +175,13 @@ Status RuntimeState::CreateBlockMgr() {
   if (query_options().__isset.max_block_mgr_memory &&
       query_options().max_block_mgr_memory > 0) {
     block_mgr_limit = query_options().max_block_mgr_memory;
-    LOG(ERROR) << "Block mgr mem limit: "
-               << PrettyPrinter::Print(block_mgr_limit, TUnit::BYTES);
+    LOG(WARNING) << "Block mgr mem limit: "
+                 << PrettyPrinter::Print(block_mgr_limit, TUnit::BYTES);
   }
 
   RETURN_IF_ERROR(BufferedBlockMgr::Create(this, query_mem_tracker(),
-      runtime_profile(), block_mgr_limit, io_mgr()->max_read_buffer_size(),
-      &block_mgr_));
+      runtime_profile(), exec_env()->tmp_file_mgr(), block_mgr_limit,
+      io_mgr()->max_read_buffer_size(), &block_mgr_));
   return Status::OK();
 }
 
@@ -221,11 +221,12 @@ void RuntimeState::ReportFileErrors(const std::string& file_name, int num_errors
   file_errors_.push_back(make_pair(file_name, num_errors));
 }
 
-bool RuntimeState::LogError(const ErrorMsg& message) {
+bool RuntimeState::LogError(const ErrorMsg& message, int vlog_level) {
   lock_guard<SpinLock> l(error_log_lock_);
-  // All errors go to the log, unreported_error_count_ is counted independently of the size of the
-  // error_log to account for errors that were already reported to the coordninator
-  VLOG_QUERY << "Error from query " << query_id() << ": " << message.msg();
+  // All errors go to the log, unreported_error_count_ is counted independently of the
+  // size of the error_log to account for errors that were already reported to the
+  // coordninator
+  VLOG(vlog_level) << "Error from query " << query_id() << ": " << message.msg();
   if (ErrorCount(error_log_) < query_options().max_errors) {
     AppendError(&error_log_, message);
     return true;
@@ -245,12 +246,13 @@ void RuntimeState::GetUnreportedErrors(ErrorLogMap* new_errors) {
 }
 
 Status RuntimeState::SetMemLimitExceeded(MemTracker* tracker,
-    int64_t failed_allocation_size) {
+    int64_t failed_allocation_size, const ErrorMsg* msg) {
   DCHECK_GE(failed_allocation_size, 0);
   {
     lock_guard<SpinLock> l(query_status_lock_);
     if (query_status_.ok()) {
-      query_status_ = Status::MEM_LIMIT_EXCEEDED;
+      query_status_ = Status::MemLimitExceeded();
+      if (msg != NULL) query_status_.MergeStatus(*msg);
     } else {
       return query_status_;
     }
@@ -260,7 +262,7 @@ Status RuntimeState::SetMemLimitExceeded(MemTracker* tracker,
   stringstream ss;
   ss << "Memory Limit Exceeded\n";
   if (failed_allocation_size != 0) {
-    DCHECK_NOTNULL(tracker);
+    DCHECK(tracker != NULL);
     ss << "  " << tracker->label() << " could not allocate "
        << PrettyPrinter::Print(failed_allocation_size, TUnit::BYTES)
        << " without exceeding limit." << endl;
@@ -298,7 +300,7 @@ void RuntimeState::AddBitmapFilter(SlotId slot, Bitmap* bitmap,
     lock_guard<SpinLock> l(bitmap_lock_);
     if (slot_bitmap_filters_.find(slot) != slot_bitmap_filters_.end()) {
       Bitmap* existing_bitmap = slot_bitmap_filters_[slot];
-      DCHECK_NOTNULL(existing_bitmap);
+      DCHECK(existing_bitmap != NULL);
       existing_bitmap->And(bitmap);
     } else {
       // This is the first time we set the slot_bitmap_filters_[slot]. We avoid

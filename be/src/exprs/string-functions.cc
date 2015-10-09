@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <re2/re2.h>
 #include <re2/stringpiece.h>
+#include <bitset>
 
 #include "exprs/anyval-util.h"
 #include "exprs/expr.h"
@@ -28,6 +29,7 @@
 #include "common/names.h"
 
 using namespace impala_udf;
+using std::bitset;
 
 // NOTE: be careful not to use string::append.  It is not performant.
 namespace impala {
@@ -83,6 +85,7 @@ StringVal StringFunctions::Repeat(
   if (str.is_null || n.is_null) return StringVal::null();
   if (str.len == 0 || n.val <= 0) return StringVal();
   StringVal result(context, str.len * n.val);
+  if (UNLIKELY(result.is_null)) return result;
   uint8_t* ptr = result.ptr;
   for (int64_t i = 0; i < n.val; ++i) {
     memcpy(ptr, str.ptr, str.len);
@@ -100,6 +103,7 @@ StringVal StringFunctions::Lpad(FunctionContext* context, const StringVal& str,
   if (len.val <= str.len || pad.len == 0) return StringVal(str.ptr, len.val);
 
   StringVal result(context, len.val);
+  if (result.is_null) return result;
   int padded_prefix_len = len.val - str.len;
   int pad_index = 0;
   int result_index = 0;
@@ -127,6 +131,7 @@ StringVal StringFunctions::Rpad(FunctionContext* context, const StringVal& str,
   }
 
   StringVal result(context, len.val);
+  if (UNLIKELY(result.is_null)) return result;
   memcpy(result.ptr, str.ptr, str.len);
 
   // Append chars of pad until desired length
@@ -155,6 +160,7 @@ IntVal StringFunctions::CharLength(FunctionContext* context, const StringVal& st
 StringVal StringFunctions::Lower(FunctionContext* context, const StringVal& str) {
   if (str.is_null) return StringVal::null();
   StringVal result(context, str.len);
+  if (UNLIKELY(result.is_null)) return result;
   for (int i = 0; i < str.len; ++i) {
     result.ptr[i] = ::tolower(str.ptr[i]);
   }
@@ -164,6 +170,7 @@ StringVal StringFunctions::Lower(FunctionContext* context, const StringVal& str)
 StringVal StringFunctions::Upper(FunctionContext* context, const StringVal& str) {
   if (str.is_null) return StringVal::null();
   StringVal result(context, str.len);
+  if (UNLIKELY(result.is_null)) return result;
   for (int i = 0; i < str.len; ++i) {
     result.ptr[i] = ::toupper(str.ptr[i]);
   }
@@ -177,6 +184,7 @@ StringVal StringFunctions::Upper(FunctionContext* context, const StringVal& str)
 StringVal StringFunctions::InitCap(FunctionContext* context, const StringVal& str) {
   if (str.is_null) return StringVal::null();
   StringVal result(context, str.len);
+  if (UNLIKELY(result.is_null)) return result;
   uint8_t* result_ptr = result.ptr;
   bool word_start = true;
   for (int i = 0; i < str.len; ++i) {
@@ -194,6 +202,7 @@ StringVal StringFunctions::InitCap(FunctionContext* context, const StringVal& st
 StringVal StringFunctions::Reverse(FunctionContext* context, const StringVal& str) {
   if (str.is_null) return StringVal::null();
   StringVal result(context, str.len);
+  if (UNLIKELY(result.is_null)) return result;
   std::reverse_copy(str.ptr, str.ptr + str.len, result.ptr);
   return result;
 }
@@ -202,6 +211,7 @@ StringVal StringFunctions::Translate(FunctionContext* context, const StringVal& 
     const StringVal& src, const StringVal& dst) {
   if (str.is_null || src.is_null || dst.is_null) return StringVal::null();
   StringVal result(context, str.len);
+  if (UNLIKELY(result.is_null)) return result;
 
   // TODO: if we know src and dst are constant, we can prebuild a conversion
   // table to remove the inner loop.
@@ -558,6 +568,106 @@ StringVal StringFunctions::ParseUrlKey(FunctionContext* ctx, const StringVal& ur
   StringVal result_sv;
   result.ToStringVal(&result_sv);
   return result_sv;
+}
+
+StringVal StringFunctions::Chr(FunctionContext* ctx, const IntVal& val) {
+  if (val.is_null) return StringVal::null();
+  if (val.val < 0 || val.val > 255) return "";
+  char c = static_cast<char>(val.val);
+  return AnyValUtil::FromBuffer(ctx, &c, 1);
+}
+
+void StringFunctions::BTrimPrepare(
+    FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope != FunctionContext::THREAD_LOCAL) return;
+  // Create a bitset to hold the unique characters to trim.
+  bitset<256>* unique_chars = new bitset<256>();
+  context->SetFunctionState(scope, unique_chars);
+  if (!context->IsArgConstant(1)) return;
+  DCHECK_EQ(context->GetArgType(1)->type, FunctionContext::TYPE_STRING);
+  StringVal* chars_to_trim = reinterpret_cast<StringVal*>(context->GetConstantArg(1));
+  for (int32_t i = 0; i < chars_to_trim->len; ++i) {
+    unique_chars->set(static_cast<int>(chars_to_trim->ptr[i]), true);
+  }
+}
+
+void StringFunctions::BTrimClose(
+    FunctionContext* context, FunctionContext::FunctionStateScope scope) {
+  if (scope != FunctionContext::THREAD_LOCAL) return;
+  bitset<256>* unique_chars = reinterpret_cast<bitset<256>*>(
+      context->GetFunctionState(scope));
+  if (unique_chars != NULL) delete unique_chars;
+}
+
+StringVal StringFunctions::BTrimString(FunctionContext* ctx,
+    const StringVal& str, const StringVal& chars_to_trim) {
+  if (str.is_null) return StringVal::null();
+  bitset<256>* unique_chars = reinterpret_cast<bitset<256>*>(
+      ctx->GetFunctionState(FunctionContext::THREAD_LOCAL));
+  // When 'chars_to_trim' is unique for each element (e.g. when 'chars_to_trim'
+  // is each element of a table column), we need to prepare a bitset of unique
+  // characters here instead of using the bitset from function context.
+  if (!ctx->IsArgConstant(1)) {
+    unique_chars->reset();
+    for (int32_t i = 0; i < chars_to_trim.len; ++i) {
+      unique_chars->set(static_cast<int>(chars_to_trim.ptr[i]), true);
+    }
+  }
+  // Find new starting position.
+  int32_t begin = 0;
+  while (begin < str.len &&
+      unique_chars->test(static_cast<int>(str.ptr[begin]))) {
+    ++begin;
+  }
+  // Find new ending position.
+  int32_t end = str.len - 1;
+  while (end > begin && unique_chars->test(static_cast<int>(str.ptr[end]))) {
+    --end;
+  }
+  return StringVal(str.ptr + begin, end - begin + 1);
+}
+
+// Similar to strstr() except that the strings are not null-terminated
+static char* locate_substring(char* haystack, int hay_len, char* needle, int needle_len) {
+  DCHECK_GT(needle_len, 0);
+  for (int i = 0; i < hay_len - needle_len + 1; ++i) {
+    char* possible_needle = haystack + i;
+    if (strncmp(possible_needle, needle, needle_len) == 0) return possible_needle;
+  }
+  return NULL;
+}
+
+StringVal StringFunctions::SplitPart(FunctionContext* context,
+    const StringVal& str, const StringVal& delim, const BigIntVal& field) {
+  if (str.is_null || delim.is_null || field.is_null) return StringVal::null();
+  int field_pos = field.val;
+  if (field_pos <= 0) {
+    stringstream ss;
+    ss << "Invalid field position: " << field.val;
+    context->SetError(ss.str().c_str());
+    return StringVal::null();
+  }
+  if (delim.len == 0) return str;
+  char* str_start = reinterpret_cast<char*>(str.ptr);
+  char* str_part = str_start;
+  char* delimiter = reinterpret_cast<char*>(delim.ptr);
+  for (int cur_pos = 1; ; ++cur_pos) {
+    int remaining_len = str.len - (str_part - str_start);
+    char* delim_ref = locate_substring(str_part, remaining_len, delimiter, delim.len);
+    if (delim_ref == NULL) {
+      if (cur_pos == field_pos) {
+        return StringVal(reinterpret_cast<uint8_t*>(str_part), remaining_len);
+      }
+      // Return empty string if required field position is not found.
+      return StringVal();
+    }
+    if (cur_pos == field_pos) {
+      return StringVal(reinterpret_cast<uint8_t*>(str_part),
+          delim_ref - str_part);
+    }
+    str_part = delim_ref + delim.len;
+  }
+  return StringVal();
 }
 
 }

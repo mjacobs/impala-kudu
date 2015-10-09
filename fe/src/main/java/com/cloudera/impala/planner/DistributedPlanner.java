@@ -29,7 +29,6 @@ import com.cloudera.impala.analysis.JoinOperator;
 import com.cloudera.impala.analysis.QueryStmt;
 import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.common.InternalException;
-import com.cloudera.impala.common.NotImplementedException;
 import com.cloudera.impala.planner.JoinNode.DistributionMode;
 import com.cloudera.impala.thrift.TPartitionType;
 import com.google.common.base.Preconditions;
@@ -95,13 +94,15 @@ public class DistributedPlanner {
   private PlanFragment createPlanFragments(
       PlanNode root, boolean isPartitioned,
       long perNodeMemLimit, ArrayList<PlanFragment> fragments)
-      throws InternalException, NotImplementedException {
+      throws ImpalaException {
     ArrayList<PlanFragment> childFragments = Lists.newArrayList();
     for (PlanNode child: root.getChildren()) {
       // allow child fragments to be partitioned, unless they contain a limit clause
       // (the result set with the limit constraint needs to be computed centrally);
       // merge later if needed
       boolean childIsPartitioned = !child.hasLimit();
+      // Do not fragment the subplan of a SubplanNode since it is executed locally.
+      if (root instanceof SubplanNode && child == root.getChild(1)) continue;
       childFragments.add(
           createPlanFragments(
             child, childIsPartitioned, perNodeMemLimit, fragments));
@@ -116,11 +117,14 @@ public class DistributedPlanner {
       result = createHashJoinFragment(
           (HashJoinNode) root, childFragments.get(1), childFragments.get(0),
           perNodeMemLimit, fragments);
-    } else if (root instanceof CrossJoinNode) {
+    } else if (root instanceof NestedLoopJoinNode) {
       Preconditions.checkState(childFragments.size() == 2);
-      result = createCrossJoinFragment(
-          (CrossJoinNode) root, childFragments.get(1), childFragments.get(0),
+      result = createNestedLoopJoinFragment(
+          (NestedLoopJoinNode) root, childFragments.get(1), childFragments.get(0),
           perNodeMemLimit, fragments);
+    } else if (root instanceof SubplanNode) {
+      Preconditions.checkState(childFragments.size() == 1);
+      result = createSubplanNodeFragment((SubplanNode) root, childFragments.get(0));
     } else if (root instanceof SelectNode) {
       result = createSelectNodeFragment((SelectNode) root, childFragments);
     } else if (root instanceof UnionNode) {
@@ -132,7 +136,7 @@ public class DistributedPlanner {
       if (((SortNode) root).isAnalyticSort()) {
         // don't parallelize this like a regular SortNode
         result = createAnalyticFragment(
-            (SortNode) root, childFragments.get(0), fragments);
+            root, childFragments.get(0), fragments);
       } else {
         result = createOrderByFragment(
             (SortNode) root, childFragments.get(0), fragments);
@@ -183,7 +187,7 @@ public class DistributedPlanner {
   public PlanFragment createInsertFragment(
       PlanFragment inputFragment, InsertStmt insertStmt, Analyzer analyzer,
       ArrayList<PlanFragment> fragments)
-      throws InternalException {
+      throws ImpalaException {
     List<Expr> partitionExprs = insertStmt.getPartitionKeyExprs();
     Boolean partitionHint = insertStmt.isRepartition();
     if (partitionExprs.isEmpty()) return inputFragment;
@@ -245,7 +249,7 @@ public class DistributedPlanner {
    * Requires that input fragment be partitioned.
    */
   private PlanFragment createMergeFragment(PlanFragment inputFragment)
-      throws InternalException {
+      throws ImpalaException {
     Preconditions.checkState(inputFragment.isPartitioned());
     ExchangeNode mergePlan = new ExchangeNode(ctx_.getNextNodeId());
     mergePlan.addChild(inputFragment.getPlanRoot(), false);
@@ -268,14 +272,25 @@ public class DistributedPlanner {
   }
 
   /**
+   * Adds the SubplanNode as the new plan root to the child fragment and returns
+   * the child fragment.
+   */
+  private PlanFragment createSubplanNodeFragment(SubplanNode node,
+      PlanFragment childFragment) {
+    node.setChild(0, childFragment.getPlanRoot());
+    childFragment.setPlanRoot(node);
+    return childFragment;
+  }
+
+  /**
    * Modifies the leftChildFragment to execute a cross join. The right child input is
    * provided by an ExchangeNode, which is the destination of the rightChildFragment's
    * output.
    */
-  private PlanFragment createCrossJoinFragment(CrossJoinNode node,
+  private PlanFragment createNestedLoopJoinFragment(NestedLoopJoinNode node,
       PlanFragment rightChildFragment, PlanFragment leftChildFragment,
       long perNodeMemLimit, ArrayList<PlanFragment> fragments)
-      throws InternalException {
+      throws ImpalaException {
     node.setDistributionMode(DistributionMode.BROADCAST);
     node.setChild(0, leftChildFragment.getPlanRoot());
     connectChildFragment(node, 1, rightChildFragment);
@@ -298,7 +313,7 @@ public class DistributedPlanner {
       HashJoinNode node, PlanFragment rightChildFragment,
       PlanFragment leftChildFragment, long perNodeMemLimit,
       ArrayList<PlanFragment> fragments)
-      throws InternalException {
+      throws ImpalaException {
     // broadcast: send the rightChildFragment's output to each node executing
     // the leftChildFragment; the cost across all nodes is proportional to the
     // total amount of data sent
@@ -364,7 +379,7 @@ public class DistributedPlanner {
         && node.getJoinOp() != JoinOperator.RIGHT_SEMI_JOIN
         && node.getJoinOp() != JoinOperator.RIGHT_ANTI_JOIN
         && (perNodeMemLimit == 0
-            || Math.round((double) rhsDataSize * PlannerContext.HASH_TBL_SPACE_OVERHEAD)
+            || Math.round(rhsDataSize * PlannerContext.HASH_TBL_SPACE_OVERHEAD)
                 <= perNodeMemLimit)
         && (node.getDistributionModeHint() == DistributionMode.BROADCAST
             || (node.getDistributionModeHint() != DistributionMode.PARTITIONED
@@ -568,7 +583,7 @@ public class DistributedPlanner {
    */
   private PlanFragment createUnionNodeFragment(UnionNode unionNode,
       ArrayList<PlanFragment> childFragments, ArrayList<PlanFragment> fragments)
-      throws InternalException {
+      throws ImpalaException {
     Preconditions.checkState(unionNode.getChildren().size() == childFragments.size());
 
     // A UnionNode could have no children or constant selects if all of its operands
@@ -641,7 +656,7 @@ public class DistributedPlanner {
    * input from childFragment.
    */
   private void connectChildFragment(PlanNode node, int childIdx,
-      PlanFragment childFragment) throws InternalException {
+      PlanFragment childFragment) throws ImpalaException {
     ExchangeNode exchangeNode = new ExchangeNode(ctx_.getNextNodeId());
     exchangeNode.addChild(childFragment.getPlanRoot(), false);
     exchangeNode.init(ctx_.getRootAnalyzer());
@@ -661,7 +676,7 @@ public class DistributedPlanner {
    */
   private PlanFragment createParentFragment(
       PlanFragment childFragment, DataPartition parentPartition)
-      throws InternalException {
+      throws ImpalaException {
     ExchangeNode exchangeNode = new ExchangeNode(ctx_.getNextNodeId());
     exchangeNode.addChild(childFragment.getPlanRoot(), false);
     exchangeNode.init(ctx_.getRootAnalyzer());
@@ -683,7 +698,7 @@ public class DistributedPlanner {
    */
   private PlanFragment createAggregationFragment(AggregationNode node,
       PlanFragment childFragment, ArrayList<PlanFragment> fragments)
-      throws InternalException {
+      throws ImpalaException {
     if (!childFragment.isPartitioned()) {
       // nothing to distribute; do full aggregation directly within childFragment
       childFragment.addPlanRoot(node);
@@ -813,8 +828,7 @@ public class DistributedPlanner {
       node.unsetLimit();
       mergeFragment = createParentFragment(mergeFragment, DataPartition.UNPARTITIONED);
       mergeAggInfo = node.getAggInfo().getMergeAggInfo();
-      mergeAggNode =
-          new AggregationNode(ctx_.getNextNodeId(), node.getChild(0), mergeAggInfo);
+      mergeAggNode = new AggregationNode(ctx_.getNextNodeId(), node, mergeAggInfo);
       mergeAggNode.init(ctx_.getRootAnalyzer());
       // Transfer having predicates. If hasGrouping == true, the predicates should
       // instead be evaluated by the 2nd phase agg (the predicates are already there).
@@ -834,7 +848,7 @@ public class DistributedPlanner {
    */
   private PlanFragment createAnalyticFragment(PlanNode node,
       PlanFragment childFragment, ArrayList<PlanFragment> fragments)
-      throws InternalException {
+      throws ImpalaException {
     Preconditions.checkState(
         node instanceof SortNode || node instanceof AnalyticEvalNode);
     if (node instanceof AnalyticEvalNode) {
@@ -880,7 +894,7 @@ public class DistributedPlanner {
    */
   private PlanFragment createOrderByFragment(SortNode node,
       PlanFragment childFragment, ArrayList<PlanFragment> fragments)
-      throws InternalException {
+      throws ImpalaException {
     node.setChild(0, childFragment.getPlanRoot());
     childFragment.addPlanRoot(node);
     if (!childFragment.isPartitioned()) return childFragment;

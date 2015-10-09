@@ -37,7 +37,6 @@ enum TDdlType {
   COMPUTE_STATS,
   DROP_DATABASE,
   DROP_TABLE,
-  TRUNCATE_TABLE,
   DROP_VIEW,
   DROP_FUNCTION,
   CREATE_DATA_SOURCE,
@@ -49,6 +48,7 @@ enum TDdlType {
   REVOKE_ROLE,
   GRANT_PRIVILEGE,
   REVOKE_PRIVILEGE,
+  TRUNCATE_TABLE,
 }
 
 // Types of ALTER TABLE commands supported.
@@ -66,6 +66,7 @@ enum TAlterTableType {
   // Used internally by the COMPUTE STATS DDL command.
   UPDATE_STATS,
   SET_CACHED,
+  RECOVER_PARTITIONS,
 }
 
 // Parameters of CREATE DATABASE commands
@@ -513,7 +514,8 @@ struct TGrantRevokeRoleParams {
 
 // Parameters for GRANT/REVOKE privilege TO/FROM role.
 struct TGrantRevokePrivParams {
-  // List of privileges being granted or revoked.
+  // List of privileges being granted or revoked. The 'has_grant_opt' for each
+  // TPrivilege is inherited from the 'has_grant_opt' of this object.
   1: required list<CatalogObjects.TPrivilege> privileges
 
   // The role name this change should apply to.
@@ -521,6 +523,9 @@ struct TGrantRevokePrivParams {
 
   // True if this is a GRANT statement false if this is a REVOKE statement.
   3: required bool is_grant
+
+  // True if WITH GRANT OPTION is set.
+  4: required bool has_grant_opt
 }
 
 // Parameters of DROP DATABASE commands
@@ -530,6 +535,9 @@ struct TDropDbParams {
 
   // If true, no error is raised if the target db does not exist
   2: required bool if_exists
+
+  // If true, drops all tables of the database
+  3: required bool cascade
 }
 
 // Parameters of DROP TABLE/VIEW commands

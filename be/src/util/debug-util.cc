@@ -19,12 +19,14 @@
 #include <boost/foreach.hpp>
 
 #include "common/version.h"
+#include "runtime/array-value.h"
 #include "runtime/descriptors.h"
 #include "runtime/raw-value.h"
 #include "runtime/tuple-row.h"
 #include "runtime/row-batch.h"
 #include "util/cpu-info.h"
 #include "util/string-parser.h"
+#include "util/uid-util.h"
 
 // / WARNING this uses a private API of GLog: DumpStackTraceToString().
 namespace google {
@@ -178,6 +180,17 @@ string PrintTuple(const Tuple* t, const TupleDescriptor& d) {
     }
     if (t->IsNull(slot_d->null_indicator_offset())) {
       out << "null";
+    } else if (slot_d->type().IsCollectionType()) {
+      const TupleDescriptor* item_d = slot_d->collection_item_descriptor();
+      const ArrayValue* array_value =
+          reinterpret_cast<const ArrayValue*>(t->GetSlot(slot_d->tuple_offset()));
+      uint8_t* array_buf = array_value->ptr;
+      out << "[";
+      for (int j = 0; j < array_value->num_tuples; ++j) {
+        out << PrintTuple(reinterpret_cast<Tuple*>(array_buf), *item_d);
+        array_buf += item_d->byte_size();
+      }
+      out << "]";
     } else {
       string value_str;
       RawValue::PrintValue(
@@ -208,7 +221,54 @@ string PrintBatch(RowBatch* batch) {
   return out.str();
 }
 
-string PrintPath(const vector<int>& path) {
+string PrintPath(const TableDescriptor& tbl_desc, const SchemaPath& path) {
+  stringstream ss;
+  ss << tbl_desc.database() << "." << tbl_desc.name();
+  const ColumnType* type = NULL;
+  if (path.size() > 0) {
+    ss << "." << tbl_desc.col_descs()[path[0]].name();
+    type = &tbl_desc.col_descs()[path[0]].type();
+  }
+  for (int i = 1; i < path.size(); ++i) {
+    ss << ".";
+    switch (type->type) {
+      case TYPE_ARRAY:
+        if (path[i] == 0) {
+          ss << "item";
+          type = &type->children[0];
+        } else {
+          DCHECK_EQ(path[i], 1);
+          ss << "pos";
+          type = NULL;
+        }
+        break;
+      case TYPE_MAP:
+        if (path[i] == 0) {
+          ss << "key";
+          type = &type->children[0];
+        } else if (path[i] == 1) {
+          ss << "value";
+          type = &type->children[1];
+        } else {
+          DCHECK_EQ(path[i], 2);
+          ss << "pos";
+          type = NULL;
+        }
+        break;
+      case TYPE_STRUCT:
+        DCHECK_LT(path[i], type->children.size());
+        ss << type->field_names[path[i]];
+        type = &type->children[path[i]];
+        break;
+      default:
+        DCHECK(false) << PrintNumericPath(path) << " " << i << " " << type->DebugString();
+        return PrintNumericPath(path);
+    }
+  }
+  return ss.str();
+}
+
+string PrintNumericPath(const SchemaPath& path) {
   stringstream ss;
   ss << "[";
   if (path.size() > 0) ss << path[0];

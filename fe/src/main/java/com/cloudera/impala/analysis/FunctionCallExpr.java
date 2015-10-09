@@ -75,10 +75,11 @@ public class FunctionCallExpr extends Expr {
    */
   public static Expr createExpr(FunctionName fnName, FunctionParams params) {
     FunctionCallExpr functionCallExpr = new FunctionCallExpr(fnName, params);
-    if (fnName.getFnNamePath().get(0).equals("decode")
-        && (fnName.getDb() == null) || Catalog.BUILTINS_DB.equals(fnName.getDb())) {
-      // If someone created the DECODE function before it became a builtin, they can
-      // continue to use it by the fully qualified name.
+    if (fnName.getFnNamePath().size() == 1
+            && fnName.getFnNamePath().get(0).equalsIgnoreCase("decode")
+        || fnName.getFnNamePath().size() == 2
+            && fnName.getFnNamePath().get(0).equalsIgnoreCase(Catalog.BUILTINS_DB)
+            && fnName.getFnNamePath().get(1).equalsIgnoreCase("decode")) {
       return new CaseExpr(functionCallExpr);
     }
     return functionCallExpr;
@@ -292,13 +293,16 @@ public class FunctionCallExpr extends Expr {
     int digitsAfter = childType.decimalScale();
     if (fnName_.getFunction().equalsIgnoreCase("ceil") ||
                fnName_.getFunction().equalsIgnoreCase("ceiling") ||
-               fnName_.getFunction().equals("floor")) {
+               fnName_.getFunction().equals("floor") ||
+               fnName_.getFunction().equals("dfloor")) {
       // These functions just return with scale 0 but can trigger rounding. We need
       // to increase the precision by 1 to handle that.
       ++digitsBefore;
       digitsAfter = 0;
     } else if (fnName_.getFunction().equalsIgnoreCase("truncate") ||
-               fnName_.getFunction().equalsIgnoreCase("round")) {
+               fnName_.getFunction().equalsIgnoreCase("dtrunc") ||
+               fnName_.getFunction().equalsIgnoreCase("round") ||
+               fnName_.getFunction().equalsIgnoreCase("dround")) {
       if (children_.size() > 1) {
         // The second argument to these functions is the desired scale, otherwise
         // the default is 0.
@@ -333,7 +337,8 @@ public class FunctionCallExpr extends Expr {
         digitsAfter = 0;
       }
 
-      if (fnName_.getFunction().equalsIgnoreCase("round") &&
+      if ((fnName_.getFunction().equalsIgnoreCase("round") ||
+           fnName_.getFunction().equalsIgnoreCase("dround")) &&
           digitsAfter < childType.decimalScale()) {
         // If we are rounding to fewer decimal places, it's possible we need another
         // digit before the decimal.
@@ -377,7 +382,7 @@ public class FunctionCallExpr extends Expr {
       // TODO: fix how we rewrite count distinct.
       argTypes = new Type[0];
       Function searchDesc = new Function(fnName_, argTypes, Type.INVALID, false);
-      fn_ = db.getFunction(searchDesc, Function.CompareMode.IS_SUPERTYPE_OF);
+      fn_ = db.getFunction(searchDesc, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
       type_ = fn_.getReturnType();
       // Make sure BE doesn't see any TYPE_NULL exprs
       for (int i = 0; i < children_.size(); ++i) {
@@ -400,8 +405,7 @@ public class FunctionCallExpr extends Expr {
     }
 
     Function searchDesc = new Function(fnName_, argTypes, Type.INVALID, false);
-    fn_ = db.getFunction(searchDesc, Function.CompareMode.IS_SUPERTYPE_OF);
-
+    fn_ = db.getFunction(searchDesc, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
     if (fn_ == null || (!isInternalFnCall_ && !fn_.userVisible())) {
       throw new AnalysisException(getFunctionNotFoundError(argTypes));
     }
@@ -430,8 +434,13 @@ public class FunctionCallExpr extends Expr {
 
       // TODO: the distinct rewrite does not handle this but why?
       if (params_.isDistinct()) {
-        if (fnName_.getFunction().equalsIgnoreCase("group_concat")) {
-          throw new AnalysisException("GROUP_CONCAT() does not support DISTINCT.");
+        // The second argument in group_concat(distinct) must be a constant expr that
+        // returns a string.
+        if (fnName_.getFunction().equalsIgnoreCase("group_concat")
+            && getChildren().size() == 2
+            && !getChild(1).isConstant()) {
+            throw new AnalysisException("Second parameter in GROUP_CONCAT(DISTINCT)" +
+                " must be a constant expression that returns a string.");
         }
         if (fn_.getBinaryType() != TFunctionBinaryType.BUILTIN) {
           throw new AnalysisException("User defined aggregates do not support DISTINCT.");

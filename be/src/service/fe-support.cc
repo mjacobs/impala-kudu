@@ -106,21 +106,35 @@ Java_com_cloudera_impala_service_FeSupport_NativeEvalConstExprs(
     // Finalize the module so any UDF functions are jit'd
     LlvmCodeGen* codegen = NULL;
     state.GetCodegen(&codegen, /* initialize */ false);
-    DCHECK_NOTNULL(codegen);
+    DCHECK(codegen != NULL);
     codegen->EnableOptimizations(false);
     codegen->FinalizeModule();
   }
 
   vector<TColumnValue> results;
-  // Open and evaluate the exprs
+  // Open and evaluate the exprs. Also, always Close() the exprs even in case of errors.
   for (int i = 0; i < expr_ctxs.size(); ++i) {
+    Status open_status = expr_ctxs[i]->Open(&state);
+    if (!open_status.ok()) {
+      expr_ctxs[i]->Close(&state);
+      (env)->ThrowNew(JniUtil::internal_exc_class(), open_status.GetDetail().c_str());
+      return result_bytes;
+    }
     TColumnValue val;
-    THROW_IF_ERROR_RET(expr_ctxs[i]->Open(&state), env,
-                       JniUtil::internal_exc_class(), result_bytes);
     expr_ctxs[i]->GetValue(NULL, false, &val);
+    // We check here if an error was set in the expression evaluated through GetValue()
+    // and throw an exception accordingly
+    Status getvalue_status = expr_ctxs[i]->root()->GetFnContextError(expr_ctxs[i]);
+    if (!getvalue_status.ok()) {
+      expr_ctxs[i]->Close(&state);
+      (env)->ThrowNew(JniUtil::internal_exc_class(), getvalue_status.GetDetail().c_str());
+      return result_bytes;
+    }
+
     expr_ctxs[i]->Close(&state);
     results.push_back(val);
   }
+
   expr_results.__set_colVals(results);
   THROW_IF_ERROR_RET(SerializeThriftMsg(env, &expr_results, &result_bytes), env,
                      JniUtil::internal_exc_class(), result_bytes);
@@ -186,7 +200,7 @@ static void ResolveSymbolLookup(const TSymbolLookupParams params,
 
   string symbol = params.symbol;
   ColumnType ret_type(INVALID_TYPE);
-  if (params.__isset.ret_arg_type) ret_type = ColumnType(params.ret_arg_type);
+  if (params.__isset.ret_arg_type) ret_type = ColumnType::FromThrift(params.ret_arg_type);
 
   // Mangle the user input
   DCHECK_NE(params.fn_binary_type, TFunctionBinaryType::HIVE);
@@ -262,7 +276,7 @@ Java_com_cloudera_impala_service_FeSupport_NativeLookupSymbol(
 
   vector<ColumnType> arg_types;
   for (int i = 0; i < lookup.arg_types.size(); ++i) {
-    arg_types.push_back(ColumnType(lookup.arg_types[i]));
+    arg_types.push_back(ColumnType::FromThrift(lookup.arg_types[i]));
   }
 
   TSymbolLookupResult result;

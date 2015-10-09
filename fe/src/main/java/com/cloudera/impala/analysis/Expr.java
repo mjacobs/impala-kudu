@@ -184,7 +184,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   public ExprId getId() { return id_; }
-  protected void setId(ExprId id) { this.id_ = id; }
+  protected void setId(ExprId id) { id_ = id; }
   public Type getType() { return type_; }
   public double getSelectivity() { return selectivity_; }
   public long getNumDistinctValues() { return numDistinctValues_; }
@@ -350,7 +350,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       if (result == null) {
         result = decimalType.getMinResolutionDecimal();
       } else {
-        result = Type.getAssignmentCompatibleType(result, childType);
+        result = Type.getAssignmentCompatibleType(result, childType, false);
       }
     }
     if (result != null) {
@@ -414,6 +414,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
       throws AnalysisException {
     Preconditions.checkState(this instanceof ArithmeticExpr ||
         this instanceof BinaryPredicate);
+    if (children_.size() == 1) return; // Do not attempt to convert for unary ops
     Preconditions.checkState(children_.size() == 2);
     Type t0 = getChild(0).getType();
     Type t1 = getChild(1).getType();
@@ -795,9 +796,9 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    * Create a deep copy of 'l'. The elements of the returned list are of the same
    * type as the input list.
    */
-  public static <C extends Expr> ArrayList<C> cloneList(Iterable<C> l) {
+  public static <C extends Expr> ArrayList<C> cloneList(List<C> l) {
     Preconditions.checkNotNull(l);
-    ArrayList<C> result = new ArrayList<C>();
+    ArrayList<C> result = new ArrayList<C>(l.size());
     for (Expr element: l) {
       result.add((C) element.clone());
     }
@@ -965,7 +966,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
    *           failure to convert a string literal to a date literal
    */
   public final Expr castTo(Type targetType) throws AnalysisException {
-    Type type = Type.getAssignmentCompatibleType(this.type_, targetType);
+    Type type = Type.getAssignmentCompatibleType(this.type_, targetType, false);
     Preconditions.checkState(type.isValid(), "cast %s to %s", this.type_, targetType);
     // If the targetType is NULL_TYPE then ignore the cast because NULL_TYPE
     // is compatible with all types and no cast is necessary.

@@ -84,56 +84,56 @@ class AnyValUtil {
 
   static uint64_t Hash64(const BooleanVal& v, const FunctionContext::TypeDesc&,
       int64_t seed) {
-    return HashUtil::FnvHash64(&v.val, 1, seed);
+    return HashUtil::MurmurHash2_64(&v.val, 1, seed);
   }
 
   static uint64_t Hash64(const TinyIntVal& v, const FunctionContext::TypeDesc&,
       int64_t seed) {
-    return HashUtil::FnvHash64(&v.val, 1, seed);
+    return HashUtil::MurmurHash2_64(&v.val, 1, seed);
   }
 
   static uint64_t Hash64(const SmallIntVal& v, const FunctionContext::TypeDesc&,
       int64_t seed) {
-    return HashUtil::FnvHash64(&v.val, 2, seed);
+    return HashUtil::MurmurHash2_64(&v.val, 2, seed);
   }
 
   static uint64_t Hash64(const IntVal& v, const FunctionContext::TypeDesc&,
       int64_t seed) {
-    return HashUtil::FnvHash64(&v.val, 4, seed);
+    return HashUtil::MurmurHash2_64(&v.val, 4, seed);
   }
 
   static uint64_t Hash64(const BigIntVal& v, const FunctionContext::TypeDesc&,
       int64_t seed) {
-    return HashUtil::FnvHash64(&v.val, 8, seed);
+    return HashUtil::MurmurHash2_64(&v.val, 8, seed);
   }
 
   static uint64_t Hash64(const FloatVal& v, const FunctionContext::TypeDesc&,
       int64_t seed) {
-    return HashUtil::FnvHash64(&v.val, 4, seed);
+    return HashUtil::MurmurHash2_64(&v.val, 4, seed);
   }
 
   static uint64_t Hash64(const DoubleVal& v, const FunctionContext::TypeDesc&,
       int64_t seed) {
-    return HashUtil::FnvHash64(&v.val, 8, seed);
+    return HashUtil::MurmurHash2_64(&v.val, 8, seed);
   }
 
   static uint64_t Hash64(const StringVal& v, const FunctionContext::TypeDesc&,
       int64_t seed) {
-    return HashUtil::FnvHash64(v.ptr, v.len, seed);
+    return HashUtil::MurmurHash2_64(v.ptr, v.len, seed);
   }
 
   static uint64_t Hash64(const TimestampVal& v, const FunctionContext::TypeDesc&,
       int64_t seed) {
     TimestampValue tv = TimestampValue::FromTimestampVal(v);
-    return HashUtil::FnvHash64(&tv, 12, seed);
+    return HashUtil::MurmurHash2_64(&tv, 12, seed);
   }
 
   static uint64_t Hash64(const DecimalVal& v, const FunctionContext::TypeDesc& t,
       int64_t seed) {
     switch (ColumnType::GetDecimalByteSize(t.precision)) {
-      case 4: return HashUtil::FnvHash64(&v.val4, 4, seed);
-      case 8: return HashUtil::FnvHash64(&v.val8, 8, seed);
-      case 16: return HashUtil::FnvHash64(&v.val16, 16, seed);
+      case 4: return HashUtil::MurmurHash2_64(&v.val4, 4, seed);
+      case 8: return HashUtil::MurmurHash2_64(&v.val8, 8, seed);
+      case 16: return HashUtil::MurmurHash2_64(&v.val16, 16, seed);
       default:
         DCHECK(false);
         return 0;
@@ -143,7 +143,7 @@ class AnyValUtil {
   /// Templated equality functions. These assume the input values are not NULL.
   template<typename T>
   static inline bool Equals(const FunctionContext::TypeDesc* type, const T& x, const T& y) {
-    DCHECK_NOTNULL(type);
+    DCHECK(type != NULL);
     return Equals(TypeDescToColumnType(*type), x, y);
   }
 
@@ -235,7 +235,7 @@ class AnyValUtil {
       case TYPE_STRING:
       case TYPE_VARCHAR:
       case TYPE_CHAR: {
-        if (type.IsVarLen()) {
+        if (type.IsVarLenStringType()) {
           reinterpret_cast<const StringValue*>(slot)->ToStringVal(
               reinterpret_cast<StringVal*>(dst));
           if (type.type == TYPE_VARCHAR) {

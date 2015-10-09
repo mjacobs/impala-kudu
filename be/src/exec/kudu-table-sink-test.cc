@@ -45,7 +45,7 @@ static const int THIRD_SLOT_ID = 4;
 class KuduTableSinkTest : public testing::Test {
  public:
   KuduTableSinkTest()
-      : runtime_state_(TPlanFragmentInstanceCtx(), "", &exec_env_) {}
+      : runtime_state_(TExecPlanFragmentParams(), "", &exec_env_) {}
 
   virtual void SetUp() {
     // Create a Kudu client and the table (this will abort the test here

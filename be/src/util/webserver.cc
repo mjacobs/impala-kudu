@@ -36,6 +36,7 @@
 #include "util/disk-info.h"
 #include "util/mem-info.h"
 #include "util/os-info.h"
+#include "util/os-util.h"
 #include "util/process-state-info.h"
 #include "util/url-coding.h"
 #include "util/debug-util.h"
@@ -47,6 +48,7 @@
 
 using boost::algorithm::is_any_of;
 using boost::algorithm::split;
+using boost::algorithm::trim_right;
 using boost::algorithm::to_lower;
 using boost::filesystem::exists;
 using boost::upgrade_to_unique_lock;
@@ -70,6 +72,15 @@ DEFINE_bool(enable_webserver_doc_root, true,
 DEFINE_string(webserver_certificate_file, "",
     "The location of the debug webserver's SSL certificate file, in .pem format. If "
     "empty, webserver SSL support is not enabled");
+DEFINE_string(webserver_private_key_file, "", "The full path to the private key used as a"
+    " counterpart to the public key contained in --ssl_server_certificate. If "
+    "--ssl_server_certificate is set, this option must be set as well.");
+DEFINE_string(webserver_private_key_password_cmd, "", "A Unix command whose output "
+    "returns the password used to decrypt the Webserver's certificate private key file "
+    "specified in --webserver_private_key_file. If the .PEM key file is not "
+    "password-protected, this command will not be invoked. The output of the command "
+    "will be truncated to 1024 bytes, and then all trailing whitespace will be trimmed "
+    "before it is used to decrypt the private key");
 DEFINE_string(webserver_authentication_domain, "",
     "Domain used for debug webserver authentication");
 DEFINE_string(webserver_password_file, "",
@@ -116,17 +127,12 @@ enum ResponseCode {
   NOT_FOUND = 404
 };
 
-// Supported HTTP content types
-enum ContentType {
-  HTML,
-  PLAIN
-};
-
 // Builds a valid HTTP header given the response code and a content type.
 string BuildHeaderString(ResponseCode response, ContentType content_type) {
   static const string RESPONSE_TEMPLATE = "HTTP/1.1 $0 $1\r\n"
       "Content-Type: text/$2\r\n"
       "Content-Length: %d\r\n"
+      "X-Frame-Options: DENY\r\n"
       "\r\n";
 
   return Substitute(RESPONSE_TEMPLATE, response, response == OK ? "OK" : "Not found",
@@ -222,9 +228,25 @@ Status Webserver::Start() {
     LOG(INFO)<< "Document root disabled";
   }
 
+  string key_password;
   if (IsSecure()) {
     options.push_back("ssl_certificate");
     options.push_back(FLAGS_webserver_certificate_file.c_str());
+
+    if (!FLAGS_webserver_private_key_file.empty()) {
+      options.push_back("ssl_private_key");
+      options.push_back(FLAGS_webserver_private_key_file.c_str());
+
+      if (!FLAGS_webserver_private_key_password_cmd.empty()) {
+        if (!RunShellProcess(FLAGS_webserver_private_key_password_cmd, &key_password)) {
+          return Status(TErrorCode::SSL_PASSWORD_CMD_FAILED,
+              FLAGS_webserver_private_key_password_cmd, key_password);
+        }
+        trim_right(key_password);
+        options.push_back("ssl_private_key_password");
+        options.push_back(key_password.c_str());
+      }
+    }
   }
 
   if (!FLAGS_webserver_authentication_domain.empty()) {
@@ -247,6 +269,9 @@ Status Webserver::Start() {
 
   options.push_back("listening_ports");
   options.push_back(listening_str.c_str());
+
+  options.push_back("enable_directory_listing");
+  options.push_back("no");
 
   // Options must be a NULL-terminated list
   options.push_back(NULL);
@@ -358,55 +383,66 @@ int Webserver::BeginRequestCallback(struct sq_connection* connection,
   MonotonicStopWatch sw;
   sw.Start();
 
-  Document document;
-  document.SetObject();
-  GetCommonJson(&document);
-
   // The output of this page is accumulated into this stringstream.
   stringstream output;
-  bool raw_json = (arguments.find("json") != arguments.end());
-  url_handler->callback()(arguments, &document);
-  if (raw_json) {
-    // Callbacks may optionally be rendered as a text-only, pretty-printed Json document
-    // (mostly for debugging or integration with third-party tools).
-    StringBuffer strbuf;
-    PrettyWriter<StringBuffer> writer(strbuf);
-    document.Accept(writer);
-    output << strbuf.GetString();
+  if (!url_handler->use_templates()) {
     content_type = PLAIN;
+    url_handler->raw_callback()(arguments, &output);
   } else {
-    if (arguments.find("raw") != arguments.end()) {
-      document.AddMember(ENABLE_RAW_JSON_KEY, "true", document.GetAllocator());
-    }
-    if (document.HasMember(ENABLE_RAW_JSON_KEY)) {
-      content_type = PLAIN;
-    }
-
-    const string& full_template_path =
-        Substitute("$0/$1/$2", FLAGS_webserver_doc_root, DOC_FOLDER,
-            url_handler->template_filename());
-    ifstream tmpl(full_template_path.c_str());
-    if (!tmpl.is_open()) {
-      output << "Could not open template: " << full_template_path;
-      content_type = PLAIN;
-    } else {
-      stringstream buffer;
-      buffer << tmpl.rdbuf();
-      RenderTemplate(buffer.str(), Substitute("$0/", FLAGS_webserver_doc_root), document,
-          &output);
-    }
+    RenderUrlWithTemplate(arguments, *url_handler, &output, &content_type);
   }
 
   VLOG(3) << "Rendering page " << request_info->uri << " took "
           << PrettyPrinter::Print(sw.ElapsedTime(), TUnit::CPU_TICKS);
 
   const string& str = output.str();
+
   const string& headers = BuildHeaderString(response, content_type);
   sq_printf(connection, headers.c_str(), (int)str.length());
 
   // Make sure to use sq_write for printing the body; sq_printf truncates at 8kb
   sq_write(connection, str.c_str(), str.length());
   return PROCESSING_COMPLETE;
+}
+
+void Webserver::RenderUrlWithTemplate(const ArgumentMap& arguments,
+    const UrlHandler& url_handler, stringstream* output, ContentType* content_type) {
+  Document document;
+  document.SetObject();
+  GetCommonJson(&document);
+
+  bool raw_json = (arguments.find("json") != arguments.end());
+  url_handler.callback()(arguments, &document);
+  if (raw_json) {
+    // Callbacks may optionally be rendered as a text-only, pretty-printed Json document
+    // (mostly for debugging or integration with third-party tools).
+    StringBuffer strbuf;
+    PrettyWriter<StringBuffer> writer(strbuf);
+    document.Accept(writer);
+    (*output) << strbuf.GetString();
+    *content_type = PLAIN;
+  } else {
+    if (arguments.find("raw") != arguments.end()) {
+      document.AddMember(ENABLE_RAW_JSON_KEY, "true", document.GetAllocator());
+    }
+    if (document.HasMember(ENABLE_RAW_JSON_KEY)) {
+      *content_type = PLAIN;
+    }
+
+    const string& full_template_path =
+        Substitute("$0/$1/$2", FLAGS_webserver_doc_root, DOC_FOLDER,
+            url_handler.template_filename());
+    ifstream tmpl(full_template_path.c_str());
+    if (!tmpl.is_open()) {
+      (*output) << "Could not open template: " << full_template_path;
+      *content_type = PLAIN;
+    } else {
+      stringstream buffer;
+      buffer << tmpl.rdbuf();
+      RenderTemplate(buffer.str(), Substitute("$0/", FLAGS_webserver_doc_root), document,
+          output);
+    }
+  }
 }
 
 void Webserver::RegisterUrlCallback(const string& path,
@@ -418,6 +454,15 @@ void Webserver::RegisterUrlCallback(const string& path,
 
   url_handlers_.insert(
       make_pair(path, UrlHandler(callback, template_filename, is_on_nav_bar)));
+}
+
+void Webserver::RegisterUrlCallback(const string& path, const RawUrlCallback& callback) {
+  upgrade_lock<shared_mutex> lock(url_handlers_lock_);
+  upgrade_to_unique_lock<shared_mutex> writer_lock(lock);
+  DCHECK(url_handlers_.find(path) == url_handlers_.end())
+      << "Duplicate Url handler for: " << path;
+
+  url_handlers_.insert(make_pair(path, UrlHandler(callback)));
 }
 
 }

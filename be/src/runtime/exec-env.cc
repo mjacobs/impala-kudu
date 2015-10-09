@@ -30,6 +30,7 @@
 #include "runtime/lib-cache.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/thread-resource-mgr.h"
+#include "runtime/tmp-file-mgr.h"
 #include "scheduling/request-pool-service.h"
 #include "service/frontend.h"
 #include "statestore/simple-scheduler.h"
@@ -120,6 +121,8 @@ DEFINE_int32(resource_broker_recv_timeout, 0, "Time to wait, in ms, "
     "for the underlying socket of an RPC to Llama to successfully receive data. "
     "A setting of 0 means the socket will wait indefinitely.");
 
+DECLARE_string(ssl_client_ca_certificate);
+
 // The key for a variable set in Impala's test environment only, to allow the
 // resource-broker to correctly map node addresses into a form that Llama understand.
 const static string PSEUDO_DISTRIBUTED_CONFIG_KEY =
@@ -131,8 +134,12 @@ ExecEnv* ExecEnv::exec_env_ = NULL;
 
 ExecEnv::ExecEnv()
   : stream_mgr_(new DataStreamMgr()),
-    impalad_client_cache_(new ImpalaInternalServiceClientCache()),
-    catalogd_client_cache_(new CatalogServiceClientCache()),
+    impalad_client_cache_(
+        new ImpalaInternalServiceClientCache(
+            "", !FLAGS_ssl_client_ca_certificate.empty())),
+    catalogd_client_cache_(
+        new CatalogServiceClientCache(
+            "", !FLAGS_ssl_client_ca_certificate.empty())),
     htable_factory_(new HBaseTableFactory()),
     disk_io_mgr_(new DiskIoMgr()),
     webserver_(new Webserver()),
@@ -142,6 +149,7 @@ ExecEnv::ExecEnv()
     cgroups_mgr_(NULL),
     hdfs_op_thread_pool_(
         CreateHdfsOpThreadPool("hdfs-worker-pool", FLAGS_num_hdfs_worker_threads, 1024)),
+    tmp_file_mgr_(new TmpFileMgr),
     request_pool_service_(new RequestPoolService(metrics_.get())),
     frontend_(new Frontend()),
     enable_webserver_(FLAGS_enable_webserver),
@@ -178,8 +186,12 @@ ExecEnv::ExecEnv()
 ExecEnv::ExecEnv(const string& hostname, int backend_port, int subscriber_port,
                  int webserver_port, const string& statestore_host, int statestore_port)
   : stream_mgr_(new DataStreamMgr()),
-    impalad_client_cache_(new ImpalaInternalServiceClientCache()),
-    catalogd_client_cache_(new CatalogServiceClientCache()),
+    impalad_client_cache_(
+        new ImpalaInternalServiceClientCache(
+            "", !FLAGS_ssl_client_ca_certificate.empty())),
+    catalogd_client_cache_(
+        new CatalogServiceClientCache(
+            "", !FLAGS_ssl_client_ca_certificate.empty())),
     htable_factory_(new HBaseTableFactory()),
     disk_io_mgr_(new DiskIoMgr()),
     webserver_(new Webserver(webserver_port)),
@@ -188,6 +200,7 @@ ExecEnv::ExecEnv(const string& hostname, int backend_port, int subscriber_port,
     thread_mgr_(new ThreadResourceMgr),
     hdfs_op_thread_pool_(
         CreateHdfsOpThreadPool("hdfs-worker-pool", FLAGS_num_hdfs_worker_threads, 1024)),
+    tmp_file_mgr_(new TmpFileMgr),
     frontend_(new Frontend()),
     enable_webserver_(FLAGS_enable_webserver && webserver_port > 0),
     tz_database_(TimezoneDatabase()),

@@ -81,7 +81,7 @@ Status ScalarFnCall::Prepare(RuntimeState* state, const RowDescriptor& desc,
     }
   }
 
-  context_index_ = context->Register(state, return_type, arg_types, varargs_buffer_size);
+  fn_context_index_ = context->Register(state, return_type, arg_types, varargs_buffer_size);
 
   // If the codegen object hasn't been created yet and we're calling a builtin or native
   // UDF with <= 8 non-variadic arguments, we can use the interpreted path and call the
@@ -149,7 +149,7 @@ Status ScalarFnCall::Open(RuntimeState* state, ExprContext* ctx,
                           FunctionContext::FunctionStateScope scope) {
   // Opens and inits children
   RETURN_IF_ERROR(Expr::Open(state, ctx, scope));
-  FunctionContext* fn_ctx = ctx->fn_context(context_index_);
+  FunctionContext* fn_ctx = ctx->fn_context(fn_context_index_);
 
   if (scalar_fn_ != NULL) {
     // We're in the interpreted path (i.e. no JIT). Populate our FunctionContext's
@@ -167,6 +167,9 @@ Status ScalarFnCall::Open(RuntimeState* state, ExprContext* ctx,
     vector<AnyVal*> constant_args;
     for (int i = 0; i < children_.size(); ++i) {
       constant_args.push_back(children_[i]->GetConstVal(ctx));
+      // Check if any errors were set during the GetConstVal() call
+      Status child_status = children_[i]->GetFnContextError(ctx);
+      if (!child_status.ok()) return child_status;
     }
     fn_ctx->impl()->SetConstantArgs(constant_args);
   }
@@ -197,9 +200,8 @@ Status ScalarFnCall::Open(RuntimeState* state, ExprContext* ctx,
 
 void ScalarFnCall::Close(RuntimeState* state, ExprContext* context,
                          FunctionContext::FunctionStateScope scope) {
-  if (context_index_ != -1 && close_fn_ != NULL) {
-    FunctionContext* fn_ctx = context->fn_context(context_index_);
-
+  if (fn_context_index_ != -1 && close_fn_ != NULL) {
+    FunctionContext* fn_ctx = context->fn_context(fn_context_index_);
     close_fn_(fn_ctx, FunctionContext::THREAD_LOCAL);
     if (scope == FunctionContext::FRAGMENT_LOCAL) {
       close_fn_(fn_ctx, FunctionContext::FRAGMENT_LOCAL);
@@ -278,7 +280,7 @@ Status ScalarFnCall::GetCodegendComputeFn(RuntimeState* state, llvm::Function** 
   llvm::Value* fn_ctxs_base = builder.CreateLoad(expr_ctx_gep, "fn_ctxs_base");
   // Use GEP to add our index to the base pointer
   llvm::Value* fn_ctx_ptr =
-      builder.CreateConstGEP1_32(fn_ctxs_base, context_index_, "fn_ctx_ptr");
+      builder.CreateConstGEP1_32(fn_ctxs_base, fn_context_index_, "fn_ctx_ptr");
   llvm::Value* fn_ctx = builder.CreateLoad(fn_ctx_ptr, "fn_ctx");
   udf_args.push_back(fn_ctx);
 
@@ -380,13 +382,13 @@ Status ScalarFnCall::GetUdf(RuntimeState* state, llvm::Function** udf) {
   RETURN_IF_ERROR(state->GetCodegen(&codegen));
 
   // from_utc_timestamp and to_utc_timestamp have inline ASM that cannot be JIT'd.
-  // TimestampFunctions::DateAddSub() contains a try/catch which doesn't work in JIT'd
+  // TimestampFunctions::AddSub() contains a try/catch which doesn't work in JIT'd
   // code.  Always use the statically compiled versions of these functions so the
   // xcompiled versions are not included in the final module to be JIT'd.
   // TODO: fix this
   bool broken_builtin = fn_.name.function_name == "from_utc_timestamp" ||
                         fn_.name.function_name == "to_utc_timestamp" ||
-                        fn_.scalar_fn.symbol.find("DateAddSub") != string::npos;
+                        fn_.scalar_fn.symbol.find("AddSub") != string::npos;
   if (fn_.binary_type == TFunctionBinaryType::NATIVE ||
       (fn_.binary_type == TFunctionBinaryType::BUILTIN &&
        (!state->codegen_enabled() || broken_builtin))) {
@@ -462,7 +464,7 @@ Status ScalarFnCall::GetUdf(RuntimeState* state, llvm::Function** udf) {
     (*udf)->setName(demangled_name);
     InlineConstants(codegen, *udf);
     *udf = codegen->FinalizeFunction(*udf);
-    DCHECK_NOTNULL(*udf);
+    DCHECK(*udf != NULL);
   } else {
     // We're running an IR UDF.
     DCHECK_EQ(fn_.binary_type, TFunctionBinaryType::IR);
@@ -506,7 +508,7 @@ Status ScalarFnCall::GetFunction(RuntimeState* state, const string& symbol, void
 void ScalarFnCall::EvaluateChildren(ExprContext* context, TupleRow* row,
                                     vector<AnyVal*>* input_vals) {
   DCHECK_EQ(input_vals->size(), NumFixedArgs());
-  FunctionContext* fn_ctx = context->fn_context(context_index_);
+  FunctionContext* fn_ctx = context->fn_context(fn_context_index_);
   uint8_t* varargs_buffer = fn_ctx->impl()->varargs_buffer();
   for (int i = 0; i < children_.size(); ++i) {
     void* src_slot = context->GetValue(children_[i], row);
@@ -524,7 +526,7 @@ void ScalarFnCall::EvaluateChildren(ExprContext* context, TupleRow* row,
 template<typename RETURN_TYPE>
 RETURN_TYPE ScalarFnCall::InterpretEval(ExprContext* context, TupleRow* row) {
   DCHECK(scalar_fn_ != NULL);
-  FunctionContext* fn_ctx = context->fn_context(context_index_);
+  FunctionContext* fn_ctx = context->fn_context(fn_context_index_);
   vector<AnyVal*>* input_vals = fn_ctx->impl()->staging_input_vals();
   EvaluateChildren(context, row, input_vals);
 

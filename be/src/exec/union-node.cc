@@ -28,11 +28,12 @@ UnionNode::UnionNode(ObjectPool* pool, const TPlanNode& tnode,
                      const DescriptorTbl& descs)
     : ExecNode(pool, tnode, descs),
       tuple_id_(tnode.union_node.tuple_id),
+      tuple_desc_(NULL),
       const_result_expr_idx_(0),
       child_idx_(0),
       child_row_batch_(NULL),
-      child_eos_(false),
-      child_row_idx_(0) {
+      child_row_idx_(0),
+      child_eos_(false) {
 }
 
 Status UnionNode::Init(const TPlanNode& tnode) {
@@ -136,8 +137,9 @@ Status UnionNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
       RETURN_IF_ERROR(QueryMaintenance(state));
 
       // Continue materializing exprs on child_row_batch_ into row batch.
-      if (EvalAndMaterializeExprs(
-              result_expr_ctx_lists_[child_idx_], false, &tuple, row_batch)) {
+      RETURN_IF_ERROR(EvalAndMaterializeExprs(result_expr_ctx_lists_[child_idx_], false,
+          &tuple, row_batch));
+      if (row_batch->AtCapacity() || ReachedLimit()) {
         *eos = ReachedLimit();
         return Status::OK();
       }
@@ -156,7 +158,10 @@ Status UnionNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
     // ReachedLimit() is true as we may end up releasing resources that are referenced
     // by the output row_batch.
     child_row_batch_.reset();
-    child(child_idx_)->Close(state);
+
+    // Unless we are inside a subplan expecting to call Open()/GetNext() on the child
+    // again, the child can be closed at this point.
+    if (!IsInSubplan()) child(child_idx_)->Close(state);
     ++child_idx_;
   }
 
@@ -165,9 +170,10 @@ Status UnionNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
     // Only evaluate the const expr lists by the first fragment instance.
     if (state->fragment_ctx().fragment_instance_idx == 0) {
       // Materialize expr results into row_batch.
-      EvalAndMaterializeExprs(
-          const_result_expr_ctx_lists_[const_result_expr_idx_], true,
-          &tuple, row_batch);
+      RETURN_IF_ERROR(EvalAndMaterializeExprs(
+          const_result_expr_ctx_lists_[const_result_expr_idx_], true, &tuple,
+          row_batch));
+
     }
     ++const_result_expr_idx_;
     *eos = ReachedLimit();
@@ -178,9 +184,13 @@ Status UnionNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
   return Status::OK();
 }
 
-Status UnionNode::Reset(RuntimeState* state, RowBatch* row_batch) {
-  DCHECK(false) << "NYI";
-  return Status("NYI");
+Status UnionNode::Reset(RuntimeState* state) {
+  child_row_idx_ = 0;
+  const_result_expr_idx_ = 0;
+  child_idx_ = 0;
+  child_row_batch_.reset();
+  child_eos_ = false;
+  return ExecNode::Reset(state);
 }
 
 void UnionNode::Close(RuntimeState* state) {
@@ -195,11 +205,11 @@ void UnionNode::Close(RuntimeState* state) {
   ExecNode::Close(state);
 }
 
-bool UnionNode::EvalAndMaterializeExprs(const vector<ExprContext*>& ctxs, bool const_exprs,
-                                        Tuple** tuple, RowBatch* row_batch) {
+Status UnionNode::EvalAndMaterializeExprs(const vector<ExprContext*>& ctxs,
+    bool const_exprs, Tuple** tuple, RowBatch* row_batch) {
   // Make sure there are rows left in the batch.
   if (!const_exprs && child_row_idx_ >= child_row_batch_->num_rows()) {
-    return false;
+    return Status::OK();
   }
   // Execute the body at least once.
   bool done = true;
@@ -227,8 +237,9 @@ bool UnionNode::EvalAndMaterializeExprs(const vector<ExprContext*>& ctxs, bool c
     for (int i = 0; i < ctxs.size(); ++i) {
       // our exprs correspond to materialized slots
       SlotDescriptor* slot_desc = materialized_slots_[i];
-      RawValue::Write(ctxs[i]->GetValue(child_row), *tuple, slot_desc,
-          row_batch->tuple_data_pool());
+      const void* value = ctxs[i]->GetValue(child_row);
+      RETURN_IF_ERROR(ctxs[i]->root()->GetFnContextError(ctxs[i]));
+      RawValue::Write(value, *tuple, slot_desc, row_batch->tuple_data_pool());
     }
 
     if (EvalConjuncts(conjunct_ctxs, num_conjunct_ctxs, row)) {
@@ -243,13 +254,10 @@ bool UnionNode::EvalAndMaterializeExprs(const vector<ExprContext*>& ctxs, bool c
       // the tuple assembled for the previous row.
       (*tuple)->Init(tuple_desc_->byte_size());
     }
-
-    if (row_batch->AtCapacity() || ReachedLimit()) {
-      return true;
-    }
+    if (row_batch->AtCapacity() || ReachedLimit()) return Status::OK();
   } while (!done);
 
-  return false;
+  return Status::OK();
 }
 
 }

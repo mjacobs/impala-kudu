@@ -135,6 +135,9 @@ struct TDescribeTableParams {
 
   // Controls the output style for this describe command.
   3: required TDescribeTableOutputStyle output_style
+
+  // Struct type with fields to display for the MINIMAL output style.
+  4: optional Types.TColumnType result_struct
 }
 
 // Results of a call to describeTable()
@@ -526,6 +529,9 @@ struct TExecRequest {
 
   // Timeline of planner's operation, for profiling
   11: optional RuntimeProfile.TEventSequence timeline
+
+  // Cleanup the catalog object if the insert query of a CTAS fails.
+  12: optional TCatalogOpRequest catalog_cleanup_request
 }
 
 // Parameters to FeSupport.cacheJar().
@@ -617,6 +623,14 @@ struct TUpdateCatalogCacheRequest {
 struct TUpdateCatalogCacheResponse {
   // The catalog service id this version is from.
   1: required Types.TUniqueId catalog_service_id
+}
+
+// Sent from the impalad BE to FE with the latest cluster membership snapshot resulting
+// from the Membership heartbeat.
+struct TUpdateMembershipRequest {
+  1: required set<string> hostnames
+  2: required set<string> ip_addresses
+  3: i32 num_nodes
 }
 
 // Contains all interesting statistics from a single 'memory pool' in the JVM.

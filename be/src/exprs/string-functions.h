@@ -32,6 +32,8 @@ class StringFunctions {
   static StringVal Substring(FunctionContext*, const StringVal& str, const BigIntVal& pos,
                              const BigIntVal& len);
   static StringVal Substring(FunctionContext*, const StringVal& str, const BigIntVal& pos);
+  static StringVal SplitPart(FunctionContext* context, const StringVal& str,
+                             const StringVal& delim, const BigIntVal& field);
   static StringVal Left(FunctionContext*, const StringVal& str, const BigIntVal& len);
   static StringVal Right(FunctionContext*, const StringVal& str, const BigIntVal& len);
   static StringVal Space(FunctionContext*, const BigIntVal& len);
@@ -75,7 +77,17 @@ class StringFunctions {
   static StringVal ParseUrlKey(FunctionContext*, const StringVal& url,
                                const StringVal& key, const StringVal& part);
   static void ParseUrlClose(FunctionContext*, FunctionContext::FunctionStateScope);
-};
 
+  /// Converts ASCII 'val' to corresponding character.
+  static StringVal Chr(FunctionContext* context, const IntVal& val);
+
+  static void BTrimPrepare(FunctionContext*, FunctionContext::FunctionStateScope);
+  static void BTrimClose(FunctionContext*, FunctionContext::FunctionStateScope);
+
+  /// Trims occurrences of the characters in 'chars_to_trim' string from
+  /// both ends of string 'str'.
+  static StringVal BTrimString(FunctionContext* ctx, const StringVal& str,
+    const StringVal& chars_to_trim);
+};
 }
 #endif

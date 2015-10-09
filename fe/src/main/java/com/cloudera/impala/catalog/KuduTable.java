@@ -27,6 +27,7 @@ import com.cloudera.impala.analysis.AlterTableStmt;
 import com.cloudera.impala.common.ImpalaRuntimeException;
 import com.cloudera.impala.thrift.TCatalogObjectType;
 import com.cloudera.impala.thrift.TColumn;
+import com.cloudera.impala.thrift.TColumnDescriptor;
 import com.cloudera.impala.thrift.TKuduTable;
 import com.cloudera.impala.thrift.TResultSet;
 import com.cloudera.impala.thrift.TResultSetMetadata;
@@ -113,9 +114,8 @@ public class KuduTable extends Table {
   @Override
   public TTableDescriptor toThriftDescriptor(Set<Long> referencedPartitions) {
     TTableDescriptor desc = new TTableDescriptor(id_.asInt(), TTableType.KUDU_TABLE,
-        getColumns().size(), numClusteringCols_, kuduTableName_, db_.getName());
+        getTColumnDescriptors(), numClusteringCols_, kuduTableName_, db_.getName());
     desc.setKuduTable(getKuduTable());
-    desc.setColNames(getColumnNames());
     return desc;
   }
 
@@ -130,6 +130,17 @@ public class KuduTable extends Table {
    */
   @Override
   public ArrayList<Column> getColumnsInHiveOrder() { return getColumns(); }
+
+  /**
+   * Returns a list of thrift column descriptors ordered by position.
+   */
+  public List<TColumnDescriptor> getTColumnDescriptors() {
+    List<TColumnDescriptor> colDescs = Lists.<TColumnDescriptor>newArrayList();
+    for (Column col: colsByPos_) {
+      colDescs.add(new TColumnDescriptor(col.getName(), col.getType().toThrift()));
+    }
+    return colDescs;
+  }
 
   public static boolean isKuduTable(org.apache.hadoop.hive.metastore.api.Table mstbl) {
     return TableType.valueOf(mstbl.getTableType()) != TableType.VIRTUAL_VIEW
@@ -232,13 +243,6 @@ public class KuduTable extends Table {
         && params.get(KEY_KEY_COLUMNS) != null
         && params.get(KEY_KEY_COLUMNS).length() > 0;
    }
-
-  /**
-   * The number of nodes is not know ahead of time and will be updated during computeStats
-   * in the scan node.
-   */
-  @Override
-  public int getNumNodes() { return -1; }
 
   public List<String> getKuduKeyColumnNames() { return kuduKeyColumnNames_; }
 

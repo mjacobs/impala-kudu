@@ -469,7 +469,8 @@ Status Coordinator::GetStatus() {
   return query_status_;
 }
 
-Status Coordinator::UpdateStatus(const Status& status, const TUniqueId* instance_id) {
+Status Coordinator::UpdateStatus(const Status& status, const TUniqueId* instance_id,
+    const string& instance_hostname) {
   {
     lock_guard<mutex> l(lock_);
 
@@ -490,7 +491,7 @@ Status Coordinator::UpdateStatus(const Status& status, const TUniqueId* instance
   // Log the id of the fragment that first failed so we can track it down easier.
   if (instance_id != NULL) {
     VLOG_QUERY << "Query id=" << query_id_ << " failed because fragment id="
-               << *instance_id << " failed.";
+               << *instance_id << " on host=" << instance_hostname << " failed.";
   }
 
   return query_status_;
@@ -591,8 +592,9 @@ Status Coordinator::FinalizeSuccessfulInsert() {
       part_path_ss << finalize_params_.hdfs_base_dir << "/" << partition.first;
     } else {
       HdfsPartitionDescriptor* part = hdfs_table->GetPartition(partition.second.id);
-      DCHECK(part != NULL) << "Partition " << partition.second.id
-                           << " not known in descriptor table";
+      DCHECK(part != NULL) << "table_id=" << hdfs_table->id()
+                           << " partition_id=" << partition.second.id
+                           << "\n" <<  PrintThrift(runtime_state()->fragment_params());
       part_path_ss << part->location();
     }
     const string& part_path = part_path_ss.str();
@@ -854,7 +856,8 @@ Status Coordinator::GetNext(RowBatch** batch, RuntimeState* state) {
   // if there was an error, we need to return the query's error status rather than
   // the status we just got back from the local executor (which may well be CANCELLED
   // in that case).  Coordinator fragment failed in this case so we log the query_id.
-  RETURN_IF_ERROR(UpdateStatus(status, &runtime_state()->fragment_instance_id()));
+  RETURN_IF_ERROR(UpdateStatus(status, &runtime_state()->fragment_instance_id(),
+      FLAGS_hostname));
 
   if (*batch == NULL) {
     returned_all_results_ = true;
@@ -882,8 +885,33 @@ Status Coordinator::GetNext(RowBatch** batch, RuntimeState* state) {
       // If the query completed successfully, report aggregate query profiles.
       ReportQuerySummary();
     }
+  } else {
+#ifndef NDEBUG
+    ValidateCollectionSlots(*batch);
+#endif
   }
+
   return Status::OK();
+}
+
+void Coordinator::ValidateCollectionSlots(RowBatch* batch) {
+  const RowDescriptor& row_desc = executor_->row_desc();
+  if (!row_desc.HasVarlenSlots()) return;
+  for (int i = 0; i < batch->num_rows(); ++i) {
+    TupleRow* row = batch->GetRow(i);
+    for (int j = 0; j < row_desc.tuple_descriptors().size(); ++j) {
+      const TupleDescriptor* tuple_desc = row_desc.tuple_descriptors()[j];
+      if (tuple_desc->collection_slots().empty()) continue;
+      for (int k = 0; k < tuple_desc->collection_slots().size(); ++k) {
+        const SlotDescriptor* slot_desc = tuple_desc->collection_slots()[k];
+        if (!slot_desc->is_materialized()) continue;
+        int tuple_idx = row_desc.GetTupleIdx(slot_desc->parent()->id());
+        const Tuple* tuple = row->GetTuple(tuple_idx);
+        if (tuple == NULL) continue;
+        DCHECK(tuple->IsNull(slot_desc->null_indicator_offset()));
+      }
+    }
+  }
 }
 
 void Coordinator::PrintBackendInfo() {
@@ -1293,7 +1321,8 @@ Status Coordinator::UpdateFragmentExecStatus(const TReportExecStatusParams& para
   // and returned_all_results_ is true.
   // (UpdateStatus() initiates cancellation, if it hasn't already been initiated)
   if (!(returned_all_results_ && status.IsCancelled()) && !status.ok()) {
-    UpdateStatus(status, &exec_state->fragment_instance_id);
+    UpdateStatus(status, &exec_state->fragment_instance_id,
+        TNetworkAddressToString(exec_state->backend_address));
     return Status::OK();
   }
 
@@ -1301,7 +1330,8 @@ Status Coordinator::UpdateFragmentExecStatus(const TReportExecStatusParams& para
     lock_guard<mutex> l(lock_);
     exec_state->stopwatch.Stop();
     DCHECK_GT(num_remaining_backends_, 0);
-    VLOG_QUERY << "Backend " << params.backend_num << " completed, "
+    VLOG_QUERY << "Backend " << params.backend_num << " on host "
+               << exec_state->backend_address << " completed, "
                << num_remaining_backends_ - 1 << " remaining: query_id=" << query_id_;
     if (VLOG_QUERY_IS_ON && num_remaining_backends_ > 1) {
       // print host/port info for the first backend that's still in progress as a

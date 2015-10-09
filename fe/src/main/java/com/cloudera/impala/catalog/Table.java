@@ -28,10 +28,12 @@ import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.log4j.Logger;
 
 import com.cloudera.impala.analysis.TableName;
+import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.thrift.TAccessLevel;
 import com.cloudera.impala.thrift.TCatalogObject;
 import com.cloudera.impala.thrift.TCatalogObjectType;
 import com.cloudera.impala.thrift.TColumn;
+import com.cloudera.impala.thrift.TColumnDescriptor;
 import com.cloudera.impala.thrift.TTable;
 import com.cloudera.impala.thrift.TTableDescriptor;
 import com.cloudera.impala.thrift.TTableStats;
@@ -98,8 +100,6 @@ public abstract class Table implements CatalogObject {
         CatalogServiceCatalog.getLastDdlTime(msTable_) : -1;
   }
 
-  //number of nodes that contain data for this table; -1: unknown
-  public abstract int getNumNodes();
   public abstract TTableDescriptor toThriftDescriptor(Set<Long> referencedPartitions);
   public abstract TCatalogObjectType getCatalogObjectType();
 
@@ -219,7 +219,7 @@ public abstract class Table implements CatalogObject {
       // have a special table property to indicate that Impala should use an external
       // data source.
       table = new DataSourceTable(id, msTbl, db, msTbl.getTableName(), msTbl.getOwner());
-    } else if (HdfsFileFormat.isHdfsFormatClass(msTbl.getSd().getInputFormat())) {
+    } else if (HdfsFileFormat.isHdfsInputFormatClass(msTbl.getSd().getInputFormat())) {
       table = new HdfsTable(id, msTbl, db, msTbl.getTableName(), msTbl.getOwner());
     }
     return table;
@@ -324,14 +324,20 @@ public abstract class Table implements CatalogObject {
    *   - Supported by Impala, in which case the type is returned.
    *   - A type Impala understands but is not yet implemented (e.g. date), the type is
    *     returned but type.IsSupported() returns false.
+   *   - A supported type that exceeds an Impala limit, e.g., on the nesting depth.
    *   - A type Impala can't understand at all, and a TableLoadingException is thrown.
    */
    protected Type parseColumnType(FieldSchema fs) throws TableLoadingException {
-     Type type = Type.parseColumnType(fs);
+     Type type = Type.parseColumnType(fs.getType());
      if (type == null) {
        throw new TableLoadingException(String.format(
            "Unsupported type '%s' in column '%s' of table '%s'",
            fs.getType(), fs.getName(), getName()));
+     }
+     if (type.exceedsMaxNestingDepth()) {
+       throw new TableLoadingException(String.format(
+           "Type exceeds the maximum nesting depth of %s:\n%s",
+           Type.MAX_NESTING_DEPTH, type.toSql()));
      }
      return type;
    }
@@ -358,6 +364,17 @@ public abstract class Table implements CatalogObject {
   }
 
   /**
+   * Returns a list of thrift column descriptors ordered by position.
+   */
+  public List<TColumnDescriptor> getTColumnDescriptors() {
+    List<TColumnDescriptor> colDescs = Lists.<TColumnDescriptor>newArrayList();
+    for (Column col: colsByPos_) {
+      colDescs.add(new TColumnDescriptor(col.getName(), col.getType().toThrift()));
+    }
+    return colDescs;
+  }
+
+  /**
    * Subclasses should override this if they provide a storage handler class. Currently
    * only HBase tables need to provide a storage handler.
    */
@@ -375,6 +392,17 @@ public abstract class Table implements CatalogObject {
       columns.add(column);
     }
     return columns;
+  }
+
+  /**
+   * Returns a struct type with the columns in the same order as getColumnsInHiveOrder().
+   */
+  public StructType getHiveColumnsAsStruct() {
+    ArrayList<StructField> fields = Lists.newArrayListWithCapacity(colsByPos_.size());
+    for (Column col: getColumnsInHiveOrder()) {
+      fields.add(new StructField(col.getName(), col.getType(), col.getComment()));
+    }
+    return new StructType(fields);
   }
 
   /**

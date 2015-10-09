@@ -209,18 +209,19 @@ class ClientConnection {
 
   T* operator->() const { return client_; }
 
-  /// Perform an RPC call f(request, response), with some failure handling in case the TCP
-  /// connection underpinning this client has been closed unexpectedly. Note that this can
-  /// lead to f() being called twice, as this method may retry f() once, depending on the
-  /// error received from the first attempt. TODO: Detect already-closed cnxns and only
-  /// retry in that case.
+  /// Perform an RPC call f(request, response), with some failure handling in case the
+  /// TCP connection underpinning this client has been closed unexpectedly. Note that
+  /// this can lead to f() being called twice, as this method may retry f() once,
+  /// depending on the error received from the first attempt.
+  /// TODO: Detect already-closed cnxns and only retry in that case.
+  ///
+  /// Returns RPC_TIMEOUT if a timeout occurred, RPC_CLIENT_CONNECT_FAILURE if the client
+  /// failed to connect, and RPC_GENERAL_ERROR if the RPC could not be completed for any
+  /// other reason (except for an unexpectedly closed cnxn, see TODO). Application-level
+  /// failures should be signalled through the response type.
   //
-  /// Returns RPC_TIMEOUT if a timeout occurred, and RPC_GENERAL_ERROR if the RPC could not
-  /// be completed for any other reason (except for an unexpectedly closed cnxn, see
-  /// TODO). Application-level failures should be signalled through the response type.
-  //
-  /// TODO: Use TTransportException::TTransportExceptionType to distinguish between failure
-  /// modes.
+  /// TODO: Use TTransportException::TTransportExceptionType to distinguish between
+  /// failure modes.
   template <class F, class Request, class Response>
   Status DoRpc(const F& f, const Request& request, Response* response) {
     DCHECK(response != NULL);
@@ -231,7 +232,10 @@ class ClientConnection {
 
       // Client may have unexpectedly been closed, so re-open and retry.
       // TODO: ThriftClient should return proper error codes.
-      RETURN_IF_ERROR(Reopen());
+      const Status& status = Reopen();
+      if (!status.ok()) {
+        return Status(TErrorCode::RPC_CLIENT_CONNECT_FAILURE, status.GetDetail());
+      }
       try {
         (client_->*f)(*response, request);
       } catch (apache::thrift::TException& e) {
@@ -254,9 +258,10 @@ class ClientCache {
  public:
   typedef ThriftClient<T> Client;
 
-  ClientCache(const std::string& service_name = "") : client_cache_helper_(1, 0, 0, 0) {
+  ClientCache(const std::string& service_name = "", bool enable_ssl = false)
+      : client_cache_helper_(1, 0, 0, 0) {
     client_factory_ = boost::bind<ThriftClientImpl*>(
-        boost::mem_fn(&ClientCache::MakeClient), this, _1, _2, service_name);
+        boost::mem_fn(&ClientCache::MakeClient), this, _1, _2, service_name, enable_ssl);
   }
 
   /// Create a ClientCache where connections are tried num_tries times, with a pause of
@@ -264,11 +269,11 @@ class ClientCache {
   /// each connection can also be set. If num_tries == 0, retry connections indefinitely.
   /// A send/receive timeout of 0 means there is no timeout.
   ClientCache(uint32_t num_tries, uint64_t wait_ms, int32_t send_timeout_ms = 0,
-      int32_t recv_timeout_ms = 0, const std::string& service_name = "")
+      int32_t recv_timeout_ms = 0, const std::string& service_name = "",
+      bool enable_ssl = false)
       : client_cache_helper_(num_tries, wait_ms, send_timeout_ms, recv_timeout_ms) {
-    client_factory_ =
-        boost::bind<ThriftClientImpl*>(
-            boost::mem_fn(&ClientCache::MakeClient), this, _1, _2, service_name);
+    client_factory_ = boost::bind<ThriftClientImpl*>(
+        boost::mem_fn(&ClientCache::MakeClient), this, _1, _2, service_name, enable_ssl);
   }
 
   /// Close all clients connected to the supplied address, (e.g., in
@@ -331,8 +336,9 @@ class ClientCache {
 
   /// Factory method to produce a new ThriftClient<T> for the wrapped cache
   ThriftClientImpl* MakeClient(const TNetworkAddress& address, ClientKey* client_key,
-      const std::string service_name) {
-    Client* client = new Client(address.hostname, address.port, service_name);
+      const std::string service_name, bool enable_ssl) {
+    Client* client = new Client(address.hostname, address.port, service_name, NULL,
+        enable_ssl);
     *client_key = reinterpret_cast<ClientKey>(client->iface());
     return client;
   }

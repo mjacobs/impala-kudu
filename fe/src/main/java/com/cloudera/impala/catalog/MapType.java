@@ -1,5 +1,7 @@
 package com.cloudera.impala.catalog;
 
+import org.apache.commons.lang3.StringUtils;
+
 import com.cloudera.impala.thrift.TColumnType;
 import com.cloudera.impala.thrift.TTypeNode;
 import com.cloudera.impala.thrift.TTypeNodeType;
@@ -23,8 +25,29 @@ public class MapType extends Type {
   public Type getValueType() { return valueType_; }
 
   @Override
-  public String toSql() {
-    return String.format("MAP<%s,%s>", keyType_.toSql(), valueType_.toSql());
+  public boolean equals(Object other) {
+    if (!(other instanceof MapType)) return false;
+    MapType otherMapType = (MapType) other;
+    return otherMapType.keyType_.equals(keyType_) &&
+        otherMapType.valueType_.equals(valueType_);
+  }
+
+  @Override
+  public String toSql(int depth) {
+    if (depth >= MAX_NESTING_DEPTH) return "MAP<...>";
+    return String.format("MAP<%s,%s>",
+        keyType_.toSql(depth + 1), valueType_.toSql(depth + 1));
+  }
+
+  @Override
+  protected String prettyPrint(int lpad) {
+    String leftPadding = StringUtils.repeat(' ', lpad);
+    if (!valueType_.isStructType()) return leftPadding + toSql();
+    // Pass in the padding to make sure nested fields are aligned properly,
+    // even if we then strip the top-level padding.
+    String structStr = valueType_.prettyPrint(lpad);
+    structStr = structStr.substring(lpad);
+    return String.format("%sMAP<%s,%s>", leftPadding, keyType_.toSql(), structStr);
   }
 
   @Override

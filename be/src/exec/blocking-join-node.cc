@@ -38,12 +38,23 @@ BlockingJoinNode::BlockingJoinNode(const string& node_name, const TJoinOp::type 
     join_op_(join_op),
     eos_(false),
     probe_side_eos_(false),
+    probe_batch_pos_(-1),
+    current_probe_row_(NULL),
     semi_join_staging_row_(NULL),
     can_add_probe_filters_(false) {
 }
 
 Status BlockingJoinNode::Init(const TPlanNode& tnode) {
   RETURN_IF_ERROR(ExecNode::Init(tnode));
+  DCHECK((join_op_ != TJoinOp::LEFT_SEMI_JOIN && join_op_ != TJoinOp::LEFT_ANTI_JOIN &&
+      join_op_ != TJoinOp::RIGHT_SEMI_JOIN && join_op_ != TJoinOp::RIGHT_ANTI_JOIN &&
+      join_op_ != TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN) || conjunct_ctxs_.size() == 0);
+  runtime_profile_->AddLocalTimeCounter(
+      bind<int64_t>(&BlockingJoinNode::LocalTimeCounterFn,
+      runtime_profile_->total_time_counter(),
+      child(0)->runtime_profile()->total_time_counter(),
+      child(1)->runtime_profile()->total_time_counter(),
+      &built_probe_overlap_stop_watch_));
   return Status::OK();
 }
 
@@ -117,18 +128,6 @@ Status BlockingJoinNode::Prepare(RuntimeState* state) {
   return Status::OK();
 }
 
-Status BlockingJoinNode::Reset(RuntimeState* state, RowBatch* row_batch) {
-  eos_ = false;
-  probe_side_eos_ = false;
-  if (row_batch != NULL) {
-    probe_batch_->TransferResourceOwnership(row_batch);
-    row_batch->tuple_data_pool()->AcquireData(build_pool_.get(), false);
-  }
-  probe_batch_->Reset();
-  build_pool_->FreeAll();
-  return ExecNode::Reset(state, row_batch);
-}
-
 void BlockingJoinNode::Close(RuntimeState* state) {
   if (is_closed()) return;
   if (build_pool_.get() != NULL) build_pool_->FreeAll();
@@ -141,7 +140,6 @@ void BlockingJoinNode::BuildSideThread(RuntimeState* state, Promise<Status>* sta
   Status s;
   {
     SCOPED_TIMER(state->total_cpu_timer());
-    SCOPED_TIMER(runtime_profile()->total_async_timer());
     s = ConstructBuildSide(state);
   }
   // IMPALA-1863: If the build-side thread failed, then we need to close the right
@@ -162,11 +160,16 @@ Status BlockingJoinNode::Open(RuntimeState* state) {
   RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(QueryMaintenance(state));
+  eos_ = false;
+  probe_side_eos_ = false;
 
-  // If we can get a thread token, initiate the construction of the build-side table in
-  // a separate thread, so that the left child can do any initialisation in parallel.
-  // Otherwise, do this in the main thread.
-  if (state->resource_pool()->TryAcquireThreadToken()) {
+  // If this node is not inside a subplan and can get a thread token, initiate the
+  // construction of the build-side table in a separate thread, so that the left child
+  // can do any initialisation in parallel. Otherwise, do this in the main thread.
+  // Inside a subplan we expect Open() to be called a number of times proportional to the
+  // input data of the SubplanNode, so we prefer doing the join build in the main thread,
+  // assuming that thread creation is expensive relative to a single subplan iteration.
+  if (!IsInSubplan() && state->resource_pool()->TryAcquireThreadToken()) {
     Promise<Status> build_side_status;
     AddRuntimeExecOption("Join Build-Side Prepared Asynchronously");
     Thread build_thread(node_name_, "build thread",
@@ -182,11 +185,29 @@ Status BlockingJoinNode::Open(RuntimeState* state) {
     // Don't exit even if we see an error, we still need to wait for the build thread
     // to finish.
     Status open_status = child(0)->Open(state);
+
+    // The left/right child overlap stops here.
+    clock_gettime(CLOCK_MONOTONIC, &overlap_stops_time_);
+    built_probe_overlap_stop_watch_.SetTimeCeiling(overlap_stops_time_);
+
     // Blocks until ConstructBuildSide has returned, after which the build side structures
     // are fully constructed.
     RETURN_IF_ERROR(build_side_status.Get());
     RETURN_IF_ERROR(open_status);
+  } else if (IsInSubplan()) {
+    // When inside a subplan, open the first child before doing the build such that
+    // UnnestNodes on the probe side are opened and project their unnested collection
+    // slots. Otherwise, the build might unnecessarily deep-copy those collection slots,
+    // and this node would return them in GetNext().
+    // TODO: Remove this special-case behavior for subplans once we have proper
+    // projection. See UnnestNode for details on the current projection implementation.
+    RETURN_IF_ERROR(child(0)->Open(state));
+    RETURN_IF_ERROR(ConstructBuildSide(state));
   } else {
+    // The left/right child never overlaps. The overlap stops here.
+    clock_gettime(CLOCK_MONOTONIC, &overlap_stops_time_);
+    built_probe_overlap_stop_watch_.SetTimeCeiling(overlap_stops_time_);
+
     RETURN_IF_ERROR(ConstructBuildSide(state));
     RETURN_IF_ERROR(child(0)->Open(state));
   }
@@ -199,7 +220,9 @@ Status BlockingJoinNode::Open(RuntimeState* state) {
     if (probe_batch_->num_rows() == 0) {
       if (probe_side_eos_) {
         RETURN_IF_ERROR(InitGetNext(NULL /* eos */));
-        eos_ = true;
+        // If the probe side is exhausted, set the eos_ to true for only those
+        // join modes that don't need to process unmatched build rows.
+        eos_ = !NeedToProcessUnmatchedBuildRows();
         break;
       }
       probe_batch_->Reset();
@@ -238,6 +261,20 @@ string BlockingJoinNode::GetLeftChildRowString(TupleRow* row) {
   }
   out << "]";
   return out.str();
+}
+
+int64_t BlockingJoinNode::LocalTimeCounterFn(const RuntimeProfile::Counter* total_time,
+    const RuntimeProfile::Counter* left_child_time,
+    const RuntimeProfile::Counter* right_child_time,
+    const MonotonicStopWatch* child_overlap_timer) {
+  int64_t local_time = total_time->value() - left_child_time->value() -
+      (right_child_time->value() - child_overlap_timer->TotalElapsedTime());
+  // While the calculation is correct at the end of the execution, counter value
+  // and the stop watch reading is not accurate during execution.
+  // If the child time counter is updated before the parent time counter, then the child
+  // time will be greater. Stop watch is not thread safe, which can return invalid value.
+  // Don't return a negative number in those cases.
+  return ::max(0L, local_time);
 }
 
 // This function is replaced by codegen

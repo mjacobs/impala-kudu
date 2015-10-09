@@ -15,6 +15,7 @@
 package com.cloudera.impala.analysis;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 
@@ -27,6 +28,7 @@ import com.cloudera.impala.catalog.View;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.Pair;
 import com.cloudera.impala.planner.PlanNode;
+import com.cloudera.impala.planner.JoinNode.DistributionMode;
 import com.cloudera.impala.thrift.TAccessEvent;
 import com.cloudera.impala.thrift.TCatalogObjectType;
 import com.google.common.base.Joiner;
@@ -40,14 +42,31 @@ import com.google.common.collect.Sets;
  * specification. An instance of a TableRef (and not a subclass thereof) represents
  * an unresolved table reference that must be resolved during analysis. All resolved
  * table references are subclasses of TableRef.
- * TODO: Rename this class to CollectionRef and re-consider the naming of all subclasses.
+ *
+ * The analysis of table refs follows a two-step process:
+ *
+ * 1. Resolution: A table ref's path is resolved and then the generic TableRef is
+ * replaced by a concrete table ref (a BaseTableRef, CollectionTabeRef or ViewRef)
+ * in the originating stmt and that is given the resolved path. This step is driven by
+ * Analyzer.resolveTableRef() which calls into TableRef.analyze().
+ *
+ * 2. Analysis/registration: After resolution, the concrete table ref is analyzed
+ * to register a tuple descriptor for its resolved path and register other table-ref
+ * specific state with the analyzer (e.g., whether it is outer/semi joined, etc.).
+ *
+ * Therefore, subclasses of TableRef should never call the analyze() of its superclass.
+ *
+ * TODO for 2.3: The current TableRef class hierarchy and the related two-phase analysis
+ * feels convoluted and is hard to follow. We should reorganize the TableRef class
+ * structure for clarity of analysis and avoid a table ref 'switching genders' in between
+ * resolution and registration.
+ *
+ * TODO for 2.3: Rename this class to CollectionRef and re-consider the naming and
+ * structure of all subclasses.
  */
 public class TableRef implements ParseNode {
   // Path to a collection type. Not set for inline views.
   protected List<String> rawPath_;
-
-  // Resolution of rawPath_ if applicable. Result of analysis.
-  protected Path resolvedPath_;
 
   // Legal aliases of this table ref. Contains the explicit alias as its sole element if
   // there is one. Otherwise, contains the two implicit aliases. Implicit aliases are set
@@ -62,12 +81,19 @@ public class TableRef implements ParseNode {
 
   protected JoinOperator joinOp_;
   protected ArrayList<String> joinHints_;
-  protected Expr onClause_;
   protected List<String> usingColNames_;
 
-  // set after analyzeJoinHints(); true if explicitly set via hints
-  private boolean isBroadcastJoin_;
-  private boolean isPartitionedJoin_;
+  // Hinted distribution mode for this table ref; set after analyzeJoinHints()
+  // TODO: Move join-specific members out of TableRef.
+  private DistributionMode distrMode_ = DistributionMode.NONE;
+
+  /////////////////////////////////////////
+  // BEGIN: Members that need to be reset()
+
+  // Resolution of rawPath_ if applicable. Result of analysis.
+  protected Path resolvedPath_;
+
+  protected Expr onClause_;
 
   // the ref to the left of us, if we're part of a JOIN clause
   protected TableRef leftTblRef_;
@@ -79,8 +105,17 @@ public class TableRef implements ParseNode {
   // all (logical) TupleIds referenced in the On clause
   protected List<TupleId> onClauseTupleIds_ = Lists.newArrayList();
 
+  // All physical tuple ids that this table ref is correlated with:
+  // Tuple ids of root descriptors from outer query blocks that this table ref
+  // (if a CollectionTableRef) or contained CollectionTableRefs (if an InlineViewRef)
+  // are rooted at. Populated during analysis.
+  protected List<TupleId> correlatedTupleIds_ = Lists.newArrayList();
+
   // analysis output
   protected TupleDescriptor desc_;
+
+  // END: Members that need to be reset()
+  /////////////////////////////////////////
 
   public TableRef(List<String> path, String alias) {
     super();
@@ -98,21 +133,30 @@ public class TableRef implements ParseNode {
    * C'tor for cloning.
    */
   protected TableRef(TableRef other) {
-    super();
-    Preconditions.checkNotNull(other);
-    this.rawPath_ = other.rawPath_;
-    this.resolvedPath_ = other.resolvedPath_;
-    this.aliases_ = other.aliases_;
-    this.hasExplicitAlias_ = other.hasExplicitAlias_;
-    this.joinOp_ = other.joinOp_;
-    this.joinHints_ =
+    rawPath_ = other.rawPath_;
+    resolvedPath_ = other.resolvedPath_;
+    aliases_ = other.aliases_;
+    hasExplicitAlias_ = other.hasExplicitAlias_;
+    joinOp_ = other.joinOp_;
+    joinHints_ =
         (other.joinHints_ != null) ? Lists.newArrayList(other.joinHints_) : null;
-    this.usingColNames_ =
+    onClause_ = (other.onClause_ != null) ? other.onClause_.clone() : null;
+    usingColNames_ =
         (other.usingColNames_ != null) ? Lists.newArrayList(other.usingColNames_) : null;
-    this.onClause_ = (other.onClause_ != null) ? other.onClause_.clone().reset() : null;
-    this.isAnalyzed_ = false;
+    distrMode_ = other.distrMode_;
+    // The table ref links are created at the statement level, so cloning a set of linked
+    // table refs is the responsibility of the statement.
+    leftTblRef_ = null;
+    isAnalyzed_ = other.isAnalyzed_;
+    onClauseTupleIds_ = Lists.newArrayList(other.onClauseTupleIds_);
+    correlatedTupleIds_ = Lists.newArrayList(other.correlatedTupleIds_);
+    desc_ = other.desc_;
   }
 
+  /**
+   * Resolves this table ref's raw path and adds privilege requests and audit events
+   * for the referenced catalog entities.
+   */
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
     try {
@@ -137,7 +181,7 @@ public class TableRef implements ParseNode {
           "Failed to load metadata for table: '%s'", Joiner.on(".").join(rawPath_)), e);
     }
 
-    if (resolvedPath_.getRootTable() != null) {
+    if (resolvedPath_.isRootedAtTable()) {
       // Add access event for auditing.
       Table table = resolvedPath_.getRootTable();
       if (table instanceof View) {
@@ -191,10 +235,16 @@ public class TableRef implements ParseNode {
   }
 
   /**
-   * Returns true if the path of this table ref is is rooted at a
-   * registered parent ref.
+   * Returns true if this table ref has a resolved path that is rooted at a registered
+   * tuple descriptor, false otherwise.
    */
-  public boolean isChildRef() { return false; }
+  public boolean isRelative() { return false; }
+
+  /**
+   * Indicates if this TableRef directly or indirectly references another TableRef from
+   * an outer query block.
+   */
+  public boolean isCorrelated() { return !correlatedTupleIds_.isEmpty(); }
 
   public List<String> getPath() { return rawPath_; }
   public Path getResolvedPath() { return resolvedPath_; }
@@ -239,9 +289,14 @@ public class TableRef implements ParseNode {
   public TableRef getLeftTblRef() { return leftTblRef_; }
   public void setLeftTblRef(TableRef leftTblRef) { this.leftTblRef_ = leftTblRef; }
   public void setJoinHints(ArrayList<String> hints) { this.joinHints_ = hints; }
-  public boolean isBroadcastJoin() { return isBroadcastJoin_; }
-  public boolean isPartitionedJoin() { return isPartitionedJoin_; }
+  public boolean isBroadcastJoin() { return distrMode_ == DistributionMode.BROADCAST; }
+  public boolean isPartitionedJoin() {
+    return distrMode_ == DistributionMode.PARTITIONED;
+  }
+  public DistributionMode getDistributionMode() { return distrMode_; }
   public List<TupleId> getOnClauseTupleIds() { return onClauseTupleIds_; }
+  public List<TupleId> getCorrelatedTupleIds() { return correlatedTupleIds_; }
+  public boolean isAnalyzed() { return isAnalyzed_; }
   public boolean isResolved() { return !getClass().equals(TableRef.class); }
 
   /**
@@ -260,7 +315,7 @@ public class TableRef implements ParseNode {
   public TupleId getId() {
     Preconditions.checkState(isAnalyzed_);
     // after analyze(), desc should be set.
-    Preconditions.checkState(desc_ != null);
+    Preconditions.checkNotNull(desc_);
     return desc_.getId();
   }
 
@@ -311,19 +366,19 @@ public class TableRef implements ParseNode {
           throw new AnalysisException(
               joinOp_.toString() + " does not support BROADCAST.");
         }
-        if (isPartitionedJoin_) {
+        if (isPartitionedJoin()) {
           throw new AnalysisException("Conflicting JOIN hint: " + hint);
         }
-        isBroadcastJoin_ = true;
+        distrMode_ = DistributionMode.BROADCAST;
         analyzer.setHasPlanHints();
       } else if (hint.equalsIgnoreCase("SHUFFLE")) {
         if (joinOp_ == JoinOperator.CROSS_JOIN) {
           throw new AnalysisException("CROSS JOIN does not support SHUFFLE.");
         }
-        if (isBroadcastJoin_) {
+        if (isBroadcastJoin()) {
           throw new AnalysisException("Conflicting JOIN hint: " + hint);
         }
-        isPartitionedJoin_ = true;
+        distrMode_ = DistributionMode.PARTITIONED;
         analyzer.setHasPlanHints();
       } else {
         analyzer.addWarning("JOIN hint not recognized: " + hint);
@@ -341,7 +396,7 @@ public class TableRef implements ParseNode {
     analyzeJoinHints(analyzer);
     if (joinOp_ == JoinOperator.CROSS_JOIN) {
       // A CROSS JOIN is always a broadcast join, regardless of the join hints
-      isBroadcastJoin_ = true;
+      distrMode_ = DistributionMode.BROADCAST;
     }
 
     if (usingColNames_ != null) {
@@ -420,21 +475,26 @@ public class TableRef implements ParseNode {
             "analytic expression not allowed in ON clause: " + toSql());
       }
       Set<TupleId> onClauseTupleIds = Sets.newHashSet();
-      for (Expr e: onClause_.getConjuncts()) {
-        // Outer join clause conjuncts are registered for this particular table ref
-        // (ie, can only be evaluated by the plan node that implements this join).
-        // The exception are conjuncts that only pertain to the nullable side
-        // of the outer join; those can be evaluated directly when materializing tuples
-        // without violating outer join semantics.
-        analyzer.registerOnClauseConjuncts(e, this);
+      List<Expr> conjuncts = onClause_.getConjuncts();
+      // Outer join clause conjuncts are registered for this particular table ref
+      // (ie, can only be evaluated by the plan node that implements this join).
+      // The exception are conjuncts that only pertain to the nullable side
+      // of the outer join; those can be evaluated directly when materializing tuples
+      // without violating outer join semantics.
+      analyzer.registerOnClauseConjuncts(conjuncts, this);
+      for (Expr e: conjuncts) {
         List<TupleId> tupleIds = Lists.newArrayList();
         e.getIds(tupleIds, null);
         onClauseTupleIds.addAll(tupleIds);
       }
       onClauseTupleIds_.addAll(onClauseTupleIds);
-    } else if (!isChildRef()
+    } else if (!isRelative() && !isCorrelated()
         && (getJoinOp().isOuterJoin() || getJoinOp().isSemiJoin())) {
-      throw new AnalysisException(joinOp_.toString() + " requires an ON or USING clause.");
+      throw new AnalysisException(
+          joinOp_.toString() + " requires an ON or USING clause.");
+    } else {
+      // Indicate that this table ref has an empty ON-clause.
+      analyzer.registerOnClauseConjuncts(Collections.<Expr>emptyList(), this);
     }
   }
 
@@ -498,6 +558,50 @@ public class TableRef implements ParseNode {
    */
   public Privilege getPrivilegeRequirement() { return Privilege.SELECT; }
 
+  /**
+   * Returns a deep clone of this table ref without also cloning the chain of table refs.
+   * Sets leftTblRef_ in the returned clone to null.
+   */
   @Override
-  public TableRef clone() { return new TableRef(this); }
+  protected TableRef clone() { return new TableRef(this); }
+
+  /**
+   * Deep copies the given list of table refs and returns the clones in a new list.
+   * The linking structure in the original table refs is preserved in the clones,
+   * i.e., if the table refs were originally linked, then the corresponding clones
+   * are linked in the same way. Similarly, if the original table refs were not linked
+   * then the clones are also not linked.
+   * Assumes that the given table refs are self-contained with respect to linking, i.e.,
+   * that no table ref links to another table ref not in the list.
+   */
+  public static List<TableRef> cloneTableRefList(List<TableRef> tblRefs) {
+    List<TableRef> clonedTblRefs = Lists.newArrayListWithCapacity(tblRefs.size());
+    TableRef leftTblRef = null;
+    for (TableRef tblRef: tblRefs) {
+      TableRef tblRefClone = tblRef.clone();
+      clonedTblRefs.add(tblRefClone);
+      if (tblRef.leftTblRef_ != null) {
+        Preconditions.checkState(tblRefs.contains(tblRef.leftTblRef_));
+        tblRefClone.leftTblRef_ = leftTblRef;
+      }
+      leftTblRef = tblRefClone;
+    }
+    return clonedTblRefs;
+  }
+
+  public void reset() {
+    isAnalyzed_ = false;
+    resolvedPath_ = null;
+    if (usingColNames_ != null) {
+      // The using col names are converted into an on-clause predicate during analysis,
+      // so unset the on-clause here.
+      onClause_ = null;
+    } else if (onClause_ != null) {
+      onClause_.reset();
+    }
+    leftTblRef_ = null;
+    onClauseTupleIds_.clear();
+    desc_ = null;
+    correlatedTupleIds_.clear();
+  }
 }

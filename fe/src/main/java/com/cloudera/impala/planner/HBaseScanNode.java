@@ -41,6 +41,7 @@ import com.cloudera.impala.catalog.HBaseColumn;
 import com.cloudera.impala.catalog.HBaseTable;
 import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.catalog.Type;
+import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.common.Pair;
 import com.cloudera.impala.service.FeSupport;
@@ -113,7 +114,8 @@ public class HBaseScanNode extends ScanNode {
   }
 
   @Override
-  public void init(Analyzer analyzer) throws InternalException {
+  public void init(Analyzer analyzer) throws ImpalaException {
+    checkForSupportedFileFormats();
     assignConjuncts(analyzer);
     setStartStopKey(analyzer);
     // Convert predicates to HBase filters_.
@@ -209,12 +211,12 @@ public class HBaseScanNode extends ScanNode {
     inputCardinality_ = cardinality_;
 
     cardinality_ *= computeSelectivity();
-    cardinality_ = Math.max(0, cardinality_);
+    cardinality_ = Math.max(1, cardinality_);
     cardinality_ = capAtLimit(cardinality_);
     LOG.debug("computeStats HbaseScan: cardinality=" + Long.toString(cardinality_));
 
     // TODO: take actual regions into account
-    numNodes_ = desc_.getTable().getNumNodes();
+    numNodes_ = tbl.getNumNodes();
     LOG.debug("computeStats HbaseScan: #nodes=" + Integer.toString(numNodes_));
   }
 
@@ -260,7 +262,7 @@ public class HBaseScanNode extends ScanNode {
         HBaseColumn col = (HBaseColumn) slot.getColumn();
         filters_.add(new THBaseFilter(
             col.getColumnFamily(), col.getColumnQualifier(),
-            (byte) hbaseOp.ordinal(), literal.getValue()));
+            (byte) hbaseOp.ordinal(), literal.getUnescapedValue()));
         analyzer.materializeSlots(Lists.newArrayList(e));
       }
     }

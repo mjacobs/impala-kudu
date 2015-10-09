@@ -66,7 +66,7 @@ Status PartitionedAggregationNode::ProcessBatch(RowBatch* batch, HashTableCtx* h
     // so we can try again to insert the row.
     Partition* dst_partition = hash_partitions_[hash >> (32 - NUM_PARTITIONING_BITS)];
     if (!dst_partition->is_spilled()) {
-      DCHECK_NOTNULL(dst_partition->hash_tbl.get());
+      DCHECK(dst_partition->hash_tbl.get() != NULL);
       DCHECK(dst_partition->aggregated_row_stream->is_pinned());
 
       HashTable* ht = dst_partition->hash_tbl.get();
@@ -103,16 +103,17 @@ allocate_tuple:
       // result row the first time, we need to construct the result row and
       // initialize it.
       intermediate_tuple = ConstructIntermediateTuple(dst_partition->agg_fn_ctxs,
-          NULL, dst_partition->aggregated_row_stream.get(), &processBatchStatus_);
+          NULL, dst_partition->aggregated_row_stream.get(), &process_batch_status_);
       if (intermediate_tuple != NULL) {
         UpdateTuple(&dst_partition->agg_fn_ctxs[0],
             intermediate_tuple, row, AGGREGATED_ROWS);
-      } else if (!processBatchStatus_.ok() && !processBatchStatus_.IsMemLimitExceeded()) {
+      } else if (!process_batch_status_.ok() &&
+                 !process_batch_status_.IsMemLimitExceeded()) {
         // TODO: cleanup BufferedBlockMgr returns so that we don't need to check the
         // status code here.  Unreserved memory requests signal failure with
         // intermediate_tuple == NULL and Status::OK, but reserved requests fail with
         // MEM_LIMIT_EXCEEDED.
-        return processBatchStatus_;
+        return process_batch_status_;
       }
       // After copying and initialize it, try to insert the tuple into the hash table.
       // If it inserts, we are done.
@@ -148,9 +149,10 @@ allocate_tuple:
     DCHECK(dst_stream != NULL);
     DCHECK(!dst_stream->is_pinned()) << AGGREGATED_ROWS;
     DCHECK(dst_stream->has_write_block()) << AGGREGATED_ROWS;
-    if (dst_stream->AddRow(row, &processBatchStatus_)) continue;
-    DCHECK(!processBatchStatus_.ok()) << AGGREGATED_ROWS;
-    return processBatchStatus_;
+    DCHECK(!dst_stream->using_small_buffers()) << AGGREGATED_ROWS;
+    if (dst_stream->AddRow(row, &process_batch_status_)) continue;
+    DCHECK(!process_batch_status_.ok()) << AGGREGATED_ROWS;
+    return process_batch_status_;
   }
 
   return Status::OK();

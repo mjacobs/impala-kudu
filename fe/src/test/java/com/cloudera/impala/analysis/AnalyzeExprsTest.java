@@ -22,25 +22,28 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 
-import junit.framework.Assert;
-
+import org.junit.Assert;
 import org.junit.Test;
 
 import com.cloudera.impala.analysis.TimestampArithmeticExpr.TimeUnit;
+import com.cloudera.impala.authorization.Privilege;
+import com.cloudera.impala.catalog.Catalog;
 import com.cloudera.impala.catalog.CatalogException;
 import com.cloudera.impala.catalog.Column;
+import com.cloudera.impala.catalog.Db;
+import com.cloudera.impala.catalog.Function;
 import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.catalog.ScalarFunction;
 import com.cloudera.impala.catalog.ScalarType;
 import com.cloudera.impala.catalog.Table;
 import com.cloudera.impala.catalog.TestSchemaUtils;
 import com.cloudera.impala.catalog.Type;
+import com.cloudera.impala.catalog.Function.CompareMode;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.thrift.TExpr;
 import com.cloudera.impala.thrift.TQueryOptions;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
 
 public class AnalyzeExprsTest extends AnalyzerTest {
@@ -243,6 +246,14 @@ public class AnalyzeExprsTest extends AnalyzerTest {
 
     AnalysisError("select cast(1 as decimal(0, 1))",
         "Decimal precision must be > 0: 0");
+
+    // IMPALA-2264: decimal is implicitly cast to lower-precision integer in edge cases.
+    checkReturnType("select CAST(999 AS DECIMAL(3,0))", ScalarType.createDecimalType(3,0));
+    AnalysisError("insert into functional.alltypesinsert (tinyint_col, year, month) " +
+        "values(CAST(999 AS DECIMAL(3,0)), 1, 1)",
+        "Possible loss of precision for target table 'functional.alltypesinsert'.\n" +
+        "Expression 'cast(999 as decimal(3,0))' (type: DECIMAL(3,0)) would need to be " +
+        "cast to TINYINT for column 'tinyint_col'");
   }
 
   /**
@@ -962,6 +973,42 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     //      + "from functional.alltypes",
     //    "Only one ORDER BY expression allowed if used with a RANGE window with "
     //      + "PRECEDING/FOLLOWING");
+
+    // percent_rank(), cume_dist() and ntile() tests
+    AnalyzesOk("select percent_rank() over(order by id) from functional.alltypes");
+    AnalyzesOk("select cume_dist() over(order by id) from functional.alltypes");
+    AnalyzesOk("select ntile(3) over(order by id) from functional.alltypes");
+    AnalyzesOk("select ntile(3000) over(order by id) from functional.alltypes");
+    AnalyzesOk("select ntile(3000000000) over(order by id) from functional.alltypes");
+    AnalyzesOk("select percent_rank() over(partition by tinyint_col, bool_col "
+        + "order by id), ntile(3) over(partition by int_col, bool_col "
+        + "order by smallint_col, id), cume_dist() over(partition by int_col, bool_col "
+        + "order by month) from functional.alltypes");
+
+    AnalysisError("select ntile(-1) over(order by int_col) from functional.alltypestiny",
+        "NTILE() requires a positive argument: -1");
+    AnalysisError("select percent_rank() over(partition by int_col) "
+        + "from functional.alltypestiny",
+        "'percent_rank()' requires an ORDER BY clause");
+    AnalysisError("select cume_dist() over(partition by int_col) "
+        + "from functional.alltypestiny",
+      "'cume_dist()' requires an ORDER BY clause");
+    AnalysisError("select ntile(2) over(partition by int_col) "
+        + "from functional.alltypestiny",
+      "'ntile(2)' requires an ORDER BY clause");
+    // TODO: Remove this test once we allow for non-constant arguments in ntile()
+    AnalysisError(
+      "select ntile(int_col) over(order by tinyint_col) "
+        + "from functional.alltypestiny",
+      "NTILE() requires a constant argument");
+
+    // Cannot order or partition by complex-typed expression.
+    AnalysisError("select id, row_number() over (order by int_array_col) " +
+        "from functional_parquet.allcomplextypes", "ORDER BY expression " +
+        "'int_array_col' with complex type 'ARRAY<INT>' is not supported.");
+    AnalysisError("select id, count() over (partition by int_struct_col) " +
+        "from functional_parquet.allcomplextypes", "PARTITION BY expression " +
+        "'int_struct_col' with complex type 'STRUCT<f1:INT,f2:INT>' is not supported.");
   }
 
   /**
@@ -975,7 +1022,7 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         Type.BIGINT, Type.FLOAT, Type.DOUBLE , Type.NULL };
     for (Type type1: numericTypes) {
       for (Type type2: numericTypes) {
-        Type t = Type.getAssignmentCompatibleType(type1, type2);
+        Type t = Type.getAssignmentCompatibleType(type1, type2, false);
         assertTrue(t.isScalarType());
         ScalarType compatibleType = (ScalarType) t;
         Type promotedType = compatibleType.getNextResolutionType();
@@ -1056,8 +1103,11 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     for (BinaryPredicate.Operator cmpOp: BinaryPredicate.Operator.values()) {
       for (Type type1: types) {
         for (Type type2: types) {
-          Type compatibleType =
-              Type.getAssignmentCompatibleType(type1, type2);
+          // Prefer strict matching.
+          Type compatibleType = Type.getAssignmentCompatibleType(type1, type2, true);
+          if (compatibleType.isInvalid()) {
+            compatibleType = Type.getAssignmentCompatibleType(type1, type2, false);
+          }
           typeCastTest(type1, type2, false, null, cmpOp, compatibleType);
           typeCastTest(type1, type2, true, null, cmpOp, compatibleType);
         }
@@ -1238,7 +1288,9 @@ public class AnalyzeExprsTest extends AnalyzerTest {
   public void TestFixedPointArithmeticOps() throws AnalysisException {
     // negative tests, no floating point types allowed
     AnalysisError("select ~float_col from functional.alltypes",
-        "Bitwise operations only allowed on integer types");
+        "'~' operation only allowed on integer types");
+    AnalysisError("select float_col! from functional.alltypes",
+        "'!' operation only allowed on integer types");
     AnalysisError("select float_col ^ int_col from functional.alltypes",
         "Invalid non-integer argument to operation '^'");
     AnalysisError("select float_col & int_col from functional.alltypes",
@@ -1402,6 +1454,9 @@ public class AnalyzeExprsTest extends AnalyzerTest {
   @Test
   public void TestFunctionCallExpr() throws AnalysisException {
     AnalyzesOk("select pi()");
+    AnalyzesOk("select _impala_builtins.pi()");
+    AnalyzesOk("select _impala_builtins.decode(1, 2, 3)");
+    AnalyzesOk("select _impala_builtins.DECODE(1, 2, 3)");
     AnalyzesOk("select sin(pi())");
     AnalyzesOk("select sin(cos(pi()))");
     AnalyzesOk("select sin(cos(tan(e())))");
@@ -1619,24 +1674,33 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     SelectStmt stmt = (SelectStmt)AnalyzesOk(String.format(sqlTemplate, caseSql));
     CaseExpr caseExpr =
         (CaseExpr)stmt.getSelectList().getItems().get(0).getExpr();
-    List<SlotRef> slotRefs = Lists.newArrayList();
-    caseExpr.collect(Predicates.instanceOf(SlotRef.class), slotRefs);
-    for (SlotRef slotRef: slotRefs) {
-      slotRef.getDesc().setIsMaterialized(true);
-      slotRef.getDesc().setByteOffset(0);
-    }
+    makeExprExecutable(caseExpr, stmt.getAnalyzer());
     TExpr caseThrift = caseExpr.treeToThrift();
     stmt = (SelectStmt)AnalyzesOk(String.format(sqlTemplate, decodeSql));
     CaseExpr decodeExpr =
         (CaseExpr)stmt.getSelectList().getItems().get(0).getExpr();
     Assert.assertEquals(caseSql, decodeExpr.toCaseSql());
-    slotRefs.clear();
-    decodeExpr.collect(Predicates.instanceOf(SlotRef.class), slotRefs);
-    for (SlotRef slotRef: slotRefs) {
-      slotRef.getDesc().setIsMaterialized(true);
-      slotRef.getDesc().setByteOffset(0);
-    }
+    makeExprExecutable(caseExpr, stmt.getAnalyzer());
     Assert.assertEquals(caseThrift, decodeExpr.treeToThrift());
+  }
+
+  /**
+   * Marks all slots referenced by 'e' as materialized. Also marks all referenced tuples
+   * as materialized and computes their mem layout.
+   */
+  private void makeExprExecutable(Expr e, Analyzer analyzer) {
+    List<TupleId> tids = Lists.newArrayList();
+    List<SlotId> sids = Lists.newArrayList();
+    e.getIds(tids, sids);
+    for (SlotId sid: sids) {
+      SlotDescriptor slotDesc = analyzer.getDescTbl().getSlotDesc(sid);
+      slotDesc.setIsMaterialized(true);
+    }
+    for (TupleId tid: tids) {
+      TupleDescriptor tupleDesc = analyzer.getTupleDesc(tid);
+      tupleDesc.setIsMaterialized(true);
+      tupleDesc.computeMemLayout();
+    }
   }
 
   @Test
@@ -1960,7 +2024,9 @@ public class AnalyzeExprsTest extends AnalyzerTest {
     AnalysisError("select d1 ^ d1 from functional.decimal_tbl",
         "Invalid non-integer argument to operation '^': d1 ^ d1");
     AnalysisError("select ~d1 from functional.decimal_tbl",
-        "Bitwise operations only allowed on integer types: ~d1");
+        "'~' operation only allowed on integer types: ~d1");
+    AnalysisError("select d1! from functional.decimal_tbl",
+        "'!' operation only allowed on integer types: d1!");
 
     AnalyzesOk("select d3 = d4 from functional.decimal_tbl");
     AnalyzesOk("select d5 != d1 from functional.decimal_tbl");
@@ -2172,5 +2238,61 @@ public class AnalyzeExprsTest extends AnalyzerTest {
         createAnalyzer(queryOptions),
         "all DISTINCT aggregate functions need to have the same set of parameters as " +
         "avg(DISTINCT int_col); deviating function: sum(DISTINCT");
+  }
+
+  @Test
+  // IMPALA-2233: Regression test for loss of precision through implicit casts.
+  public void TestImplicitArgumentCasts() throws AnalysisException {
+    FunctionName fnName = new FunctionName(Catalog.BUILTINS_DB, "greatest");
+    Function tinyIntFn = new Function(fnName, new Type[] {ScalarType.DOUBLE},
+        Type.DOUBLE, true);
+    Function decimalFn = new Function(fnName,
+        new Type[] {ScalarType.TINYINT, ScalarType.createDecimalType(30, 10)},
+        Type.INVALID, false);
+    Assert.assertFalse(tinyIntFn.compare(decimalFn, CompareMode.IS_SUPERTYPE_OF));
+    Assert.assertTrue(tinyIntFn.compare(decimalFn,
+        CompareMode.IS_NONSTRICT_SUPERTYPE_OF));
+    // Check that this resolves to the decimal version of the function.
+    Analyzer analyzer = createAnalyzer(Catalog.BUILTINS_DB);
+    Db db = analyzer.getDb(Catalog.BUILTINS_DB, Privilege.VIEW_METADATA, true);
+    Function foundFn = db.getFunction(decimalFn, CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+    assertNotNull(foundFn);
+    Assert.assertTrue(foundFn.getArgs()[0].isDecimal());
+
+    // The double version of the function is a non-strict supertype if the arguments are
+    // (double, decimal).
+    Function doubleDecimalFn = new Function(fnName,
+        new Type[] {ScalarType.DOUBLE, ScalarType.createDecimalType(30, 10)},
+        Type.INVALID, false);
+    foundFn = db.getFunction(doubleDecimalFn, CompareMode.IS_SUPERTYPE_OF);
+    Assert.assertNull(foundFn);
+    foundFn = db.getFunction(doubleDecimalFn, CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+    assertNotNull(foundFn);
+    Assert.assertEquals(Type.DOUBLE, foundFn.getArgs()[0]);
+
+    // Float and any precision decimal can be matched to FLOAT non-strictly.
+    Function floatDecimalFn = new Function(fnName,
+        new Type[] {ScalarType.FLOAT, ScalarType.createDecimalType(10, 7)},
+        Type.INVALID, false);
+    foundFn = db.getFunction(floatDecimalFn, CompareMode.IS_SUPERTYPE_OF);
+    Assert.assertNull(foundFn);
+    foundFn = db.getFunction(floatDecimalFn, CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
+    assertNotNull(foundFn);
+    Assert.assertEquals(Type.FLOAT, foundFn.getArgs()[0]);
+
+    // Float and bigint should be matched to double.
+    Function floatBigIntFn = new Function(fnName,
+        new Type[] {ScalarType.FLOAT, ScalarType.BIGINT}, Type.INVALID, false);
+    foundFn = db.getFunction(floatBigIntFn, CompareMode.IS_SUPERTYPE_OF);
+    Assert.assertNotNull(foundFn);
+    Assert.assertEquals(Type.DOUBLE, foundFn.getArgs()[0]);
+
+    FunctionName lagFnName = new FunctionName(Catalog.BUILTINS_DB, "lag");
+    // Timestamp should not be converted to string if string overload available.
+    Function lagStringFn = new Function(lagFnName,
+        new Type[] {ScalarType.STRING, Type.TINYINT}, Type.INVALID, false);
+    foundFn = db.getFunction(lagStringFn, CompareMode.IS_SUPERTYPE_OF);
+    Assert.assertNotNull(foundFn);
+    Assert.assertEquals(Type.STRING, foundFn.getArgs()[0]);
   }
 }

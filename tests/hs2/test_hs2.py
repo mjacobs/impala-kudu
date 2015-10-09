@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # Copyright (c) 2012 Cloudera, Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +15,9 @@
 # Client tests for Impala's HiveServer2 interface
 
 import pytest
+import json
+from socket import getfqdn
+from urllib2 import urlopen
 from tests.hs2.hs2_test_suite import HS2TestSuite, needs_session, operation_id_to_query_id
 from TCLIService import TCLIService
 from ImpalaService import ImpalaHiveServer2Service
@@ -26,6 +28,18 @@ class TestHS2(HS2TestSuite):
     """Check that a session can be opened"""
     open_session_req = TCLIService.TOpenSessionReq()
     TestHS2.check_response(self.hs2_client.OpenSession(open_session_req))
+
+  def test_open_session_http_addr(self):
+    """Check that OpenSession returns the coordinator's http address."""
+    open_session_req = TCLIService.TOpenSessionReq()
+    open_session_resp = self.hs2_client.OpenSession(open_session_req)
+    TestHS2.check_response(open_session_resp)
+    http_addr = open_session_resp.configuration['http_addr']
+    resp = urlopen("http://%s/queries?json" % http_addr)
+    assert resp.msg == 'OK'
+    queries_json = json.loads(resp.read())
+    assert 'completed_queries' in queries_json
+    assert 'in_flight_queries' in queries_json
 
   def test_open_session_unsupported_protocol(self):
     """Test that we get the right protocol version back if we ask for one larger than the
@@ -245,3 +259,29 @@ class TestHS2(HS2TestSuite):
     TestHS2.check_response(get_profile_resp)
 
     assert execute_statement_req.statement in get_profile_resp.profile
+
+  @needs_session(conf_overlay={"use:database": "functional"})
+  def test_change_default_database(self):
+    execute_statement_req = TCLIService.TExecuteStatementReq()
+    execute_statement_req.sessionHandle = self.session_handle
+    execute_statement_req.statement = "SELECT 1 FROM alltypes LIMIT 1"
+    execute_statement_resp = self.hs2_client.ExecuteStatement(execute_statement_req)
+    # Will fail if there's no table called 'alltypes' in the database
+    TestHS2.check_response(execute_statement_resp)
+
+  @needs_session(conf_overlay={"use:database": "FUNCTIONAL"})
+  def test_change_default_database_case_insensitive(self):
+    execute_statement_req = TCLIService.TExecuteStatementReq()
+    execute_statement_req.sessionHandle = self.session_handle
+    execute_statement_req.statement = "SELECT 1 FROM alltypes LIMIT 1"
+    execute_statement_resp = self.hs2_client.ExecuteStatement(execute_statement_req)
+    # Will fail if there's no table called 'alltypes' in the database
+    TestHS2.check_response(execute_statement_resp)
+
+  @needs_session(conf_overlay={"use:database": "doesnt-exist"})
+  def test_bad_default_database(self):
+    execute_statement_req = TCLIService.TExecuteStatementReq()
+    execute_statement_req.sessionHandle = self.session_handle
+    execute_statement_req.statement = "SELECT 1 FROM alltypes LIMIT 1"
+    execute_statement_resp = self.hs2_client.ExecuteStatement(execute_statement_req)
+    TestHS2.check_response(execute_statement_resp, TCLIService.TStatusCode.ERROR_STATUS)

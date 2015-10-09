@@ -136,7 +136,7 @@ Status ProjectedColumnsFromTupleDescriptor(const TupleDescriptor& tuple_desc,
   for (int i = 0; i < slots.size(); ++i) {
     if (!slots[i]->is_materialized()) continue;
     int col_idx = slots[i]->col_pos();
-    string impala_col_name = to_lower_copy(table_desc->col_names()[col_idx]);
+    string impala_col_name = to_lower_copy(table_desc->col_descs()[col_idx].name());
     IdxByLowerCaseColName::const_iterator iter;
     if ((iter = idx_by_lc_name.find(impala_col_name)) == idx_by_lc_name.end()) {
       return Status(strings::Substitute("Could not find column: $0 in the Kudu schema.",

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env impala-python
 # Copyright 2012 Cloudera Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,15 @@
 # ImpalaD instances. Each ImpalaD runs on a different port allowing this to be run
 # on a single machine.
 import os
+# psutil does not exist on hosts which build Impala packages. Furthermore, it is not
+# needed as the packaging code does not start any processes.
+# TODO: Remove this logic and all usage of psutil_exists once we switch to using a python
+# virtualenv.
+try:
+  import psutil
+  psutil_exists = True
+except ImportError:
+  psutil_exists = False
 import sys
 from time import sleep, time
 from optparse import OptionParser
@@ -28,13 +37,16 @@ parser.add_option("-s", "--cluster_size", type="int", dest="cluster_size", defau
                   help="Size of the cluster (number of impalad instances to start).")
 parser.add_option("--build_type", dest="build_type", default= 'debug',
                   help="Build type to use - debug / release")
-parser.add_option("--impalad_args", dest="impalad_args", default="",
+parser.add_option("--impalad_args", dest="impalad_args", action="append", type="string",
+                  default=[],
                   help="Additional arguments to pass to each Impalad during startup")
 parser.add_option("--enable_rm", dest="enable_rm", action="store_true", default=False,
                   help="Enable resource management with Yarn and Llama.")
-parser.add_option("--state_store_args", dest="state_store_args", default="",
+parser.add_option("--state_store_args", dest="state_store_args", action="append",
+                  type="string", default=[],
                   help="Additional arguments to pass to State Store during startup")
-parser.add_option("--catalogd_args", dest="catalogd_args", default="",
+parser.add_option("--catalogd_args", dest="catalogd_args", action="append",
+                  type="string", default=[],
                   help="Additional arguments to pass to the Catalog Service at startup")
 parser.add_option("--kill", "--kill_only", dest="kill_only", action="store_true",
                   default=False, help="Instead of starting the cluster, just kill all"\
@@ -80,6 +92,27 @@ RM_ARGS = ("-enable_rm=true -llama_addresses=%s -cgroup_hierarchy_path=%s "
            "-fair_scheduler_allocation_path=%s")
 CLUSTER_WAIT_TIMEOUT_IN_SECONDS = 240
 
+def check_process_exists(binary, attempts=1):
+  """Checks if a process exists given the binary name. The `attempts` count allows us to
+  control the time a process needs to settle until it becomes available. After each try
+  the script will sleep for one second and retry. Returns True if it exists and False
+  otherwise.
+  TODO: The conditional import will go away once we start using virtualenv.
+  """
+  if not psutil_exists:
+    print "psutil not available, process invocations and kills may be unstable."
+    return True
+  for _ in range(attempts):
+    for pid in psutil.get_pid_list():
+      try:
+        process = psutil.Process(pid)
+        if process.name == binary: return True
+      except psutil.NoSuchProcess, e:
+        # Ignore the case when a process is no longer exists
+        pass
+    sleep(1)
+  return False
+
 def exec_impala_process(cmd, args, stderr_log_file_path):
   redirect_output = str()
   if options.verbose:
@@ -102,19 +135,29 @@ def kill_matching_processes(binary_name, force=False):
   if force: kill_cmd += " -9"
   os.system("%s %s" % (kill_cmd, binary_name))
 
+  if psutil_exists and check_process_exists(binary_name):
+    raise RuntimeError("Unable to kill %s. Check process permissions." % (binary_name, ))
+
 def start_statestore():
   print "Starting State Store logging to %s/statestored.INFO" % options.log_dir
   stderr_log_file_path = os.path.join(options.log_dir, "statestore-error.log")
   args = "%s %s" % (build_impalad_logging_args(0, "statestored"),
-                    options.state_store_args)
+                    " ".join(options.state_store_args))
   exec_impala_process(STATE_STORE_PATH, args, stderr_log_file_path)
+  if not check_process_exists("statestored", 10):
+    raise RuntimeError("Unable to start statestored. Check log or file permissions"
+                       " for more details.")
 
 def start_catalogd():
   print "Starting Catalog Service logging to %s/catalogd.INFO" % options.log_dir
   stderr_log_file_path = os.path.join(options.log_dir, "catalogd-error.log")
   args = "%s %s %s" % (build_impalad_logging_args(0, "catalogd"),
-                       options.catalogd_args, build_jvm_args(options.cluster_size))
+                       " ".join(options.catalogd_args),
+                       build_jvm_args(options.cluster_size))
   exec_impala_process(CATALOGD_PATH, args, stderr_log_file_path)
+  if not check_process_exists("catalogd", 10):
+    raise RuntimeError("Unable to start catalogd. Check log or file permissions"
+                       " for more details.")
 
 def start_mini_impala_cluster(cluster_size):
   print ("Starting in-process Impala Cluster logging "
@@ -171,9 +214,11 @@ def start_impalad_instances(cluster_size):
       # Yes, this is a hack, but it's easier than modifying the minikdc...
       sleep(2)
 
+    # impalad args from the --impalad_args flag. Also replacing '#ID' with the instance.
+    param_args = (" ".join(options.impalad_args)).replace("#ID", str(i))
     args = "%s %s %s %s %s" %\
           (build_impalad_logging_args(i, service_name), build_jvm_args(i),
-           build_impalad_port_args(i), options.impalad_args.replace("#ID", str(i)),
+           build_impalad_port_args(i), param_args,
            build_rm_args(i))
     stderr_log_file_path = os.path.join(options.log_dir, '%s-error.log' % service_name)
     exec_impala_process(IMPALAD_PATH, args, stderr_log_file_path)

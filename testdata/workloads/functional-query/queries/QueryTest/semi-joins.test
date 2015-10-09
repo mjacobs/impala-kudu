@@ -280,7 +280,7 @@ INT, INT, INT
 ---- QUERY
 # Regression test for IMPALA-1351: PHJ::GetNext() returns -1 in NAAJ w/o error.
 # NOTE: Commented out because it takes a few hours to run on a single node.
-# TODO: Casey will try to simplify.
+# TODO: Casey will try to simplify, also consider moving to semi-joins-exhaustive.
 #SELECT COUNT(t2.month) AS int_col_1
 #FROM alltypesagg t1 CROSS
 #JOIN alltypesagg t2 FULL

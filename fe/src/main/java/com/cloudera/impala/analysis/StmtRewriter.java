@@ -30,6 +30,8 @@ import com.google.common.collect.Lists;
 /**
  * Class representing a statement rewriter. A statement rewriter performs subquery
  * unnesting on an analyzed parse tree.
+ * TODO: Now that we have a nested-loop join supporting all join modes we could
+ * allow more rewrites, although it is not clear we would always want to.
  */
 public class StmtRewriter {
   private final static Logger LOG = LoggerFactory.getLogger(StmtRewriter.class);
@@ -40,42 +42,34 @@ public class StmtRewriter {
    */
   public static StatementBase rewrite(AnalysisResult analysisResult)
       throws AnalysisException {
-    StatementBase rewrittenStmt = null;
-    if (analysisResult.getStmt() instanceof QueryStmt) {
-      QueryStmt analyzedStmt = (QueryStmt)analysisResult.getStmt();
-      rewriteQueryStatement(analyzedStmt, analysisResult.getAnalyzer());
-      rewrittenStmt = analyzedStmt.clone();
-    } else if (analysisResult.getStmt() instanceof InsertStmt) {
-      // For an InsertStmt, rewrites are performed during its analysis.
-      // Clone the insert stmt to reset its analysis state.
-      rewrittenStmt = ((InsertStmt)analysisResult.getStmt()).clone();
-    } else if (analysisResult.getStmt() instanceof CreateTableAsSelectStmt) {
-      // For a CTAS, rewrites are performed during its analysis.
-      CreateTableAsSelectStmt ctasStmt =
-          (CreateTableAsSelectStmt)analysisResult.getStmt();
-      // Create a new CTAS from the original create statement and the
-      // rewritten insert statement.
-      Preconditions.checkNotNull(analysisResult.getTmpCreateTableStmt());
-      rewrittenStmt = new CreateTableAsSelectStmt(analysisResult.getTmpCreateTableStmt(),
-          ctasStmt.getQueryStmt().clone());
-    } else if (analysisResult.isUpdateStmt()) {
-      throw new AnalysisException("Update performs internal rewrite only.");
-    } else if (analysisResult.isDeleteStmt()) {
-      throw new AnalysisException("Delete performs internal rewrite only.");
+    // Analyzed stmt that contains a query statement with subqueries to be rewritten.
+    StatementBase stmt = analysisResult.getStmt();
+    Preconditions.checkState(stmt.isAnalyzed());
+    // Analyzed query statement to be rewritten.
+    QueryStmt queryStmt = null;
+    if (stmt instanceof QueryStmt) {
+      queryStmt = (QueryStmt) analysisResult.getStmt();
+    } else if (stmt instanceof InsertStmt) {
+      queryStmt = ((InsertStmt) analysisResult.getStmt()).getQueryStmt();
+    } else if (stmt instanceof CreateTableAsSelectStmt) {
+      queryStmt = ((CreateTableAsSelectStmt) analysisResult.getStmt()).getQueryStmt();
     } else {
       throw new AnalysisException("Unsupported statement containing subqueries: " +
-          analysisResult.getStmt().toSql());
+          stmt.toSql());
     }
-    return rewrittenStmt;
+    rewriteQueryStatement(queryStmt, queryStmt.getAnalyzer());
+    stmt.reset();
+    return stmt;
   }
 
   /**
-   *  Calls the appropriate rewrite method based on the specific type of query stmt. See
-   *  rewriteSelectStatement() and rewriteUnionStatement() documentation.
+   * Calls the appropriate rewrite method based on the specific type of query stmt. See
+   * rewriteSelectStatement() and rewriteUnionStatement() documentation.
    */
   public static void rewriteQueryStatement(QueryStmt stmt, Analyzer analyzer)
       throws AnalysisException {
     Preconditions.checkNotNull(stmt);
+    Preconditions.checkNotNull(stmt.isAnalyzed());
     if (stmt instanceof SelectStmt) {
       rewriteSelectStatement((SelectStmt)stmt, analyzer);
     } else if (stmt instanceof UnionStmt) {
@@ -94,12 +88,10 @@ public class StmtRewriter {
   private static void rewriteSelectStatement(SelectStmt stmt, Analyzer analyzer)
       throws AnalysisException {
     // Rewrite all the subqueries in the FROM clause.
-    for (TableRef tblRef: stmt.fromClause_) {
+    for (TableRef tblRef: stmt.tableRefs_) {
       if (!(tblRef instanceof InlineViewRef)) continue;
       InlineViewRef inlineViewRef = (InlineViewRef)tblRef;
       rewriteQueryStatement(inlineViewRef.getViewStmt(), inlineViewRef.getAnalyzer());
-      // Reset the state of the underlying stmt since it was rewritten
-      inlineViewRef.setRewrittenViewStmt(inlineViewRef.getViewStmt().clone());
     }
     // Rewrite all the subqueries in the WHERE clause.
     if (stmt.hasWhereClause()) {
@@ -201,7 +193,7 @@ public class StmtRewriter {
    */
   private static void rewriteWhereClauseSubqueries(SelectStmt stmt, Analyzer analyzer)
      throws AnalysisException {
-    int numTableRefs = stmt.fromClause_.size();
+    int numTableRefs = stmt.tableRefs_.size();
     ArrayList<Expr> exprsWithSubqueries = Lists.newArrayList();
     ExprSubstitutionMap smap = new ExprSubstitutionMap();
     // Replace all BetweenPredicates that contain subqueries with their
@@ -303,7 +295,9 @@ public class StmtRewriter {
     rewriteSelectStatement((SelectStmt) subquery.getStatement(), subquery.getAnalyzer());
     // Create a new Subquery with the rewritten stmt and use a substitution map
     // to replace the original subquery from the expr.
-    Subquery newSubquery = new Subquery(subquery.getStatement().clone());
+    QueryStmt rewrittenStmt = subquery.getStatement().clone();
+    rewrittenStmt.reset();
+    Subquery newSubquery = new Subquery(rewrittenStmt);
     newSubquery.analyze(analyzer);
     ExprSubstitutionMap smap = new ExprSubstitutionMap();
     smap.put(subquery, newSubquery);
@@ -358,13 +352,7 @@ public class StmtRewriter {
       // For correlated subqueries that are eligible for rewrite by transforming
       // into a join, a LIMIT clause has no effect on the results, so we can
       // safely remove it.
-      subqueryStmt.limitElement_ = null;
-    }
-
-    if (expr instanceof ExistsPredicate) {
-      // For uncorrelated subqueries, we limit the number of rows returned by the
-      // subquery.
-      if (onClauseConjuncts.isEmpty()) subqueryStmt.setLimit(1);
+      subqueryStmt.limitElement_ = new LimitElement(null, null);
     }
 
     // Update the subquery's select list and/or its GROUP BY clause by adding
@@ -379,13 +367,13 @@ public class StmtRewriter {
           lhsExprs, rhsExprs, updateGroupBy);
     }
 
-    // Analyzing the inline view trigger reanalysis of the subquery's select statement.
+    // Analyzing the inline view triggers reanalysis of the subquery's select statement.
     // However the statement is already analyzed and since statement analysis is not
-    // idempotent, the analysis needs to be reset (by a call to clone()).
-    inlineView = (InlineViewRef)inlineView.clone();
+    // idempotent, the analysis needs to be reset.
+    inlineView.reset();
     inlineView.analyze(analyzer);
-    inlineView.setLeftTblRef(stmt.fromClause_.get(stmt.fromClause_.size() - 1));
-    stmt.fromClause_.add(inlineView);
+    inlineView.setLeftTblRef(stmt.tableRefs_.get(stmt.tableRefs_.size() - 1));
+    stmt.tableRefs_.add(inlineView);
     JoinOperator joinOp = JoinOperator.LEFT_SEMI_JOIN;
 
     // Create a join conjunct from the expr that contains a subquery.
@@ -424,19 +412,35 @@ public class StmtRewriter {
 
     if (onClausePredicate == null) {
       Preconditions.checkState(expr instanceof ExistsPredicate);
-      // TODO: Remove this when we support independent subquery evaluation.
-      if (((ExistsPredicate)expr).isNotExists()) {
-        throw new AnalysisException("Unsupported uncorrelated NOT EXISTS subquery: " +
-            subqueryStmt.toSql());
+      ExistsPredicate existsPred = (ExistsPredicate) expr;
+      // Note that the concept of a 'correlated inline view' is similar but not the same
+      // as a 'correlated subquery', i.e., a subquery with a correlated predicate.
+      if (inlineView.isCorrelated()) {
+        if (existsPred.isNotExists()) {
+          inlineView.setJoinOp(JoinOperator.LEFT_ANTI_JOIN);
+        } else {
+          inlineView.setJoinOp(JoinOperator.LEFT_SEMI_JOIN);
+        }
+        // No visible tuples added.
+        return false;
+      } else {
+        // TODO: Remove this when we support independent subquery evaluation.
+        if (existsPred.isNotExists()) {
+          throw new AnalysisException("Unsupported uncorrelated NOT EXISTS subquery: " +
+              subqueryStmt.toSql());
+        }
+        // For uncorrelated subqueries, we limit the number of rows returned by the
+        // subquery.
+        subqueryStmt.setLimit(1);
+        // We don't have an ON clause predicate to create an equi-join. Rewrite the
+        // subquery using a CROSS JOIN.
+        // TODO This is very expensive. Remove it when we implement independent
+        // subquery evaluation.
+        inlineView.setJoinOp(JoinOperator.CROSS_JOIN);
+        LOG.warn("uncorrelated subquery rewritten using a cross join");
+        // Indicate that new visible tuples may be added in stmt's select list.
+        return true;
       }
-      // We don't have an ON clause predicate to create an equi-join. Rewrite the
-      // subquery using a CROSS JOIN.
-      // TODO This is very expensive. Remove it when we implement independent
-      // subquery evaluation.
-      inlineView.setJoinOp(JoinOperator.CROSS_JOIN);
-      LOG.warn("uncorrelated subquery rewritten using a cross join");
-      // Indicate that new visible tuples may be added in stmt's select list.
-      return true;
     }
 
     // Create an smap from the original select-list exprs of the select list to
@@ -482,7 +486,7 @@ public class StmtRewriter {
       break;
     }
 
-    if (!hasEqJoinPred) {
+    if (!hasEqJoinPred && !inlineView.isCorrelated()) {
       // TODO: Remove this when independent subquery evaluation is implemented.
       // TODO: Requires support for non-equi joins.
       boolean hasGroupBy = ((SelectStmt) inlineView.getViewStmt()).hasGroupByClause();
@@ -502,7 +506,7 @@ public class StmtRewriter {
       return true;
     }
 
-    // We have a valid equi-join conjunct.
+    // We have a valid equi-join conjunct or the inline view is correlated.
     if (expr instanceof InPredicate && ((InPredicate)expr).isNotIn() ||
         expr instanceof ExistsPredicate && ((ExistsPredicate)expr).isNotExists()) {
       // For the case of a NOT IN with an eq join conjunct, replace the join
@@ -542,7 +546,7 @@ public class StmtRewriter {
    * replacing an unqualified star item.
    */
   private static void replaceUnqualifiedStarItems(SelectStmt stmt, int tableIdx) {
-    Preconditions.checkState(tableIdx < stmt.fromClause_.size());
+    Preconditions.checkState(tableIdx < stmt.tableRefs_.size());
     ArrayList<SelectListItem> newItems = Lists.newArrayList();
     for (int i = 0; i < stmt.selectList_.getItems().size(); ++i) {
       SelectListItem item = stmt.selectList_.getItems().get(i);
@@ -553,7 +557,7 @@ public class StmtRewriter {
       // '*' needs to be replaced by tbl1.*,...,tbln.*, where
       // tbl1,...,tbln are the visible tableRefs in stmt.
       for (int j = 0; j < tableIdx; ++j) {
-        TableRef tableRef = stmt.fromClause_.get(j);
+        TableRef tableRef = stmt.tableRefs_.get(j);
         if (tableRef.getJoinOp() == JoinOperator.LEFT_SEMI_JOIN ||
             tableRef.getJoinOp() == JoinOperator.LEFT_ANTI_JOIN) {
           continue;

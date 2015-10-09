@@ -55,7 +55,7 @@ Status ExprContext::Prepare(RuntimeState* state, const RowDescriptor& row_desc,
 
 Status ExprContext::Open(RuntimeState* state) {
   DCHECK(prepared_);
-  DCHECK(!opened_);
+  if (opened_) return Status::OK();
   opened_ = true;
   // Fragment-local state is only initialized for original contexts. Clones inherit the
   // original's fragment state and only need to have thread-local state initialized.
@@ -91,6 +91,7 @@ int ExprContext::Register(RuntimeState* state,
 Status ExprContext::Clone(RuntimeState* state, ExprContext** new_ctx) {
   DCHECK(prepared_);
   DCHECK(opened_);
+  DCHECK(*new_ctx == NULL);
 
   *new_ctx = state->obj_pool()->Add(new ExprContext(root_));
   (*new_ctx)->pool_.reset(new MemPool(pool_->mem_tracker()));
@@ -100,8 +101,9 @@ Status ExprContext::Clone(RuntimeState* state, ExprContext** new_ctx) {
   }
   (*new_ctx)->fn_contexts_ptr_ = &((*new_ctx)->fn_contexts_[0]);
 
-  (*new_ctx)->prepared_ = true;
   (*new_ctx)->is_clone_ = true;
+  (*new_ctx)->prepared_ = true;
+  (*new_ctx)->opened_ = true;
 
   return root_->Open(state, *new_ctx, FunctionContext::THREAD_LOCAL);
 }
@@ -258,7 +260,7 @@ void* ExprContext::GetValue(Expr* e, TupleRow* row) {
       if (v.is_null) return NULL;
       result_.string_val.ptr = reinterpret_cast<char*>(v.ptr);
       result_.string_val.len = v.len;
-      if (e->type_.IsVarLen()) {
+      if (e->type_.IsVarLenStringType()) {
         return &result_.string_val;
       } else {
         return result_.string_val.ptr;
@@ -287,6 +289,14 @@ void* ExprContext::GetValue(Expr* e, TupleRow* row) {
           DCHECK(false) << e->type_.GetByteSize();
           return NULL;
       }
+    }
+    case TYPE_ARRAY:
+    case TYPE_MAP: {
+      impala_udf::ArrayVal v = e->GetArrayVal(this, row);
+      if (v.is_null) return NULL;
+      result_.array_val.ptr = v.ptr;
+      result_.array_val.num_tuples = v.num_tuples;
+      return &result_.array_val;
     }
     default:
       DCHECK(false) << "Type not implemented: " << e->type_.DebugString();
@@ -330,6 +340,9 @@ DoubleVal ExprContext::GetDoubleVal(TupleRow* row) {
 }
 StringVal ExprContext::GetStringVal(TupleRow* row) {
   return root_->GetStringVal(this, row);
+}
+ArrayVal ExprContext::GetArrayVal(TupleRow* row) {
+  return root_->GetArrayVal(this, row);
 }
 TimestampVal ExprContext::GetTimestampVal(TupleRow* row) {
   return root_->GetTimestampVal(this, row);

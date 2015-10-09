@@ -20,6 +20,7 @@
 #include "common/status.h"
 #include "exprs/expr-value.h"
 #include "udf/udf.h"
+#include "udf/udf-internal.h" // for ArrayVal
 
 using namespace impala_udf;
 
@@ -47,14 +48,17 @@ class ExprContext {
   Status Prepare(RuntimeState* state, const RowDescriptor& row_desc,
                  MemTracker* tracker);
 
-  /// Must be called after calling Prepare(). Should not be called on clones.
+  /// Must be called after calling Prepare(). Does not need to be called on clones.
+  /// Idempotent (this allows exprs to be opened multiple times in subplans without
+  /// reinitializing function state).
   Status Open(RuntimeState* state);
 
   /// Creates a copy of this ExprContext. Open() must be called first. The copy contains
-  /// clones of each FunctionContext, which share the fragment-local state of the originals
-  /// but have their own MemPool and thread-local state. Clone() should be used to create
-  /// an ExprContext for each execution thread that needs to evaluate 'root'. Note that
-  /// clones are already opened.
+  /// clones of each FunctionContext, which share the fragment-local state of the
+  /// originals but have their own MemPool and thread-local state. Clone() should be used
+  /// to create an ExprContext for each execution thread that needs to evaluate
+  /// 'root'. Note that clones are already opened. '*new_context' must be initialized by
+  /// the caller to NULL.
   Status Clone(RuntimeState* state, ExprContext** new_context);
 
   /// Closes all FunctionContexts. Must be called on every ExprContext, including clones.
@@ -99,6 +103,7 @@ class ExprContext {
   /// Register(). This should only be called by Exprs.
   FunctionContext* fn_context(int i) {
     DCHECK_GE(i, 0);
+    DCHECK_LT(i, fn_contexts_.size());
     return fn_contexts_[i];
   }
 
@@ -114,11 +119,12 @@ class ExprContext {
   FloatVal GetFloatVal(TupleRow* row);
   DoubleVal GetDoubleVal(TupleRow* row);
   StringVal GetStringVal(TupleRow* row);
+  ArrayVal GetArrayVal(TupleRow* row);
   TimestampVal GetTimestampVal(TupleRow* row);
   DecimalVal GetDecimalVal(TupleRow* row);
 
-  /// Frees all local allocations made by fn_contexts_. This can be called when result data
-  /// from this context is no longer needed.
+  /// Frees all local allocations made by fn_contexts_. This can be called when result
+  /// data from this context is no longer needed.
   void FreeLocalAllocations();
   static void FreeLocalAllocations(const std::vector<ExprContext*>& ctxs);
   static void FreeLocalAllocations(const std::vector<FunctionContext*>& ctxs);
@@ -131,8 +137,8 @@ class ExprContext {
   friend class HiveUdfCall;
   friend class ScalarFnCall;
 
-  /// FunctionContexts for each registered expression. The FunctionContexts are created and
-  /// owned by this ExprContext.
+  /// FunctionContexts for each registered expression. The FunctionContexts are created
+  /// and owned by this ExprContext.
   std::vector<FunctionContext*> fn_contexts_;
 
   /// Array access to fn_contexts_. Used by ScalarFnCall's codegen'd compute function
@@ -150,8 +156,10 @@ class ExprContext {
   /// void*.
   ExprValue result_;
 
-  /// Debugging variables.
+  /// True if this context came from a Clone() call. Used to manage FunctionStateScope.
   bool is_clone_;
+
+  /// Variables keeping track of current state.
   bool prepared_;
   bool opened_;
   bool closed_;

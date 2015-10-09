@@ -24,28 +24,33 @@
 
 namespace impala {
 
-/// An ObjectPool maintains a list of C++ objects which are deallocated by destroying the
-/// pool.
+/// An ObjectPool maintains a list of C++ objects which are deallocated by destroying or
+/// clearing the pool.
 /// Thread-safe.
 class ObjectPool {
  public:
   ObjectPool(): objects_() {}
 
-  ~ObjectPool() {
+  ~ObjectPool() { Clear(); }
+
+  template <class T>
+  T* Add(T* t) {
+    // Create the object to be pushed to the shared vector outside the critical section.
+    // TODO: Consider using a lock-free structure.
+    SpecificElement<T>* obj = new SpecificElement<T>(t);
+    DCHECK(obj != NULL);
+    boost::lock_guard<SpinLock> l(lock_);
+    objects_.push_back(obj);
+    return t;
+  }
+
+  void Clear() {
+    boost::lock_guard<SpinLock> l(lock_);
     for (ElementVector::iterator i = objects_.begin();
          i != objects_.end(); ++i) {
       delete *i;
     }
-  }
-
-  template <class T>
-  T* Add(T* t) {
-    /// Create the object to be pushed to the shared vector outside the critical section.
-    /// TODO: Consider using a lock-free structure.
-    SpecificElement<T>* obj = new SpecificElement<T>(t);
-    boost::lock_guard<SpinLock> l(lock_);
-    objects_.push_back(obj);
-    return t;
+    objects_.clear();
   }
 
  private:

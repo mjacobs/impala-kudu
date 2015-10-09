@@ -108,8 +108,9 @@ class MemTracker;
 /// is slower than disks) and run out of memory.
 /// For both CPU and memory, we want to model the machine as having a fixed amount of
 /// resources.  If a single query is running, it should saturate either CPU or Disk
-/// as well as using as little memory as possible. With multiple queries, each query should
-/// get less CPU, therefore need fewer queued buffers and therefore less memory usage.
+/// as well as using as little memory as possible. With multiple queries, each query
+/// should get less CPU. In that case each query will need fewer queued buffers and
+/// therefore have less memory usage.
 //
 /// The IoMgr defers CPU management to the caller. The IoMgr provides a GetNextRange
 /// API which will return the next scan range the caller should process. The caller
@@ -209,8 +210,8 @@ class DiskIoMgr {
 
     int64_t mtime() const { return mtime_; }
 
-    /// This method is called to release acquired resources by the cached handle when it is
-    /// evicted.
+    /// This method is called to release acquired resources by the cached handle when it
+    /// is evicted.
     static void Release(HdfsCachedFileHandle** h);
 
     bool ok() const { return hdfs_file_ != NULL; }
@@ -241,6 +242,7 @@ class DiskIoMgr {
 
     /// Returns the buffer to the IoMgr. This must be called for every buffer
     /// returned by GetNext()/Read() that did not return an error. This is non-blocking.
+    /// After calling this, the buffer descriptor is invalid and cannot be accessed.
     void Return();
 
    private:
@@ -313,7 +315,7 @@ class DiskIoMgr {
     /// Length of data read or written.
     int64_t len_;
 
-    /// Id of disk containing file_;
+    /// Id of disk containing byte range.
     int disk_id_;
 
     /// The type of IO request, READ or WRITE.
@@ -371,6 +373,8 @@ class DiskIoMgr {
 
     /// Enqueues a buffer for this range. This does not block.
     /// Returns true if this scan range has hit the queue capacity, false otherwise.
+    /// The caller passes ownership of buffer to the scan range and it is not
+    /// valid to access buffer after this call.
     bool EnqueueBuffer(BufferDescriptor* buffer);
 
     /// Cleanup any queued buffers (i.e. due to cancellation). This cannot
@@ -657,9 +661,9 @@ class DiskIoMgr {
 
   /// When the file handle is no longer in use by the scan range, return it and try to
   /// unbuffer the handle. If unbuffering, closing sockets and dropping buffers in the
-  /// libhdfs client, is not supported, close the file handle. If the unbuffer operation is
-  /// supported, put the file handle together with the mtime in the LRU cache for later
-  /// reuse.
+  /// libhdfs client, is not supported, close the file handle. If the unbuffer operation
+  /// is supported, put the file handle together with the mtime in the LRU cache for
+  /// later reuse.
   void CacheOrCloseFileHandle(const char* fname, HdfsCachedFileHandle* fid, bool close);
 
   /// Default ready buffer queue capacity. This constant doesn't matter too much
@@ -681,10 +685,10 @@ class DiskIoMgr {
 
   friend class DiskIoMgrTest_Buffers_Test;
 
-  /// Pool to allocate BufferDescriptors
+  /// Pool to allocate BufferDescriptors.
   ObjectPool pool_;
 
-  /// Process memory tracker; needed to account for io buffers
+  /// Process memory tracker; needed to account for io buffers.
   MemTracker* process_mem_tracker_;
 
   /// Number of worker(read) threads per disk. Also the max depth of queued

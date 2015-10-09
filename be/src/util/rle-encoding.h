@@ -88,18 +88,34 @@ class RleDecoder {
     DCHECK_LE(bit_width_, 64);
   }
 
-  RleDecoder() {}
+  RleDecoder() : bit_width_(-1) {}
+
+  void Reset(uint8_t* buffer, int buffer_len, int bit_width) {
+    DCHECK_GE(bit_width, 0);
+    DCHECK_LE(bit_width, 64);
+    bit_reader_.Reset(buffer, buffer_len);
+    bit_width_ = bit_width;
+    current_value_ = 0;
+    repeat_count_ = 0;
+    literal_count_ = 0;
+  }
 
   /// Gets the next value.  Returns false if there are no more.
   template<typename T>
   bool Get(T* val);
 
- private:
+ protected:
   BitReader bit_reader_;
+  /// Number of bits needed to encode the value. Must be between 0 and 64.
   int bit_width_;
   uint64_t current_value_;
   uint32_t repeat_count_;
   uint32_t literal_count_;
+ private:
+  /// Fills literal_count_ and repeat_count_ with next values. Returns false if there
+  /// are no more.
+  template<typename T>
+  bool NextCounts();
 };
 
 /// Class to incrementally build the rle data.   This class does not allocate any memory.
@@ -119,7 +135,7 @@ class RleEncoder {
   RleEncoder(uint8_t* buffer, int buffer_len, int bit_width)
     : bit_width_(bit_width),
       bit_writer_(buffer, buffer_len) {
-    DCHECK_GE(bit_width_, 1);
+    DCHECK_GE(bit_width_, 0);
     DCHECK_LE(bit_width_, 64);
     max_run_byte_size_ = MinBufferSize(bit_width);
     DCHECK_GE(buffer_len, max_run_byte_size_) << "Input buffer not big enough.";
@@ -187,7 +203,7 @@ class RleEncoder {
   /// (number of groups encodable by a 1-byte indicator * 8)
   static const int MAX_VALUES_PER_LITERAL_RUN = (1 << 6) * 8;
 
-  /// Number of bits needed to encode the value.
+  /// Number of bits needed to encode the value. Must be between 0 and 64.
   const int bit_width_;
 
   /// Underlying buffer.
@@ -227,35 +243,42 @@ class RleEncoder {
 
 template<typename T>
 inline bool RleDecoder::Get(T* val) {
+  DCHECK_GE(bit_width_, 0);
   if (UNLIKELY(literal_count_ == 0 && repeat_count_ == 0)) {
-    // Read the next run's indicator int, it could be a literal or repeated run
-    // The int is encoded as a vlq-encoded value.
-    int32_t indicator_value = 0;
-    bool result = bit_reader_.GetVlqInt(&indicator_value);
-    if (!result) return false;
-
-    // lsb indicates if it is a literal run or repeated run
-    bool is_literal = indicator_value & 1;
-    if (is_literal) {
-      literal_count_ = (indicator_value >> 1) * 8;
-    } else {
-      repeat_count_ = indicator_value >> 1;
-      bool result = bit_reader_.GetAligned<T>(
-          BitUtil::Ceil(bit_width_, 8), reinterpret_cast<T*>(&current_value_));
-      DCHECK(result);
-    }
+    if (!NextCounts<T>()) return false;
   }
 
   if (LIKELY(repeat_count_ > 0)) {
     *val = current_value_;
     --repeat_count_;
   } else {
-    DCHECK(literal_count_ > 0);
+    DCHECK_GT(literal_count_, 0);
     bool result = bit_reader_.GetValue(bit_width_, val);
     DCHECK(result);
     --literal_count_;
   }
 
+  return true;
+}
+
+template<typename T>
+bool RleDecoder::NextCounts() {
+  // Read the next run's indicator int, it could be a literal or repeated run.
+  // The int is encoded as a vlq-encoded value.
+  int32_t indicator_value = 0;
+  bool result = bit_reader_.GetVlqInt(&indicator_value);
+  if (!result) return false;
+
+  // lsb indicates if it is a literal run or repeated run
+  bool is_literal = indicator_value & 1;
+  if (is_literal) {
+    literal_count_ = (indicator_value >> 1) * 8;
+  } else {
+    repeat_count_ = indicator_value >> 1;
+    bool result = bit_reader_.GetAligned<T>(
+        BitUtil::Ceil(bit_width_, 8), reinterpret_cast<T*>(&current_value_));
+    DCHECK(result);
+  }
   return true;
 }
 

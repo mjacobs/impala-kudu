@@ -39,8 +39,8 @@ namespace impala {
 //
 /// A Status may either be OK (represented by passing a default constructed Status
 /// instance, created via Status::OK()), or it may represent an error condition. In the
-/// latter case, a Status has both an error code, which belongs to the TErrorCode enum, and
-/// an error string, which may be presented to clients or logged to disk.
+/// latter case, a Status has both an error code, which belongs to the TErrorCode enum,
+/// and an error string, which may be presented to clients or logged to disk.
 ///
 /// An error Status may also have one or more optional 'detail' strings which provide
 /// further context. These strings are intended for internal consumption only - and
@@ -87,11 +87,13 @@ class Status {
   // Return a default constructed Status instance in the OK case.
   inline static Status OK() { return Status(); }
 
+  // Return a MEM_LIMIT_EXCEEDED error status.
+  static Status MemLimitExceeded();
+
   static const Status CANCELLED;
-  static const Status MEM_LIMIT_EXCEEDED;
   static const Status DEPRECATED_RPC;
 
-  /// copy c'tor makes copy of error detail so Status can be returned by value
+  /// Copy c'tor makes copy of error detail so Status can be returned by value.
   Status(const Status& status)
     : msg_(status.msg_ != NULL ? new ErrorMsg(*status.msg_) : NULL) { }
 
@@ -138,6 +140,7 @@ class Status {
   Status(const std::string& error_msg);
 
   /// Create a status instance that represents an expected error and will not be logged
+  static Status Expected(const ErrorMsg& e);
   static Status Expected(const std::string& error_msg);
 
   ~Status() {
@@ -189,7 +192,7 @@ class Status {
 
   /// Returns the error message associated with a non-successful status.
   const ErrorMsg& msg() const {
-    DCHECK_NOTNULL(msg_);
+    DCHECK(msg_ != NULL);
     return *msg_;
   }
 
@@ -197,7 +200,7 @@ class Status {
   /// if an error was reported.
   /// TODO: deprecate, error should be immutable
   void SetErrorMsg(const ErrorMsg& m) {
-    DCHECK_NOTNULL(msg_);
+    DCHECK(msg_ != NULL);
     delete msg_;
     msg_ = new ErrorMsg(m);
   }
@@ -221,8 +224,8 @@ class Status {
   void ToThrift(TStatus* status) const;
 
   /// Returns the formatted message of the error message and the individual details of the
-  /// additional messages as a single string. This should only be called internally and not
-  /// to report an error back to the client.
+  /// additional messages as a single string. This should only be called internally and
+  /// not to report an error back to the client.
   const std::string GetDetail() const;
 
   TErrorCode::type code() const {
@@ -231,8 +234,8 @@ class Status {
 
  private:
 
-  /// Silent general error, this cannot be used with typed error messages as it would defy
-  /// the cause of a useful error message.
+  // Status constructors that can suppress logging via 'silent' parameter
+  Status(const ErrorMsg& error_msg, bool silent);
   Status(const std::string& error_msg, bool silent);
 
   /// Status uses a naked pointer to ensure the size of an instance on the stack is only

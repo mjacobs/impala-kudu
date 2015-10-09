@@ -26,20 +26,23 @@
 #include "exprs/expr.h"
 #include "exec/aggregation-node.h"
 #include "exec/analytic-eval-node.h"
-#include "exec/cross-join-node.h"
 #include "exec/data-source-scan-node.h"
 #include "exec/empty-set-node.h"
 #include "exec/exchange-node.h"
 #include "exec/hash-join-node.h"
-#include "exec/hdfs-scan-node.h"
 #include "exec/hbase-scan-node.h"
 #include "exec/kudu-scan-node.h"
-#include "exec/select-node.h"
+#include "exec/hdfs-scan-node.h"
+#include "exec/nested-loop-join-node.h"
 #include "exec/partitioned-aggregation-node.h"
 #include "exec/partitioned-hash-join-node.h"
+#include "exec/select-node.h"
+#include "exec/singular-row-src-node.h"
 #include "exec/sort-node.h"
+#include "exec/subplan-node.h"
 #include "exec/topn-node.h"
 #include "exec/union-node.h"
+#include "exec/unnest-node.h"
 #include "runtime/descriptors.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/mem-pool.h"
@@ -120,6 +123,7 @@ ExecNode::ExecNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl
     num_rows_returned_(0),
     rows_returned_counter_(NULL),
     rows_returned_rate_(NULL),
+    containing_subplan_(NULL),
     is_closed_(false) {
   InitRuntimeProfile(PrintPlanNodeType(tnode.node_type));
 }
@@ -162,9 +166,10 @@ Status ExecNode::Open(RuntimeState* state) {
   return Expr::Open(conjunct_ctxs_, state);
 }
 
-Status ExecNode::Reset(RuntimeState* state, RowBatch* row_batch) {
+Status ExecNode::Reset(RuntimeState* state) {
+  num_rows_returned_ = 0;
   for (int i = 0; i < children_.size(); ++i) {
-    RETURN_IF_ERROR(children_[i]->Reset(state, row_batch));
+    RETURN_IF_ERROR(children_[i]->Reset(state));
   }
   return Status::OK();
 }
@@ -181,10 +186,13 @@ void ExecNode::Close(RuntimeState* state) {
   }
   Expr::Close(conjunct_ctxs_, state);
 
-  if (mem_tracker() != NULL) {
-    if (mem_tracker()->consumption() != 0) {
-      LOG(WARNING) << "Query " << state->query_id() << " leaked memory." << endl
-          << state->instance_mem_tracker()->LogUsage();
+  if (mem_tracker() != NULL && mem_tracker()->consumption() != 0) {
+    LOG(WARNING) << "Query " << state->query_id() << " may have leaked memory." << endl
+                 << state->instance_mem_tracker()->LogUsage();
+    // Workaround: Until IMPALA-1867 is fixed, single I/O block MemTracker accounting
+    // leaks are possible.  These are harmless, see IMPALA-1867.
+    // TODO: remove guard when IMPALA-1867 is fixed.
+    if (mem_tracker()->consumption() != state->block_mgr()->max_block_size()) {
       DCHECK_EQ(mem_tracker()->consumption(), 0)
           << "Leaked memory." << endl << state->instance_mem_tracker()->LogUsage();
     }
@@ -232,10 +240,11 @@ Status ExecNode::CreateTreeHelper(
   if (*node_idx >= tnodes.size()) {
     return Status("Failed to reconstruct plan tree from thrift.");
   }
-  int num_children = tnodes[*node_idx].num_children;
+  const TPlanNode& tnode = tnodes[*node_idx];
+
+  int num_children = tnode.num_children;
   ExecNode* node = NULL;
-  RETURN_IF_ERROR(CreateNode(pool, tnodes[*node_idx], descs, &node));
-  // assert(parent != NULL || (node_idx == 0 && root_expr != NULL));
+  RETURN_IF_ERROR(CreateNode(pool, tnode, descs, &node));
   if (parent != NULL) {
     parent->children_.push_back(node);
   } else {
@@ -250,6 +259,9 @@ Status ExecNode::CreateTreeHelper(
       return Status("Failed to reconstruct plan tree from thrift.");
     }
   }
+
+  // Call Init() after children have been set and Init()'d themselves
+  RETURN_IF_ERROR(node->Init(tnode));
 
   // build up tree of profiles; add children >0 first, so that when we print
   // the profile, child 0 is printed last (makes the output more readable)
@@ -299,8 +311,8 @@ Status ExecNode::CreateNode(ObjectPool* pool, const TPlanNode& tnode,
         *node = pool->Add(new HashJoinNode(pool, tnode, descs));
       }
       break;
-    case TPlanNodeType::CROSS_JOIN_NODE:
-      *node = pool->Add(new CrossJoinNode(pool, tnode, descs));
+    case TPlanNodeType::NESTED_LOOP_JOIN_NODE:
+      *node = pool->Add(new NestedLoopJoinNode(pool, tnode, descs));
       break;
     case TPlanNodeType::EMPTY_SET_NODE:
       *node = pool->Add(new EmptySetNode(pool, tnode, descs));
@@ -324,6 +336,22 @@ Status ExecNode::CreateNode(ObjectPool* pool, const TPlanNode& tnode,
     case TPlanNodeType::ANALYTIC_EVAL_NODE:
       *node = pool->Add(new AnalyticEvalNode(pool, tnode, descs));
       break;
+    case TPlanNodeType::SINGULAR_ROW_SRC_NODE:
+      *node = pool->Add(new SingularRowSrcNode(pool, tnode, descs));
+      break;
+    case TPlanNodeType::SUBPLAN_NODE:
+      if (!FLAGS_enable_partitioned_hash_join || !FLAGS_enable_partitioned_aggregation) {
+        error_msg << "Query referencing nested types is not supported because the "
+            << "--enable_partitioned_hash_join and/or --enable_partitioned_aggregation "
+            << "Impala Daemon start-up flags are set to false.\nTo enable nested types "
+            << "support please set those flags to true (they are enabled by default).";
+        return Status(error_msg.str());
+      }
+      *node = pool->Add(new SubplanNode(pool, tnode, descs));
+      break;
+    case TPlanNodeType::UNNEST_NODE:
+      *node = pool->Add(new UnnestNode(pool, tnode, descs));
+      break;
     default:
       map<int, const char*>::const_iterator i =
           _TPlanNodeType_VALUES_TO_NAMES.find(tnode.node_type);
@@ -334,7 +362,6 @@ Status ExecNode::CreateNode(ObjectPool* pool, const TPlanNode& tnode,
       error_msg << str << " not implemented";
       return Status(error_msg.str());
   }
-  RETURN_IF_ERROR((*node)->Init(tnode));
   return Status::OK();
 }
 

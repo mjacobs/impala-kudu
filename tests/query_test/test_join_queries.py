@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # Copyright (c) 2012 Cloudera, Inc. All rights reserved.
 # Targeted tests for Impala joins
 #
@@ -8,7 +7,7 @@ import pytest
 from copy import copy
 from tests.common.test_vector import *
 from tests.common.impala_test_suite import *
-from tests.common.skip import SkipIfS3, SkipIfIsilon
+from tests.common.skip import SkipIf, SkipIfS3, SkipIfIsilon, SkipIfOldAggsJoins
 
 class TestJoinQueries(ImpalaTestSuite):
   BATCH_SIZES = [0, 1]
@@ -36,8 +35,13 @@ class TestJoinQueries(ImpalaTestSuite):
     new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
     self.run_test_case('QueryTest/joins', new_vector)
 
+  @SkipIfOldAggsJoins.unsupported
+  def test_partitioned_joins(self, vector):
+    self.run_test_case('QueryTest/joins-partitioned', vector)
+
   @SkipIfS3.hbase
   @SkipIfIsilon.hbase
+  @SkipIf.skip_hbase
   def test_joins_against_hbase(self, vector):
     new_vector = copy(vector)
     new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
@@ -48,10 +52,22 @@ class TestJoinQueries(ImpalaTestSuite):
     new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
     self.run_test_case('QueryTest/outer-joins', new_vector)
 
+  def test_single_node_nested_loop_joins(self, vector):
+    # Test the execution of nested-loops joins for join types that can only be
+    # executed in a single node (right [outer|semi|anti] and full outer joins).
+    new_vector = copy(vector)
+    new_vector.get_value('exec_option')['num_nodes'] = 1
+    self.run_test_case('QueryTest/single-node-nlj', new_vector)
+
+  def test_single_node_nested_loop_joins_exhaustive(self, vector):
+    if self.exploration_strategy() != 'exhaustive': pytest.skip()
+    new_vector = copy(vector)
+    new_vector.get_value('exec_option')['num_nodes'] = 1
+    self.run_test_case('QueryTest/single-node-nlj-exhaustive', new_vector)
+
 class TestTPCHJoinQueries(ImpalaTestSuite):
-  # Uses the tpch dataset in order to have larger joins. Needed for example to test
+  # Uses the TPC-H dataset in order to have larger joins. Needed for example to test
   # the repartitioning codepaths.
-  BATCH_SIZES = [0, 1]
 
   @classmethod
   def get_workload(cls):
@@ -144,3 +160,8 @@ class TestSemiJoinQueries(ImpalaTestSuite):
     new_vector = copy(vector)
     new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
     self.run_test_case('QueryTest/semi-joins', new_vector)
+
+  def test_semi_joins_exhaustive(self, vector):
+    if self.exploration_strategy() != 'exhaustive': pytest.skip()
+    new_vector = copy(vector)
+    self.run_test_case('QueryTest/semi-joins-exhaustive', new_vector)

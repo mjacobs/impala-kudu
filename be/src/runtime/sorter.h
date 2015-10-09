@@ -15,6 +15,8 @@
 #ifndef IMPALA_RUNTIME_SORTER_H_
 #define IMPALA_RUNTIME_SORTER_H_
 
+#include <deque>
+
 #include "runtime/buffered-block-mgr.h"
 #include "util/tuple-row-compare.h"
 
@@ -108,6 +110,11 @@ class Sorter {
   /// Get the next batch of sorted output rows from the sorter.
   Status GetNext(RowBatch* batch, bool* eos);
 
+  /// Resets all internal state like ExecNode::Reset().
+  /// Init() must have been called, AddBatch()/GetNext()/InputDone()
+  /// may or may not have been called.
+  Status Reset();
+
   /// Estimate the memory overhead in bytes for an intermediate merge, based on the
   /// maximum number of memory buffers available for the sort, the row descriptor for
   /// the sorted tuples and the batch size used (in rows).
@@ -157,6 +164,20 @@ class Sorter {
   /// True if the tuples to be sorted have var-length slots.
   bool has_var_len_slots_;
 
+  /// Expressions used to materialize the sort tuple. Contains one expr per slot in the
+  /// tuple.
+  std::vector<ExprContext*> sort_tuple_slot_expr_ctxs_;
+
+  /// Mem tracker for batches created during merge. Not owned by Sorter.
+  MemTracker* mem_tracker_;
+
+  /// Descriptor for the sort tuple. Input rows are materialized into 1 tuple before
+  /// sorting. Not owned by the Sorter.
+  RowDescriptor* output_row_desc_;
+
+  /////////////////////////////////////////
+  /// BEGIN: Members that must be Reset()
+
   /// The current unsorted run that is being collected. Is sorted and added to
   /// sorted_runs_ after it is full (i.e. number of blocks allocated == max available
   /// buffers) or after the input is complete. Owned and placed in obj_pool_.
@@ -166,18 +187,7 @@ class Sorter {
   /// List of sorted runs that have been produced but not merged. unsorted_run_ is added
   /// to this list after an in-memory sort. Sorted runs produced by intermediate merges
   /// are also added to this list. Runs are added to the object pool.
-  std::list<Run*> sorted_runs_;
-
-  /// Descriptor for the sort tuple. Input rows are materialized into 1 tuple before
-  /// sorting. Not owned by the Sorter.
-  RowDescriptor* output_row_desc_;
-
-  /// Expressions used to materialize the sort tuple. Contains one expr per slot in the
-  /// tuple.
-  std::vector<ExprContext*> sort_tuple_slot_expr_ctxs_;
-
-  /// Mem tracker for batches created during merge. Not owned by Sorter.
-  MemTracker* mem_tracker_;
+  std::deque<Run*> sorted_runs_;
 
   /// Merger object (intermediate or final) currently used to produce sorted runs.
   /// Only one merge is performed at a time. Will never be used if the input fits in
@@ -186,10 +196,13 @@ class Sorter {
 
   /// Runs that are currently processed by the merge_.
   /// These runs can be deleted when we are done with the current merge.
-  std::list<Run*> merging_runs_;
+  std::deque<Run*> merging_runs_;
 
-  /// Pool of owned Run objects.
+  /// Pool of owned Run objects. Maintains Runs objects across non-freeing Reset() calls.
   ObjectPool obj_pool_;
+
+  /// END: Members that must be Reset()
+  /////////////////////////////////////////
 
   /// Runtime profile and counters for this sorter instance.
   RuntimeProfile* profile_;

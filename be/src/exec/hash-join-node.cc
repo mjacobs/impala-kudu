@@ -137,7 +137,7 @@ Status HashJoinNode::Prepare(RuntimeState* state) {
   return Status::OK();
 }
 
-Status HashJoinNode::Reset(RuntimeState* state, RowBatch* row_batch) {
+Status HashJoinNode::Reset(RuntimeState* state, bool can_free_tuple_data) {
   DCHECK(false) << "NYI";
   return Status("NYI");
 }
@@ -161,12 +161,18 @@ Status HashJoinNode::ConstructBuildSide(RuntimeState* state) {
   // row ptrs.  The row ptrs are copied into the hash table's internal structure so they
   // don't need to be stored in the build_pool_.
   RowBatch build_batch(child(1)->row_desc(), state->batch_size(), mem_tracker());
-  RETURN_IF_ERROR(child(1)->Open(state));
+  {
+    SCOPED_STOP_WATCH(&built_probe_overlap_stop_watch_);
+    RETURN_IF_ERROR(child(1)->Open(state));
+  }
   while (true) {
     RETURN_IF_CANCELLED(state);
     RETURN_IF_ERROR(QueryMaintenance(state));
     bool eos;
-    RETURN_IF_ERROR(child(1)->GetNext(state, &build_batch, &eos));
+    {
+      SCOPED_STOP_WATCH(&built_probe_overlap_stop_watch_);
+      RETURN_IF_ERROR(child(1)->GetNext(state, &build_batch, &eos));
+    }
     SCOPED_TIMER(build_timer_);
     // take ownership of tuple data of build_batch
     build_pool_->AcquireData(build_batch.tuple_data_pool(), false);
@@ -282,9 +288,10 @@ Status HashJoinNode::GetNext(RuntimeState* state, RowBatch* out_batch, bool* eos
       }
     }
 
-    // check whether we need to output the current probe row before
-    // getting a new probe batch
-    if (match_all_probe_ && !matched_probe_) {
+    // If a probe row exists at this point, check whether we need to output the current
+    // probe row before getting a new probe batch. (IMPALA-2440)
+    bool probe_row_exists = !probe_side_eos_ || probe_batch_->num_rows() > 0;
+    if (match_all_probe_ && !matched_probe_ && probe_row_exists) {
       int row_idx = out_batch->AddRow();
       TupleRow* out_row = out_batch->GetRow(row_idx);
       CreateOutputRow(out_row, current_probe_row_, NULL);

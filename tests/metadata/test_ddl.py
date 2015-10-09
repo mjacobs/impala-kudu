@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # Copyright (c) 2012 Cloudera, Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,13 +23,15 @@ from tests.common.test_vector import *
 from tests.common.test_dimensions import ALL_NODES_ONLY
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import *
+from tests.common.skip import SkipIfIsilon
 from tests.common.skip import SkipIfS3
 from tests.util.filesystem_utils import WAREHOUSE, IS_DEFAULT_FS
 
 # Validates DDL statements (create, drop)
 class TestDdlStatements(ImpalaTestSuite):
   TEST_DBS = ['ddl_test_db', 'alter_table_test_db', 'alter_table_test_db2',
-              'function_ddl_test', 'udf_test', 'data_src_test', 'truncate_table_test_db']
+              'function_ddl_test', 'udf_test', 'data_src_test', 'truncate_table_test_db',
+              'test_db']
 
   @classmethod
   def get_workload(self):
@@ -106,6 +107,22 @@ class TestDdlStatements(ImpalaTestSuite):
     self.client.execute("drop database {0}".format(DDL_TEST_DB))
     assert not self.hdfs_client.exists("test-warehouse/{0}.db/".format(DDL_TEST_DB))
 
+    # Dropping the db using "cascade" removes all tables' and db's directories
+    # but keeps the external tables' directory
+    self._create_db(DDL_TEST_DB)
+    self.client.execute("create table {0}.t1(i int)".format(DDL_TEST_DB))
+    self.client.execute("create table {0}.t2(i int)".format(DDL_TEST_DB))
+    self.client.execute("create external table {0}.t3(i int) "
+                        "location '/test-warehouse/{0}/t3/'".format(DDL_TEST_DB))
+    self.client.execute("drop database {0} cascade".format(DDL_TEST_DB))
+    assert not self.hdfs_client.exists("test-warehouse/{0}.db/".format(DDL_TEST_DB))
+    assert not self.hdfs_client.exists("test-warehouse/{0}.db/t1/".format(DDL_TEST_DB))
+    assert not self.hdfs_client.exists("test-warehouse/{0}.db/t2/".format(DDL_TEST_DB))
+    assert self.hdfs_client.exists("test-warehouse/{0}/t3/".format(DDL_TEST_DB))
+    self.hdfs_client.delete_file_dir("test-warehouse/{0}/t3/".format(DDL_TEST_DB),
+        recursive=True)
+    assert not self.hdfs_client.exists("test-warehouse/{0}/t3/".format(DDL_TEST_DB))
+
   @SkipIfS3.insert # S3: missing coverage: truncate table
   @pytest.mark.execute_serially
   def test_truncate_cleans_hdfs_files(self):
@@ -165,6 +182,7 @@ class TestDdlStatements(ImpalaTestSuite):
     self.run_test_case('QueryTest/create', vector, use_db='ddl_test_db',
         multiple_impalad=self._use_multiple_impalad(vector))
 
+<<<<<<< HEAD
   @SkipIfS3.insert
   @pytest.mark.execute_serially
   def test_create_kudu(self, vector):
@@ -173,6 +191,42 @@ class TestDdlStatements(ImpalaTestSuite):
     self._create_db('ddl_test_db', sync=True)
     self.run_test_case('QueryTest/create_kudu', vector, use_db='ddl_test_db',
         multiple_impalad=self._use_multiple_impalad(vector))
+=======
+  @SkipIfS3.hive
+  @SkipIfIsilon.hive
+  @pytest.mark.execute_serially
+  def test_create_hive_integration(self, vector):
+    """Verifies that creating a catalog entity (database, table) in Impala using
+    'IF NOT EXISTS' while the entity exists in HMS, does not throw an error.
+    TODO: This test should be eventually subsumed by the Impala/Hive integration
+    tests."""
+    # Create a database in Hive
+    ret = call(["hive", "-e", "create database test_db"])
+    assert ret == 0
+    # Creating a database with the same name using 'IF NOT EXISTS' in Impala should
+    # not fail
+    self.client.execute("create database if not exists test_db")
+    # The database should appear in the catalog (IMPALA-2441)
+    assert 'test_db' in self.client.execute("show databases").data
+    # Ensure a table can be created in this database from Impala and that it is
+    # accessable in both Impala and Hive
+    self.client.execute("create table if not exists test_db.test_tbl_in_impala(a int)")
+    ret = call(["hive", "-e", "select * from test_db.test_tbl_in_impala"])
+    assert ret == 0
+    self.client.execute("select * from test_db.test_tbl_in_impala")
+
+    # Create a table in Hive
+    ret = call(["hive", "-e", "create table test_db.test_tbl (a int)"])
+    assert ret == 0
+    # Creating a table with the same name using 'IF NOT EXISTS' in Impala should
+    # not fail
+    self.client.execute("create table if not exists test_db.test_tbl (a int)")
+    # The table should not appear in the catalog unless invalidate metadata is
+    # executed
+    assert 'test_tbl' not in self.client.execute("show tables in test_db").data
+    self.client.execute("invalidate metadata test_db.test_tbl")
+    assert 'test_tbl' in self.client.execute("show tables in test_db").data
+>>>>>>> upupstream/cdh5-trunk
 
   @pytest.mark.execute_serially
   def test_sync_ddl_drop(self, vector):
@@ -306,6 +360,7 @@ class TestDdlStatements(ImpalaTestSuite):
       self.client.execute(select_stmt)
       for drop_stmt in drop_stmts: self.client.execute(drop_stmt % (""))
 
+  @SkipIfS3.insert # S3: missing coverage: alter table partitions.
   @pytest.mark.execute_serially
   def test_create_alter_bulk_partition(self, vector):
     TBL_NAME = 'foo_part'

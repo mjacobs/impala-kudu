@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # Copyright (c) 2012 Cloudera, Inc. All rights reserved.
 # General Impala query tests
 #
@@ -85,6 +84,10 @@ class TestQueries(ImpalaTestSuite):
   def test_union(self, vector):
     self.run_test_case('QueryTest/union', vector)
 
+  def test_very_large_strings(self, vector):
+    """Regression test for IMPALA-1619"""
+    self.run_test_case('QueryTest/large_strings', vector)
+
   def test_sort(self, vector):
     if vector.get_value('table_format').file_format == 'hbase':
       pytest.xfail(reason="IMPALA-283 - select count(*) produces inconsistent results")
@@ -104,6 +107,12 @@ class TestQueries(ImpalaTestSuite):
 
   def test_subquery(self, vector):
     self.run_test_case('QueryTest/subquery', vector)
+
+  def test_subplans(self, vector):
+    pytest.xfail("Disabled due to missing nested types functionality.")
+    if vector.get_value('table_format').file_format != 'parquet':
+      pytest.xfail("Nested TPCH only available in parquet.")
+    self.run_test_case('QueryTest/subplannull_data', vector)
 
   def test_empty(self, vector):
     self.run_test_case('QueryTest/empty', vector)

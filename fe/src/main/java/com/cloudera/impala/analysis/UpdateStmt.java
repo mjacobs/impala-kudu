@@ -168,8 +168,8 @@ public abstract class UpdateStmt extends StatementBase {
 
     // Analyze the generated select statement.
     SelectStmt srcStmt =
-        new SelectStmt(new SelectList(selectList), fromClause_, wherePredicate_,
-            null, null, null, null);
+        new SelectStmt(new SelectList(selectList), fromClause_.getTableRefs(),
+            wherePredicate_, null, null, null, null);
     srcStmt.analyze(analyzer);
 
     if (analyzer.containsSubquery()) {

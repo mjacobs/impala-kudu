@@ -70,6 +70,7 @@ import com.cloudera.impala.analysis.SqlParserSymbols;
     keywordMap.put("by", new Integer(SqlParserSymbols.KW_BY));
     keywordMap.put("cached", new Integer(SqlParserSymbols.KW_CACHED));
     keywordMap.put("case", new Integer(SqlParserSymbols.KW_CASE));
+    keywordMap.put("cascade", new Integer(SqlParserSymbols.KW_CASCADE));
     keywordMap.put("cast", new Integer(SqlParserSymbols.KW_CAST));
     keywordMap.put("change", new Integer(SqlParserSymbols.KW_CHANGE));
     keywordMap.put("char", new Integer(SqlParserSymbols.KW_CHAR));
@@ -170,11 +171,13 @@ import com.cloudera.impala.analysis.SqlParserSymbols;
     keywordMap.put("range", new Integer(SqlParserSymbols.KW_RANGE));
     keywordMap.put("rcfile", new Integer(SqlParserSymbols.KW_RCFILE));
     keywordMap.put("real", new Integer(SqlParserSymbols.KW_DOUBLE));
+    keywordMap.put("recover", new Integer(SqlParserSymbols.KW_RECOVER));
     keywordMap.put("refresh", new Integer(SqlParserSymbols.KW_REFRESH));
     keywordMap.put("regexp", new Integer(SqlParserSymbols.KW_REGEXP));
     keywordMap.put("rename", new Integer(SqlParserSymbols.KW_RENAME));
     keywordMap.put("replace", new Integer(SqlParserSymbols.KW_REPLACE));
     keywordMap.put("replication", new Integer(SqlParserSymbols.KW_REPLICATION));
+    keywordMap.put("restrict", new Integer(SqlParserSymbols.KW_RESTRICT));
     keywordMap.put("returns", new Integer(SqlParserSymbols.KW_RETURNS));
     keywordMap.put("revoke", new Integer(SqlParserSymbols.KW_REVOKE));
     keywordMap.put("right", new Integer(SqlParserSymbols.KW_RIGHT));
@@ -345,6 +348,9 @@ EndOfLineComment = "--" {NonTerminator}* {LineTerminator}?
 "\"" { return newToken(SqlParserSymbols.UNMATCHED_STRING_LITERAL, null); }
 "'" { return newToken(SqlParserSymbols.UNMATCHED_STRING_LITERAL, null); }
 "`" { return newToken(SqlParserSymbols.UNMATCHED_STRING_LITERAL, null); }
+
+// double-character tokens
+"!=" { return newToken(SqlParserSymbols.NOTEQUAL, null); }
 
 // The rules for IntegerLiteral and DecimalLiteral are the same, but it is useful
 // to distinguish them, e.g., so the Parser can use integer literals without analysis.

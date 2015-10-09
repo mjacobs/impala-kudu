@@ -19,6 +19,7 @@
 #include "codegen/codegen-anyval.h"
 #include "codegen/llvm-codegen.h"
 #include "gen-cpp/Exprs_types.h"
+#include "runtime/array-value.h"
 #include "runtime/runtime-state.h"
 
 #include "common/names.h"
@@ -283,7 +284,7 @@ Status SlotRef::GetCodegendComputeFn(RuntimeState* state, llvm::Function** fn) {
   // *Val. The optimizer does a better job when there is a phi node for each value, rather
   // than having get_slot_block generate an AnyVal and having a single phi node over that.
   // TODO: revisit this code, can possibly be simplified
-  if (type().IsVarLen()) {
+  if (type().IsVarLenStringType()) {
     DCHECK(ptr != NULL);
     DCHECK(len != NULL);
     PHINode* ptr_phi = builder.CreatePHI(ptr->getType(), 2, "ptr_phi");
@@ -457,6 +458,14 @@ DecimalVal SlotRef::GetDecimalVal(ExprContext* context, TupleRow* row) {
       DCHECK(false);
       return DecimalVal::null();
   }
+}
+
+ArrayVal SlotRef::GetArrayVal(ExprContext* context, TupleRow* row) {
+  DCHECK(type_.IsCollectionType());
+  Tuple* t = row->GetTuple(tuple_idx_);
+  if (t == NULL || t->IsNull(null_indicator_offset_)) return ArrayVal::null();
+  ArrayValue* array_value = reinterpret_cast<ArrayValue*>(t->GetSlot(slot_offset_));
+  return ArrayVal(array_value->ptr, array_value->num_tuples);
 }
 
 }

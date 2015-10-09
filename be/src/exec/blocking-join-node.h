@@ -32,7 +32,8 @@ class RowBatch;
 class TupleRow;
 
 /// Abstract base class for join nodes that block while consuming all rows from their
-/// right child in Open().
+/// right child in Open(). There is no implementation of Reset() because the Open()
+/// sufficiently covers setting members into a 'reset' state.
 class BlockingJoinNode : public ExecNode {
  public:
   BlockingJoinNode(const std::string& node_name, const TJoinOp::type join_op,
@@ -53,10 +54,6 @@ class BlockingJoinNode : public ExecNode {
   /// (subclasses should implement InitGetNext()).
   virtual Status Open(RuntimeState* state);
 
-  /// Subclasses should reset any state modified in Open() and GetNext() and then call
-  /// BlockingJoinNode::Reset().
-  virtual Status Reset(RuntimeState* state, RowBatch* row_batch);
-
   /// Subclasses should close any other structures and then call
   /// BlockingJoinNode::Close().
   virtual void Close(RuntimeState* state);
@@ -66,7 +63,7 @@ class BlockingJoinNode : public ExecNode {
  protected:
   const std::string node_name_;
   TJoinOp::type join_op_;
-  bool eos_;  // if true, nothing left to return in GetNext()
+
   boost::scoped_ptr<MemPool> build_pool_;  // holds everything referenced from build side
 
   /// probe_batch_ must be cleared before calling GetNext().  The child node
@@ -74,6 +71,7 @@ class BlockingJoinNode : public ExecNode {
   /// is responsible for.
   boost::scoped_ptr<RowBatch> probe_batch_;
 
+  bool eos_;  // if true, nothing left to return in GetNext()
   bool probe_side_eos_;  // if true, left child has no more rows to process
 
   /// TODO: These variables should move to a join control block struct, which is local to
@@ -95,12 +93,24 @@ class BlockingJoinNode : public ExecNode {
 
   /// If true, this node can add filters to the probe (left child) node after processing
   /// the entire build side.
+  /// Note that we disable probe filters if we are inside a subplan.
   bool can_add_probe_filters_;
 
   RuntimeProfile::Counter* build_timer_;   // time to prepare build side
   RuntimeProfile::Counter* probe_timer_;   // time to process the probe (left child) batch
   RuntimeProfile::Counter* build_row_counter_;   // num build rows
   RuntimeProfile::Counter* probe_row_counter_;   // num probe (left child) rows
+
+  /// The time (i.e. clock reads) when the right child stops overlapping with the left
+  /// child.
+  /// For the single threaded case, the left and right child never overlaps.
+  /// For the build side in a different thread, the overlap stops when the left child
+  /// Open() returns.
+  timespec overlap_stops_time_;
+
+  /// Stopwatch that measures the build child's Open/GetNext time that overlaps
+  /// with the probe child Open().
+  MonotonicStopWatch built_probe_overlap_stop_watch_;
 
   /// Init the build-side state for a new left child row (e.g. hash table iterator or list
   /// iterator) given the first row. Used in Open() to prepare for GetNext().
@@ -132,6 +142,51 @@ class BlockingJoinNode : public ExecNode {
   /// 'build_row' to 'out_row'.
   /// This is replaced by codegen.
   void CreateOutputRow(TupleRow* out_row, TupleRow* probe_row, TupleRow* build_row);
+
+  /// Returns true if the join needs to process unmatched build rows, false
+  /// otherwise.
+  bool NeedToProcessUnmatchedBuildRows() {
+    return join_op_ == TJoinOp::RIGHT_ANTI_JOIN ||
+        join_op_ == TJoinOp::RIGHT_OUTER_JOIN ||
+        join_op_ == TJoinOp::FULL_OUTER_JOIN;
+  }
+
+  /// This function calculates the "local time" spent in the join node.
+  ///
+  /// The definition of "local time" is the wall clock time where this exec node is
+  /// processing and it is not blocked by any of its children.
+  ///
+  /// The join node has two execution models:
+  ///   1. The entire join execution is in a single thread.
+  ///   2. The build(right) side is executed on a different thread while the main thread
+  ///      opens the probe(left) side.
+  ///
+  /// In case 1, the "local time" spent in this node is as simple as:
+  ///     total_time - left child time - right child time
+  /// Because the entire right child time blocks the execution, the right child time is
+  /// the same as right_child_blocking_stop_watch_.
+  ///
+  /// Case 2 is more complicated. The build thread is started first and then
+  /// the main thread will "open" the left child. When the left child is ready
+  /// (i.e. Open() returned), the main thread will wait for the build thread to finish.
+  /// Because the left child is always executed in the main thread, all the left child
+  /// time should not be counted towards the hash join "local time".
+  /// For the right child (the build side), the child time in the build thread up to the
+  /// point when the left child Open() returns should not be counted towards the hash
+  /// join local time. This time period completely overlaps with the left child time.
+  /// From the time when left child Open() returned, the right child time should be
+  /// removed from the total time because this is the only child that is blocking the
+  /// join execution.
+  ///
+  /// Here's the calculation:
+  ///   total_time - left child time - (right child time - overlapped period)
+  ///
+  /// The "overlapped period" is measured by built_probe_overlap_stop_watch_. Using this
+  /// overlap method, both children's "Prepare" time are also excluded.
+  static int64_t LocalTimeCounterFn(const RuntimeProfile::Counter* total_time,
+      const RuntimeProfile::Counter* left_child_time,
+      const RuntimeProfile::Counter* right_child_time,
+      const MonotonicStopWatch* child_overlap_timer);
 
  private:
   /// Supervises ConstructBuildSide in a separate thread, and returns its status in the
