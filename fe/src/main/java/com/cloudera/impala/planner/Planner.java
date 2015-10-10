@@ -4,15 +4,15 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
+import com.cloudera.impala.analysis.ExprSubstitutionMap;
+import com.cloudera.impala.analysis.QueryStmt;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.cloudera.impala.analysis.AnalysisContext;
 import com.cloudera.impala.analysis.ColumnLineageGraph;
 import com.cloudera.impala.analysis.Expr;
-import com.cloudera.impala.analysis.ExprSubstitutionMap;
 import com.cloudera.impala.analysis.InsertStmt;
-import com.cloudera.impala.analysis.QueryStmt;
 import com.cloudera.impala.catalog.HBaseTable;
 import com.cloudera.impala.catalog.Table;
 import com.cloudera.impala.common.ImpalaException;
@@ -88,15 +88,10 @@ public class Planner {
 
     PlanFragment rootFragment = fragments.get(fragments.size() - 1);
     ExprSubstitutionMap rootNodeSmap = rootFragment.getPlanRoot().getOutputSmap();
-    ColumnLineageGraph graph = ctx_.getRootAnalyzer().getColumnLineageGraph();
     List<Expr> resultExprs = null;
-    Table targetTable = null;
     if (ctx_.isInsertOrCtas()) {
       InsertStmt insertStmt = ctx_.getAnalysisResult().getInsertStmt();
       insertStmt.substituteResultExprs(rootNodeSmap, ctx_.getRootAnalyzer());
-      resultExprs = insertStmt.getResultExprs();
-      targetTable = insertStmt.getTargetTable();
-      graph.addTargetColumnLabels(targetTable);
       if (!ctx_.isSingleNodeExec()) {
         // repartition on partition keys
         rootFragment = distributedPlanner.createInsertFragment(
@@ -104,14 +99,21 @@ public class Planner {
       }
       // set up table sink for root fragment
       rootFragment.setSink(insertStmt.createDataSink());
+      resultExprs = insertStmt.getResultExprs();
     } else {
+      if (ctx_.isUpdate()) {
+        // Set up update sink for root fragment
+        rootFragment.setSink(ctx_.getAnalysisResult().getUpdateStmt().createDataSink());
+      } else if (ctx_.isDelete()) {
+        // Set up delete sink for root fragment
+        rootFragment.setSink(ctx_.getAnalysisResult().getDeleteStmt().createDataSink());
+      }
       QueryStmt queryStmt = ctx_.getQueryStmt();
       queryStmt.substituteResultExprs(rootNodeSmap, ctx_.getRootAnalyzer());
       resultExprs = queryStmt.getResultExprs();
-      graph.addTargetColumnLabels(ctx_.getQueryStmt().getColLabels());
     }
     rootFragment.setOutputExprs(resultExprs);
-
+    
     LOG.debug("desctbl: " + ctx_.getRootAnalyzer().getDescTbl().debugString());
     LOG.debug("resultexprs: " + Expr.debugString(rootFragment.getOutputExprs()));
     LOG.debug("finalize plan fragments");
@@ -122,9 +124,12 @@ public class Planner {
     Collections.reverse(fragments);
     ctx_.getRootAnalyzer().getTimeline().markEvent("Distributed plan created");
 
+    ColumnLineageGraph graph = ctx_.getRootAnalyzer().getColumnLineageGraph();
     if (RuntimeEnv.INSTANCE.computeLineage() || RuntimeEnv.INSTANCE.isTestEnv()) {
       // Compute the column lineage graph
       if (ctx_.isInsertOrCtas()) {
+        Table targetTable = ctx_.getAnalysisResult().getInsertStmt().getTargetTable();
+        graph.addTargetColumnLabels(targetTable);
         Preconditions.checkNotNull(targetTable);
         List<Expr> exprs = Lists.newArrayList();
         if (targetTable instanceof HBaseTable) {
@@ -136,6 +141,7 @@ public class Planner {
         }
         graph.computeLineageGraph(exprs, ctx_.getRootAnalyzer());
       } else {
+        graph.addTargetColumnLabels(ctx_.getQueryStmt().getColLabels());
         graph.computeLineageGraph(resultExprs, ctx_.getRootAnalyzer());
       }
       LOG.trace("lineage: " + graph.debugString());

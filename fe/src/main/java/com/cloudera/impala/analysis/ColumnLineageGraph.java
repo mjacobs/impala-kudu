@@ -396,6 +396,8 @@ public class ColumnLineageGraph {
     }
     for (SlotId slotId: slotIds) {
       SlotDescriptor slotDesc = descTbl_.getSlotDesc(slotId);
+      Preconditions.checkNotNull(slotDesc, "Could not find slot desc for slot with id: "
+          + slotId);
       List<Expr> sourceExprs = slotDesc.getSourceExprs();
       if (sourceExprs.isEmpty() && slotDesc.isScanSlot() &&
           slotDesc.getPath().isRootedAtTuple()) {

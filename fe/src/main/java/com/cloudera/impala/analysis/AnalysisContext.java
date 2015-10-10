@@ -117,6 +117,10 @@ public class AnalysisContext {
       return stmt_ instanceof GrantRevokePrivStmt;
     }
     public boolean isTruncateStmt() { return stmt_ instanceof TruncateStmt; }
+    public boolean isUpdateStmt() { return stmt_ instanceof UpdateStmt2; }
+    public UpdateStmt2 getUpdateStmt() { return (UpdateStmt2) stmt_; }
+    public boolean isDeleteStmt() { return stmt_ instanceof DeleteStmt; }
+    public DeleteStmt getDeleteStmt() { return (DeleteStmt) stmt_; }
 
     public boolean isCatalogOp() {
       return isUseStmt() || isViewMetadataStmt() || isDdlStmt();
@@ -378,6 +382,7 @@ public class AnalysisContext {
     Analyzer analyzer = getAnalyzer();
     // Process statements for which column-level privilege requests may be registered.
     if (analysisResult_.isQueryStmt() || analysisResult_.isInsertStmt() ||
+        analysisResult_.isUpdateStmt() || analysisResult_.isDeleteStmt() ||
         analysisResult_.isCreateTableAsSelectStmt() ||
         analysisResult_.isCreateViewStmt() || analysisResult_.isAlterViewStmt()) {
       // Map of table name to a list of privilege requests associated with that table.
