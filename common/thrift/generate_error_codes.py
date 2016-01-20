@@ -205,7 +205,11 @@ error_codes = (
   "in conjunction with Kerberos authentication is not supported at the same time. "
   "Disable server-to-server SSL by unsetting --ssl_client_ca_certificate."),
 
-  ("UDF_MEM_LIMIT_EXCEEDED", 66, "$0's allocations exceeded memory limits.")
+  ("UDF_MEM_LIMIT_EXCEEDED", 66, "$0's allocations exceeded memory limits."),
+
+  ("KUDU_IMPALA_TYPE_MISSING", 67, "Kudu type $0 is not available in Impala."),
+
+  ("IMPALA_KUDU_TYPE_MISSING", 68, "Impala type $0 is not available in Kudu.")
 )
 
 import sys
