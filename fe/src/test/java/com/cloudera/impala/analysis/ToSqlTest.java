@@ -733,6 +733,38 @@ public class ToSqlTest extends AnalyzerTest {
         "SELECT * FROM w");
   }
 
+  @Test
+  public void TestUpdate() {
+    testToSql("update functional_kudu.dimtbl set name = '10' where name < '11'",
+        "UPDATE functional_kudu.dimtbl SET name = '10' FROM functional_kudu.dimtbl " +
+            "WHERE name < '11'");
+
+    testToSql(
+        "update functional_kudu.dimtbl set name = '10', zip=cast(99 as int) where name " +
+            "< '11'",
+        "UPDATE functional_kudu.dimtbl SET name = '10', zip = CAST(99 AS INT) FROM " +
+            "functional_kudu.dimtbl WHERE name < '11'");
+
+    testToSql("update a set name = '10' FROM functional_kudu.dimtbl a",
+        "UPDATE a SET name = '10' FROM functional_kudu.dimtbl a");
+
+    testToSql(
+        "update a set a.name = 'oskar' from functional_kudu.dimtbl a join functional" +
+            ".alltypes b on a.id = b.id where zip > 94549",
+        "UPDATE a SET a.name = 'oskar' FROM functional_kudu.dimtbl a INNER JOIN " +
+            "functional.alltypes b ON a.id = b.id WHERE zip > 94549");
+  }
+
+  @Test
+  public void TestDelete() {
+    testToSql("delete functional_kudu.testtbl where zip = 10",
+        "DELETE FROM functional_kudu.testtbl WHERE zip = 10");
+    testToSql("delete from functional_kudu.testtbl where zip = 10",
+        "DELETE FROM functional_kudu.testtbl WHERE zip = 10");
+    testToSql("delete a from functional_kudu.testtbl a where zip = 10",
+        "DELETE a FROM functional_kudu.testtbl a WHERE zip = 10");
+  }
+
   /**
    * Tests that toSql() properly handles subqueries in the where clause.
    */

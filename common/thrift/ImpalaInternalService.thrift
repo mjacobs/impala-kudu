@@ -189,6 +189,13 @@ struct TQueryCtx {
 
   // List of tables suspected to have corrupt stats
   10: optional list<CatalogObjects.TTableName> tables_with_corrupt_stats
+
+  // The timestamp on which to perform the scan for the query.
+  // When the backing storage engine supports timestamps (such as Kudu) this allows to
+  // select a timestamp on which to perform the scan, making sure that results returned
+  // from multiple scan nodes are consistent.
+  // This defaults to -1 when no timestamp is specified.
+  11: optional i64 timestamp = -1;
 }
 
 // Context of a fragment instance, including its unique id, the total number
