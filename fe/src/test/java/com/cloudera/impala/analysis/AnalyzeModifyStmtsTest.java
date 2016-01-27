@@ -16,6 +16,8 @@ package com.cloudera.impala.analysis;
 
 import org.junit.Test;
 
+import com.cloudera.impala.testutil.TestUtils;
+
 /**
  * Tests analysis phase of the ModifyStmt and its sub-classes.
  *
@@ -26,6 +28,7 @@ public class AnalyzeModifyStmtsTest extends AnalyzerTest {
 
   @Test
   public void TestFromListAliases() {
+    TestUtils.assumeKuduIsSupported();
     AnalysisError("update a.name set a.name = 'Oskar' from functional_kudu.testtbl a",
         "'a.name' is not a table alias. Using the FROM clause requires the target table" +
             " to be a table alias.");
@@ -79,6 +82,7 @@ public class AnalyzeModifyStmtsTest extends AnalyzerTest {
 
   @Test
   public void TestUpdate() {
+    TestUtils.assumeKuduIsSupported();
     AnalyzesOk("update functional_kudu.dimtbl set name = 'Oskar'");
     AnalyzesOk("update ignore functional_kudu.dimtbl set name = 'Oskar'");
     // Correct default database resolution
@@ -135,6 +139,7 @@ public class AnalyzeModifyStmtsTest extends AnalyzerTest {
 
   @Test
   public void TestWhereClause() {
+    TestUtils.assumeKuduIsSupported();
     // With where clause
     AnalyzesOk("update functional_kudu.dimtbl set name = '10' where name = '11'");
     // Complex where clause
@@ -148,6 +153,7 @@ public class AnalyzeModifyStmtsTest extends AnalyzerTest {
 
   @Test
   public void TestWithSourceStmtRewrite() {
+    TestUtils.assumeKuduIsSupported();
     // No subqueries in set statement as we cannot translate them into subqueries in
     // the select list
     AnalysisError(
@@ -169,6 +175,7 @@ public class AnalyzeModifyStmtsTest extends AnalyzerTest {
 
   @Test
   public void TestWithJoin() {
+    TestUtils.assumeKuduIsSupported();
     // Simple Join
     AnalyzesOk(
         "update a set a.name = b.name FROM functional_kudu.testtbl a join functional" +
@@ -204,12 +211,14 @@ public class AnalyzeModifyStmtsTest extends AnalyzerTest {
 
   @Test
   public void TestNoViewModification() {
+    TestUtils.assumeKuduIsSupported();
     AnalysisError("update functional.alltypes_view set id = 10", "Cannot modify view");
     AnalysisError("delete functional.alltypes_view", "Cannot modify view");
   }
 
   @Test
   public void TestNoNestedTypes() {
+    TestUtils.assumeKuduIsSupported();
     AnalysisError(
         "update a set c.item = 10 FROM functional_kudu.testtbl a, functional" +
         ".allcomplextypes b, b.int_array_col c",
