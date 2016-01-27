@@ -21,7 +21,9 @@
 #include "exec/exec-node.h"
 #include "exec/hdfs-table-sink.h"
 #include "exec/hbase-table-sink.h"
+#ifdef KUDU
 #include "exec/kudu-table-sink.h"
+#endif
 #include "exprs/expr.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
 #include "gen-cpp/ImpalaInternalService_constants.h"
@@ -61,12 +63,14 @@ Status DataSink::CreateDataSink(ObjectPool* pool,
           tmp_sink = new HBaseTableSink(row_desc, output_exprs, thrift_sink);
           sink->reset(tmp_sink);
           break;
+#ifdef KUDU
         case TTableSinkType::KUDU_INSERT:
         case TTableSinkType::KUDU_UPDATE:
         case TTableSinkType::KUDU_DELETE:
           tmp_sink = new KuduTableSink(row_desc, output_exprs, thrift_sink);
           sink->reset(tmp_sink);
           break;
+#endif
         default:
           stringstream error_msg;
           const char* str = "Unknown table sink";

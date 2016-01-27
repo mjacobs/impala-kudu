@@ -32,8 +32,11 @@
 #include "exec/hash-join-node.h"
 #include "exec/hbase-scan-node.h"
 #include "exec/hdfs-scan-node.h"
+#ifdef KUDU
 #include "exec/kudu-scan-node.h"
+#endif
 #include "exec/nested-loop-join-node.h"
+#include "exec/select-node.h"
 #include "exec/partitioned-aggregation-node.h"
 #include "exec/partitioned-hash-join-node.h"
 #include "exec/select-node.h"
@@ -294,9 +297,11 @@ Status ExecNode::CreateNode(ObjectPool* pool, const TPlanNode& tnode,
     case TPlanNodeType::DATA_SOURCE_NODE:
       *node = pool->Add(new DataSourceScanNode(pool, tnode, descs));
       break;
+#ifdef KUDU
     case TPlanNodeType::KUDU_SCAN_NODE:
       *node = pool->Add(new KuduScanNode(pool, tnode, descs));
       break;
+#endif
     case TPlanNodeType::AGGREGATION_NODE:
       if (FLAGS_enable_partitioned_aggregation) {
         *node = pool->Add(new PartitionedAggregationNode(pool, tnode, descs));

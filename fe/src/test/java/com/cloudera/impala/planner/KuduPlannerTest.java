@@ -14,6 +14,7 @@
 
 package com.cloudera.impala.planner;
 
+import com.cloudera.impala.testutil.TestUtils;
 import com.cloudera.impala.thrift.TExplainLevel;
 import com.cloudera.impala.thrift.TQueryOptions;
 import org.junit.Test;
@@ -24,17 +25,27 @@ import org.junit.Test;
 public class KuduPlannerTest extends PlannerTestBase {
 
   @Test
-  public void testKudu() { runPlannerTestFile("kudu"); }
+  public void testKudu() {
+    TestUtils.assumeKuduIsSupported();
+    runPlannerTestFile("kudu");
+  }
 
   @Test
-  public void testUpdate() { runPlannerTestFile("kudu-update"); }
+  public void testUpdate() {
+    TestUtils.assumeKuduIsSupported();
+    runPlannerTestFile("kudu-update");
+  }
 
   @Test
-  public void testDelete() { runPlannerTestFile("kudu-delete"); }
+  public void testDelete() {
+    TestUtils.assumeKuduIsSupported();
+    runPlannerTestFile("kudu-delete");
+  }
 
 
   @Test
   public void testSelectivity() {
+    TestUtils.assumeKuduIsSupported();
     TQueryOptions options = defaultQueryOptions();
     options.setExplain_level(TExplainLevel.VERBOSE);
     runPlannerTestFile("kudu-selectivity", options);

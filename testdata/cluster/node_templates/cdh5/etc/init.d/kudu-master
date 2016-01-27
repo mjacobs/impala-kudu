@@ -1,0 +1,13 @@
+#!/bin/bash
+
+DIR=$(dirname $0)
+
+. "$DIR/common"
+
+function start {
+  do_start "$KUDU_HOME"/sbin-release/kudu-master \
+      -flagfile "$NODE_DIR"/etc/kudu/master.conf \
+      -vmodule IBelongToTheMiniCluster
+}
+
+$1

@@ -39,28 +39,40 @@ if [ -z $IMPALA_HOME ]; then
   fi
 fi
 
-# Set a default value for Kudu binary distribution, this is temporary only
-# TODO: replace with packaged path once beta is there
-export KUDU_HOME=${KUDU_HOME:-"$IMPALA_HOME/../kudu"}
-export KUDU_CLIENT_ROOT=${KUDU_CLIENT_ROOT:-"$KUDU_HOME/kudu-cli-export"}
-export KUDU_CLIENT_CMAKE_MODULE=${KUDU_CLIENT_CMAKE_MODULE:-"$KUDU_CLIENT_ROOT/usr/local/share/kuduClient"}
-export KUDU_BIN_HOME=${KUDU_BIN_HOME:-"$IMPALA_HOME/../kudu-bin"}
-export KUDU_MASTER=${KUDU_MASTER:-"127.0.0.1"}
-export KUDU_MASTER_PORT=${KUDU_MASTER_PORT:-"7051"}
-# TODO: Figure out a way to use a snapshot version without causing a lot of breakage due
-#       to nightly changes from Kudu. The version below is the last released version but
-#       before release this needs to be updated to the version about to be released.
-export KUDU_JAVA_VERSION=0.6.0
-
 # Setting up Impala binary toolchain.
 : ${DISABLE_IMPALA_TOOLCHAIN=0}
 : ${IMPALA_TOOLCHAIN=$IMPALA_HOME/toolchain}
 : ${USE_SYSTEM_GCC=0}
-
 export USE_SYSTEM_GCC
 export IMPALA_TOOLCHAIN
 export DISABLE_IMPALA_TOOLCHAIN
+
 export IS_OSX=$(if [[ "$OSTYPE" == "darwin"* ]]; then echo true; else echo false; fi)
+
+# Kudu doesn't compile on some old Linux distros. KUDU_IS_SUPPORTED enables building Kudu
+# into the backend. The frontend build is OS independent since it is Java.
+export KUDU_IS_SUPPORTED=true
+if [[ $DISABLE_IMPALA_TOOLCHAIN -eq 1 ]]; then
+  KUDU_IS_SUPPORTED=false
+fi
+if ! $IS_OSX; then
+  if ! which lsb_release &>/dev/null; then
+    echo Unable to find the 'lsb_release' command. \
+        Please ensure it is available in your PATH. 1>&2
+    return 1
+  fi
+  DISTRO_VERSION=$(lsb_release -sir 2>&1)
+  if [[ $? -ne 0 ]]; then
+    echo lsb_release cammond failed, output was: "$DISTRO_VERSION" 1>&2
+    return 1
+  fi
+  # Remove spaces, trim minor versions, and convert to lowercase.
+  DISTRO_VERSION=$(tr -d ' \n' <<< "$DISTRO_VERSION" | cut -d. -f1 | tr "A-Z" "a-z")
+  case "$DISTRO_VERSION" in
+    # "enterprise" is Oracle
+    centos5 | debian6 | enterprise*5 | redhat*5 | suse*11) KUDU_IS_SUPPORTED=false;;
+  esac
+fi
 
 export CDH_MAJOR_VERSION=5
 export HADOOP_LZO=${HADOOP_LZO-$IMPALA_HOME/../hadoop-lzo}
@@ -150,6 +162,7 @@ export IMPALA_GFLAGS_VERSION=2.0
 export IMPALA_GLOG_VERSION=0.3.2
 export IMPALA_GPERFTOOLS_VERSION=2.0
 export IMPALA_GTEST_VERSION=1.6.0
+export IMPALA_KUDU_VERSION=0.7.0.p0.425
 export IMPALA_LLVM_VERSION=3.3
 export IMPALA_LLVM_ASAN_VERSION=3.7.0
 export IMPALA_LZ4_VERSION=svn
@@ -174,6 +187,14 @@ if [[ -n "$IMPALA_TOOLCHAIN" ]]; then
   IMPALA_RE2_VERSION+=-p1
   IMPALA_LLVM_VERSION+=-p1
 fi
+
+export KUDU_MASTER=${KUDU_MASTER:-"127.0.0.1"}
+export KUDU_MASTER_PORT=${KUDU_MASTER_PORT:-"7051"}
+# TODO: Figure out a way to use a snapshot version without causing a lot of breakage due
+#       to nightly changes from Kudu. The version below is the last released version but
+#       before release this needs to be updated to the version about to be released.
+export KUDU_HOME="$IMPALA_TOOLCHAIN/kudu-$IMPALA_KUDU_VERSION/lib/kudu"
+export KUDU_JAVA_VERSION=0.6.0
 
 if [[ $OSTYPE == "darwin"* ]]; then
   IMPALA_CYRUS_SASL_VERSION=2.1.26

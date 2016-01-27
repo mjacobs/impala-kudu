@@ -25,10 +25,12 @@
 # The script is called as follows without any additional parameters:
 #
 #     python bootstrap_toolchain.py
-import sh
+import glob
 import os
-import sys
 import re
+import sh
+import shutil
+import sys
 
 HOST = "https://native-toolchain.s3.amazonaws.com/build"
 
@@ -69,6 +71,18 @@ def download_package(destination, product, version, compiler):
   sh.tar(z=True, x=True, f=os.path.join(destination, file_name), directory=destination)
   sh.rm(os.path.join(destination, file_name))
 
+  if product == "kudu":
+    # The Kudu tarball is actually a renamed parcel. Rename the contents to match the
+    # naming convention.
+    kudu_dirs = glob.glob("{0}/KUDU*{1}*".format(destination, version))
+    if not kudu_dirs:
+      raise Exception("Could not find contents of Kudu tarball")
+    if len(kudu_dirs) > 1:
+      raise Exception("Found too many Kudu folders: %s" % (kudu_dirs, ))
+    new_dir = "{0}/{1}-{2}".format(destination, product, version)
+    if os.path.exists(new_dir):
+      shutil.rmtree(new_dir)
+    os.rename(kudu_dirs[0], new_dir)
 
 def bootstrap(packages):
   """Validates the presence of $IMPALA_HOME and $IMPALA_TOOLCHAIN in the environment. By
@@ -98,7 +112,8 @@ def bootstrap(packages):
 
   for p in packages:
     pkg_name, pkg_version = unpack_name_and_version(p)
-    download_package(destination, pkg_name, pkg_version, compiler)
+    download_package(destination, pkg_name, pkg_version,
+        "any" if pkg_name == "kudu" else compiler)
 
 def unpack_name_and_version(package):
   """A package definition is either a string where the version is fetched from the
@@ -116,6 +131,6 @@ def unpack_name_and_version(package):
 
 if __name__ == "__main__":
   packages = ["avro", "boost", "bzip2", "gcc", "gflags", "glog",
-              "gperftools", "gtest", "llvm", ("llvm", "3.7.0"), "lz4", "openldap",
+              "gperftools", "gtest", "kudu", "llvm", ("llvm", "3.7.0"), "lz4", "openldap",
               "rapidjson", "re2", "snappy", "thrift", "zlib"]
   bootstrap(packages)

@@ -21,7 +21,7 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/exec")
 # where to put generated binaries
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/exec")
 
-add_library(Exec
+set(SOURCES
   aggregation-node.cc
   aggregation-node-ir.cc
   analytic-eval-node.cc
@@ -65,10 +65,6 @@ add_library(Exec
   partitioned-aggregation-node-ir.cc
   partitioned-hash-join-node.cc
   partitioned-hash-join-node-ir.cc
-  kudu-scanner.cc
-  kudu-scan-node.cc
-  kudu-table-sink.cc
-  kudu-util.cc
   read-write-util.cc
   scan-node.cc
   scanner-context.cc
@@ -82,6 +78,14 @@ add_library(Exec
   union-node.cc
   unnest-node.cc
 )
+if($ENV{KUDU_IS_SUPPORTED} STREQUAL true)
+  list(APPEND SOURCES
+    kudu-scanner.cc
+    kudu-scan-node.cc
+    kudu-table-sink.cc
+    kudu-util.cc)
+endif()
+add_library(Exec ${SOURCES})
 add_dependencies(Exec thrift-deps)
 
 ADD_BE_TEST(zigzag-test)
@@ -93,5 +97,7 @@ ADD_BE_TEST(parquet-plain-test)
 ADD_BE_TEST(parquet-version-test)
 ADD_BE_TEST(row-batch-list-test)
 ADD_BE_TEST(incr-stats-util-test)
-ADD_BE_TEST(kudu-scan-node-test)
-ADD_BE_TEST(kudu-table-sink-test)
+if($ENV{KUDU_IS_SUPPORTED} STREQUAL true)
+  ADD_BE_TEST(kudu-scan-node-test)
+  ADD_BE_TEST(kudu-table-sink-test)
+endif()
