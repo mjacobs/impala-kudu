@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifdef KUDU
+
 #include "exec/kudu-util.h"
 
 #include <algorithm>
@@ -175,3 +177,5 @@ void InitKuduLogging() {
 }
 
 }  // namespace impala
+
+#endif
