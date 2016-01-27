@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifdef USE_KUDU
+
 #include "exec/kudu-scanner.h"
 
 #include <boost/foreach.hpp>
@@ -344,3 +346,5 @@ Status KuduScanner::GetNextBlock() {
 }
 
 }  // namespace impala
+
+#endif
