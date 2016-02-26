@@ -87,6 +87,10 @@ class KillableThreadedServer(TServer):
     TServer.__init__(self, *args)
     self.daemon = kwargs.get("daemon", False)
     self.is_shutdown = False
+<<<<<<< HEAD
+=======
+    self.transports = set()
+>>>>>>> feature/kudu-with-thirdparty-02-22
     self.port = self.serverTransport.port
 
   def shutdown(self):
