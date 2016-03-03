@@ -93,21 +93,21 @@ public class CreateTableStmt extends StatementBase {
     Preconditions.checkNotNull(rowFormat);
     Preconditions.checkNotNull(tableName);
 
-    this.columnDefs_ = Lists.newArrayList(columnDefs);
-    this.comment_ = comment;
-    this.isExternal_ = isExternal;
-    this.ifNotExists_ = ifNotExists;
-    this.fileFormat_ = fileFormat;
-    this.location_ = location;
-    this.cachingOp_ = cachingOp;
-    this.partitionColDefs_ = Lists.newArrayList(partitionColumnDefs);
-    this.rowFormat_ = rowFormat;
-    this.tableName_ = tableName;
-    this.tblProperties_ = tblProperties;
-    this.serdeProperties_ = serdeProperties;
+    columnDefs_ = Lists.newArrayList(columnDefs);
+    comment_ = comment;
+    isExternal_ = isExternal;
+    ifNotExists_ = ifNotExists;
+    fileFormat_ = fileFormat;
+    location_ = location;
+    cachingOp_ = cachingOp;
+    partitionColDefs_ = Lists.newArrayList(partitionColumnDefs);
+    rowFormat_ = rowFormat;
+    tableName_ = tableName;
+    tblProperties_ = tblProperties;
+    serdeProperties_ = serdeProperties;
     unescapeProperties(tblProperties_);
     unescapeProperties(serdeProperties_);
-    this.distributeParams_ = distributeParams;
+    distributeParams_ = distributeParams;
   }
 
   /**
@@ -187,7 +187,7 @@ public class CreateTableStmt extends StatementBase {
     if (tblProperties_ != null) params.setTable_properties(tblProperties_);
     if (serdeProperties_ != null) params.setSerde_properties(serdeProperties_);
     if (distributeParams_ != null) {
-      for(DistributeParam d : distributeParams_) {
+      for (DistributeParam d : distributeParams_) {
         params.addToDistribute_by(d.toThrift());
       }
     }
@@ -368,7 +368,7 @@ public class CreateTableStmt extends StatementBase {
     if (distributeParams_ != null) {
       List<String> keyColumns = KuduUtil.parseKeyColumnsAsList(
           getTblProperties().get(KuduTable.KEY_KEY_COLUMNS));
-      for(DistributeParam d : distributeParams_) {
+      for (DistributeParam d : distributeParams_) {
         // If the columns are not set, default to all key columns
         if (d.getColumns() == null) d.setColumns(keyColumns);
         d.analyze(analyzer);

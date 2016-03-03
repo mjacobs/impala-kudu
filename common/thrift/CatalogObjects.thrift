@@ -182,7 +182,7 @@ struct TColumn {
   8: optional string column_qualifier
   9: optional bool is_binary
 
-  // Indicates whether this is a Kudu column, If true implies all following Kudu specific
+  // Indicates whether this is a Kudu column. If true implies all following Kudu specific
   // fields are set.
   10: optional bool is_kudu_column
   11: optional bool is_key

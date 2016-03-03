@@ -1623,7 +1623,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     // Distribute range data types are picked up during analysis and forwarded to Kudu
     AnalyzesOk("create table tab (a int, b int, c int, d int) " +
         "distribute by hash(a,b,c) into 8 buckets, " +
-        "range(a) split rows ((1),('abc'),(3)) " +
+        "range(a) split rows ((1),(2),(3)) " +
         "tblproperties (" +
         "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler', " +
         "'kudu.table_name'='tab'," +

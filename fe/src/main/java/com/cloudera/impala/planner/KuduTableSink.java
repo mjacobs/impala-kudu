@@ -30,53 +30,37 @@ import com.google.common.collect.Lists;
 
 /**
  * Class used to represent a Sink that will transport
- * data from a plan fragment into an Kudu table using the Kudu client.
+ * data from a plan fragment into an Kudu table using a Kudu client.
  */
 public class KuduTableSink extends TableSink {
 
-  // Sink type e.g. INSERT, UPDATE
-  private Type sinkType_;
-
   // Optional list of referenced Kudu table column indices. The position of a result
   // expression i matches a column index into the Kudu schema at targetColdIdxs[i].
-  private ArrayList<Integer> targetColdIdxs_;
+  private ArrayList<Integer> targetColIdxs_;
 
   private final boolean ignoreNotFoundOrDuplicate_;
 
-  private KuduTableSink(Table targetTable, Type sinkType,
+  public KuduTableSink(Table targetTable, Op sinkOp,
       List<Integer> referencedColumns, boolean ignoreNotFoundOrDuplicate) {
-    super(targetTable);
-    sinkType_ = sinkType;
-    targetColdIdxs_ = referencedColumns != null
+    super(targetTable, sinkOp);
+    targetColIdxs_ = referencedColumns != null
         ? Lists.newArrayList(referencedColumns) : null;
     ignoreNotFoundOrDuplicate_ = ignoreNotFoundOrDuplicate;
-  }
-
-  public static KuduTableSink createInsertSink(Table targetTable,
-      boolean ignoreDuplicates) {
-    return new KuduTableSink(targetTable, Type.INSERT, null, ignoreDuplicates);
-  }
-
-  public static KuduTableSink createUpdateSink(Table targetTable,
-      List<Integer> referencedColIdxs, boolean ignoreNotFound) {
-    return new KuduTableSink(targetTable, Type.UPDATE, referencedColIdxs,
-        ignoreNotFound);
-  }
-
-  public static KuduTableSink createDeleteSink(Table targetTable,
-      List<Integer> referencedColIdxs, boolean ignoreNotFound) {
-    return new KuduTableSink(targetTable, Type.DELETE, referencedColIdxs,
-        ignoreNotFound);
   }
 
   @Override
   public String getExplainString(String prefix, String detailPrefix,
       TExplainLevel explainLevel) {
     StringBuilder output = new StringBuilder();
-    output.append(prefix + sinkType_.toExplainString());
+    output.append(prefix + sinkOp_.toExplainString());
     output.append(" KUDU [" + targetTable_.getFullName() + "]\n");
-    output.append(detailPrefix).append("ignoreKeysNotFoundOrDuplicate: ").append(
-        ignoreNotFoundOrDuplicate_);
+    output.append(detailPrefix);
+    if (sinkOp_ == Op.INSERT) {
+      output.append("check unique keys: ");
+    } else {
+      output.append("check keys exist: ");
+    }
+    output.append(ignoreNotFoundOrDuplicate_);
     output.append("\n");
     if (explainLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
       output.append(PrintUtils.printHosts(detailPrefix, fragment_.getNumNodes()));
@@ -89,44 +73,13 @@ public class KuduTableSink extends TableSink {
   @Override
   protected TDataSink toThrift() {
     TDataSink result = new TDataSink(TDataSinkType.TABLE_SINK);
-    TTableSink tTableSink =
-        new TTableSink(targetTable_.getId().asInt(), sinkType_.toThrift());
+    TTableSink tTableSink = new TTableSink(targetTable_.getId().asInt(),
+        TTableSinkType.KUDU, sinkOp_.toThrift());
     TKuduTableSink tKuduSink = new TKuduTableSink();
-    tKuduSink.setReferenced_columns(targetColdIdxs_);
+    tKuduSink.setReferenced_columns(targetColIdxs_);
     tKuduSink.setIgnore_not_found_or_duplicate(ignoreNotFoundOrDuplicate_);
     tTableSink.setKudu_table_sink(tKuduSink);
     result.table_sink = tTableSink;
     return result;
-  }
-
-  /**
-   * Enum to specify the sink type
-   */
-  public enum Type {
-    INSERT {
-      @Override
-      public String toExplainString() { return "INSERT INTO"; }
-
-      @Override
-      public TTableSinkType toThrift() { return TTableSinkType.KUDU_INSERT; }
-    },
-    UPDATE {
-      @Override
-      public String toExplainString() { return "UPDATE"; }
-
-      @Override
-      public TTableSinkType toThrift() { return TTableSinkType.KUDU_UPDATE; }
-    },
-    DELETE {
-      @Override
-      public String toExplainString() { return "DELETE FROM"; }
-
-      @Override
-      public TTableSinkType toThrift() { return TTableSinkType.KUDU_DELETE; }
-    };
-
-    public abstract String toExplainString();
-
-    public abstract TTableSinkType toThrift();
   }
 }

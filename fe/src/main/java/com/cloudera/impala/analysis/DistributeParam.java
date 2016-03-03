@@ -47,17 +47,16 @@ public class DistributeParam implements ParseNode {
   /**
    * Creates a DistributeParam partitioned by hash.
    */
-  public static DistributeParam createHashParam(Type t, List<String> cols,
-      BigDecimal buckets) {
-    return new DistributeParam(t, cols, buckets);
+  public static DistributeParam createHashParam(List<String> cols, BigDecimal buckets) {
+    return new DistributeParam(Type.HASH, cols, buckets);
   }
 
   /**
    * Creates a DistributeParam partitioned by range.
    */
-  public static DistributeParam createRangeParam(Type t, List<String> cols,
+  public static DistributeParam createRangeParam(List<String> cols,
       ArrayList<ArrayList<LiteralExpr>> splitRows) {
-    return new DistributeParam(t, cols, splitRows);
+    return new DistributeParam(Type.RANGE, cols, splitRows);
   }
 
   private static final int NO_BUCKETS = -1;
@@ -74,17 +73,18 @@ public class DistributeParam implements ParseNode {
   private final Type type_;
 
   // Only relevant for hash partitioning, -1 otherwise
-  private final int buckets_;
+  private final int num_buckets_;
 
   // Only relevant for range partitioning, null otherwise
   private final ArrayList<ArrayList<LiteralExpr>> splitRows_;
 
+  // Set in analyze()
   private TDistributeByRangeParam rangeParam_;
 
   private DistributeParam(Type t, List<String> cols, BigDecimal buckets) {
     type_ = t;
     columns_ = cols;
-    buckets_ = buckets.intValue();
+    num_buckets_ = buckets.intValue();
     splitRows_ = null;
   }
 
@@ -93,17 +93,22 @@ public class DistributeParam implements ParseNode {
     type_ = t;
     columns_ = cols;
     splitRows_ = splitRows;
-    buckets_ = NO_BUCKETS;
+    num_buckets_ = NO_BUCKETS;
   }
 
+  /**
+   * TODO Refactor the logic below to analyze 'columns_'. This analysis should output
+   * a vector of column types that would then be used during the analysis of the split
+   * rows.
+   */
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException {
-    if (type_ == Type.HASH && buckets_ <= 1) {
+    if (type_ == Type.HASH && num_buckets_ <= 1) {
       throw new AnalysisException(String.format(
           "Number of buckets in DISTRIBUTE BY clause '%s' must be larger than 1.",
           toSql()));
     } else if (type_ == Type.RANGE) {
-      // Creating the thrift structure here allows to throw meaningful exceptions.
+      // Creating the thrift structure simultaneously checks for semantic errors
       rangeParam_ = new TDistributeByRangeParam();
       rangeParam_.setColumns(columns_);
 
@@ -111,8 +116,8 @@ public class DistributeParam implements ParseNode {
         TRangeLiteralList list = new TRangeLiteralList();
         if (splitRow.size() != columns_.size()) {
           throw new AnalysisException(String.format(
-              "SPLIT ROWS has different size than number " +
-              "of projected key columns: %d != %d", splitRow.size(), columns_.size()));
+              "SPLIT ROWS has different size than number of projected key columns: %d. "
+                  + "Split row: %s", columns_.size(), splitRowToString(splitRow)));
         }
         for (LiteralExpr expr : splitRow) {
           expr.analyze(analyzer);
@@ -132,8 +137,8 @@ public class DistributeParam implements ParseNode {
             BoolLiteral bool = (BoolLiteral) expr;
             literal.setBool_literal(bool.getValue());
           } else {
-            throw new AnalysisException(String.format("Split row value: %s (Type: %s) is not "
-                + "supported.", expr.getStringValue(), expr.getType().toSql()));
+            throw new AnalysisException(String.format("Split row value is not supported: %s "
+                + "(Type: %s) is not supported.", expr.getStringValue(), expr.getType().toSql()));
           }
           list.addToValues(literal);
         }
@@ -144,35 +149,41 @@ public class DistributeParam implements ParseNode {
 
   @Override
   public String toSql() {
-    if (buckets_ == NO_BUCKETS) {
+    if (num_buckets_ == NO_BUCKETS) {
       StringBuilder builder = new StringBuilder();
-      for (ArrayList<LiteralExpr> rangeEntry : splitRows_) {
-        builder.append("[");
-        List<String> rangeElementStrings = Lists.newArrayList();
-        for (LiteralExpr rangeElement : rangeEntry) {
-          rangeElementStrings.add(rangeElement.getStringValue());
-        }
-        builder.append(Joiner.on(",").join(rangeElementStrings));
-        builder.append("]");
+      for (ArrayList<LiteralExpr> splitRow : splitRows_) {
+        splitRowToString(splitRow);
       }
       return String.format("RANGE(%s) INTO RANGES(%s)", Joiner.on(", ").join(columns_),
           builder.toString());
     } else {
-      return String.format("HASH(%s) INTO %d BUCKETS", Joiner.on(", ").join(columns_), buckets_);
+      return String.format("HASH(%s) INTO %d BUCKETS", Joiner.on(", ").join(columns_),
+          num_buckets_);
     }
+  }
+
+  private String splitRowToString(ArrayList<LiteralExpr> splitRow) {
+    StringBuilder builder = new StringBuilder();
+    builder.append("[");
+    List<String> rangeElementStrings = Lists.newArrayList();
+    for (LiteralExpr rangeElement : splitRow) {
+      rangeElementStrings.add(rangeElement.getStringValue());
+    }
+    builder.append(Joiner.on(",").join(rangeElementStrings));
+    builder.append("]");
+    return builder.toString();
   }
 
   TDistributeParam toThrift() {
     TDistributeParam result = new TDistributeParam();
     if (type_ == Type.HASH) {
-      result.setType(TDistributeType.HASH);
       TDistributeByHashParam hash = new TDistributeByHashParam();
-      hash.setBuckets(buckets_);
+      hash.setNum_buckets(num_buckets_);
       hash.setColumns(columns_);
       result.setBy_hash_param(hash);
     } else {
       Preconditions.checkState(type_ == Type.RANGE);
-      result.setType(TDistributeType.RANGE);
+
       result.setBy_range_param(rangeParam_);
     }
     return result;
@@ -181,5 +192,5 @@ public class DistributeParam implements ParseNode {
   public List<String> getColumns() { return columns_; }
   public void setColumns(List<String> cols) { columns_ = cols; }
   public Type getType_() { return type_; }
-  public int getBuckets_() { return buckets_; }
+  public int getNumBuckets() { return num_buckets_; }
 }

@@ -1,37 +1,37 @@
 delete from functional_kudu.testtbl
 ---- PLAN
 DELETE FROM KUDU [functional_kudu.testtbl]
-|  ignoreKeysNotFoundOrDuplicate: false
+|  check keys exist: false
 |
 00:SCAN KUDU [functional_kudu.testtbl]
 ---- DISTRIBUTEDPLAN
 DELETE FROM KUDU [functional_kudu.testtbl]
-|  ignoreKeysNotFoundOrDuplicate: false
+|  check keys exist: false
 |
 00:SCAN KUDU [functional_kudu.testtbl]
 ====
 delete ignore from functional_kudu.testtbl
 ---- PLAN
 DELETE FROM KUDU [functional_kudu.testtbl]
-|  ignoreKeysNotFoundOrDuplicate: true
+|  check keys exist: true
 |
 00:SCAN KUDU [functional_kudu.testtbl]
 ---- DISTRIBUTEDPLAN
 DELETE FROM KUDU [functional_kudu.testtbl]
-|  ignoreKeysNotFoundOrDuplicate: true
+|  check keys exist: true
 |
 00:SCAN KUDU [functional_kudu.testtbl]
 ====
 delete from functional_kudu.testtbl where name = 'hallo'
 ---- PLAN
 DELETE FROM KUDU [functional_kudu.testtbl]
-|  ignoreKeysNotFoundOrDuplicate: false
+|  check keys exist: false
 |
 00:SCAN KUDU [functional_kudu.testtbl]
    kudu predicates: name = 'hallo'
 ---- DISTRIBUTEDPLAN
 DELETE FROM KUDU [functional_kudu.testtbl]
-|  ignoreKeysNotFoundOrDuplicate: false
+|  check keys exist: false
 |
 00:SCAN KUDU [functional_kudu.testtbl]
    kudu predicates: name = 'hallo'
@@ -40,27 +40,31 @@ delete a from functional_kudu.testtbl a, functional.alltypes b
 where a.id = b.id and a.id in (select id from functional.alltypes)
 ---- PLAN
 DELETE FROM KUDU [functional_kudu.testtbl]
-|  ignoreKeysNotFoundOrDuplicate: false
+|  check keys exist: false
 |
 04:HASH JOIN [LEFT SEMI JOIN]
 |  hash predicates: a.id = id
+|  runtime filters: RF000 <- id
 |
 |--02:SCAN HDFS [functional.alltypes]
 |     partitions=24/24 files=24 size=478.45KB
 |
 03:HASH JOIN [INNER JOIN]
 |  hash predicates: b.id = a.id
+|  runtime filters: RF001 <- a.id
 |
 |--00:SCAN KUDU [functional_kudu.testtbl a]
 |
 01:SCAN HDFS [functional.alltypes b]
    partitions=24/24 files=24 size=478.45KB
+   runtime filters: RF000 -> b.id, RF001 -> b.id
 ---- DISTRIBUTEDPLAN
 DELETE FROM KUDU [functional_kudu.testtbl]
-|  ignoreKeysNotFoundOrDuplicate: false
+|  check keys exist: false
 |
 04:HASH JOIN [LEFT SEMI JOIN, BROADCAST]
 |  hash predicates: a.id = id
+|  runtime filters: RF000 <- id
 |
 |--06:EXCHANGE [BROADCAST]
 |  |
@@ -69,6 +73,7 @@ DELETE FROM KUDU [functional_kudu.testtbl]
 |
 03:HASH JOIN [INNER JOIN, BROADCAST]
 |  hash predicates: b.id = a.id
+|  runtime filters: RF001 <- a.id
 |
 |--05:EXCHANGE [BROADCAST]
 |  |
@@ -76,4 +81,5 @@ DELETE FROM KUDU [functional_kudu.testtbl]
 |
 01:SCAN HDFS [functional.alltypes b]
    partitions=24/24 files=24 size=478.45KB
+   runtime filters: RF000 -> b.id, RF001 -> b.id
 ====

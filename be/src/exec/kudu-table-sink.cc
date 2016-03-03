@@ -50,7 +50,7 @@ KuduTableSink::KuduTableSink(const RowDescriptor& row_desc,
     : table_id_(tsink.table_sink.target_table_id),
       row_desc_(row_desc),
       select_list_texprs_(select_list_texprs),
-      sink_type_(tsink.table_sink.type),
+      sink_action_(tsink.table_sink.action),
       kudu_table_sink_(tsink.table_sink.kudu_table_sink),
       kudu_flush_counter_(NULL),
       kudu_flush_timer_(NULL),
@@ -130,13 +130,12 @@ Status KuduTableSink::Open(RuntimeState* state) {
 }
 
 kudu::client::KuduWriteOperation* KuduTableSink::NewWriteOp() {
-  if (sink_type_ == TTableSinkType::KUDU_INSERT) {
+  if (sink_action_ == TSinkAction::INSERT) {
     return table_->NewInsert();
-  } else if (sink_type_ == TTableSinkType::KUDU_UPDATE) {
+  } else if (sink_action_ == TSinkAction::UPDATE) {
     return table_->NewUpdate();
   } else {
-    DCHECK(sink_type_ == TTableSinkType::KUDU_DELETE) << "Sink type not supported. "
-                                                      << sink_type_;
+    DCHECK(sink_action_ == TSinkAction::DELETE) << "Sink type not supported. " << sink_action_;
     return table_->NewDelete();
   }
 }
@@ -261,9 +260,9 @@ Status KuduTableSink::Flush(int64_t* error_count) {
     // key already present errors from Kudu in INSERT, UPDATE, or DELETE operations will
     // be ignored.
     if (!kudu_table_sink_.ignore_not_found_or_duplicate ||
-        ((sink_type_ == TTableSinkType::KUDU_DELETE && !e.IsNotFound()) ||
-            (sink_type_ == TTableSinkType::KUDU_UPDATE && !e.IsNotFound()) ||
-            (sink_type_ == TTableSinkType::KUDU_INSERT && !e.IsAlreadyPresent()))) {
+        ((sink_action_ == TSinkAction::DELETE && !e.IsNotFound()) ||
+            (sink_action_ == TSinkAction::UPDATE && !e.IsNotFound()) ||
+            (sink_action_ == TSinkAction::INSERT && !e.IsAlreadyPresent()))) {
       if (first_error) {
         error_msg_buffer << "Error while flushing Kudu session: \n";
         first_error = false;

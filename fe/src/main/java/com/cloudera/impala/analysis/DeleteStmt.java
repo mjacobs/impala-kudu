@@ -17,9 +17,13 @@ package com.cloudera.impala.analysis;
 import java.util.List;
 
 import com.cloudera.impala.common.Pair;
+import com.cloudera.impala.planner.DataSink;
 import com.cloudera.impala.planner.KuduTableSink;
+import com.cloudera.impala.planner.TableSink;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
+import org.apache.hadoop.hbase.client.Delete;
 
 /**
  * Representation of a DELETE statement.
@@ -32,7 +36,7 @@ import com.google.common.collect.Lists;
  *
  * Only the syntax using the explicit from clause can contain join conditions.
  */
-public class DeleteStmt extends UpdateStmt {
+public class DeleteStmt extends ModifyStmt {
 
   public DeleteStmt(List<String> targetTablePath, FromClause tableRefs,
       Expr wherePredicate, boolean ignoreNotFound) {
@@ -40,11 +44,22 @@ public class DeleteStmt extends UpdateStmt {
         wherePredicate, ignoreNotFound);
   }
 
-  public KuduTableSink createDataSink() {
+  public DeleteStmt(DeleteStmt other) {
+    super(other.targetTablePath_, other.fromClause_.clone(),
+        Lists.<Pair<SlotRef, Expr>>newArrayList(), other.wherePredicate_.clone(),
+        other.ignoreNotFound_);
+  }
+
+  public DataSink createDataSink() {
     // analyze() must have been called before.
     Preconditions.checkState(table_ != null);
-    return KuduTableSink.createDeleteSink(table_, referencedColumns_,
-        ignoreNotFound_);
+    return TableSink.create(table_, TableSink.Op.DELETE, ImmutableList.<Expr>of(),
+        referencedColumns_, false, ignoreNotFound_);
+  }
+
+  @Override
+  public DeleteStmt clone() {
+    return new DeleteStmt(this);
   }
 
   @Override

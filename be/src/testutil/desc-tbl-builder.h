@@ -22,13 +22,6 @@ namespace impala {
 class ObjectPool;
 class TupleDescBuilder;
 
-struct Slot {
-  Slot(ColumnType type, bool mat = true)
-    : slot_type(type), materialized(mat) {}
-  ColumnType slot_type;
-  bool materialized;
-};
-
 /// Aids in the construction of a DescriptorTbl by declaring tuples and slots
 /// associated with those tuples.
 /// TupleIds are monotonically increasing from 0 for each DeclareTuple, and
@@ -60,26 +53,21 @@ class DescriptorTblBuilder {
   TDescriptorTable thrift_desc_tbl_;
 
   TTupleDescriptor BuildTuple(
-      const std::vector<Slot>& slots, TDescriptorTable* thrift_desc_tbl,
+      const std::vector<ColumnType>& slot_types, TDescriptorTable* thrift_desc_tbl,
       int* tuple_id, int* slot_id);
 };
 
 class TupleDescBuilder {
  public:
-  TupleDescBuilder& operator<< (ColumnType slot_type) {
-    slots_.push_back(Slot(slot_type));
+  TupleDescBuilder& operator<< (const ColumnType& slot_type) {
+    slot_types_.push_back(slot_type);
     return *this;
   }
 
-  TupleDescBuilder& AddSlot(ColumnType slot_type, bool materialized) {
-    slots_.push_back(Slot(slot_type, materialized));
-    return *this;
-  }
-
-  std::vector<Slot> slots() const { return slots_; }
+  std::vector<ColumnType> slot_types() const { return slot_types_; }
 
  private:
-  std::vector<Slot> slots_;
+  std::vector<ColumnType> slot_types_;
 };
 
 }

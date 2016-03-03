@@ -28,18 +28,11 @@ public class KuduColumn extends Column {
   public KuduColumn(String name, boolean isKey, boolean isNullable, Type type,
       String comment, int position) {
     super(name, type, comment, position);
-    this.isKey_ = isKey;
-    this.isNullable_ = isNullable;
+    isKey_ = isKey;
+    isNullable_ = isNullable;
   }
 
-  /**
-   * Returns whether this column is a key column in the Kudu table.
-   */
   public boolean isKey() { return isKey_; }
-
-  /**
-   * Returns whether this column is nullable in the Kudu table.
-   */
   public boolean isNullable() { return isNullable_; }
 
   @Override

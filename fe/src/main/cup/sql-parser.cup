@@ -663,8 +663,7 @@ explain_stmt ::=
 // tbl(col1,...) etc) and the PARTITION clause. If the column permutation is present, the
 // query statement clause is optional as well.
 insert_stmt ::=
-  opt_with_clause:w KW_INSERT KW_OVERWRITE opt_ignore:ignore
-  opt_kw_table table_name:table
+  opt_with_clause:w KW_INSERT KW_OVERWRITE opt_ignore:ignore opt_kw_table table_name:table
   LPAREN opt_ident_list:col_perm RPAREN partition_clause:list opt_plan_hints:hints
   opt_query_stmt:query
   {: RESULT = new InsertStmt(w, table, true, list, hints, query, col_perm, ignore); :}
@@ -672,21 +671,19 @@ insert_stmt ::=
   opt_ignore:ignore opt_kw_table table_name:table
   partition_clause:list opt_plan_hints:hints query_stmt:query
   {: RESULT = new InsertStmt(w, table, true, list, hints, query, null, ignore); :}
-  | opt_with_clause:w KW_INSERT
-  opt_ignore:ignore KW_INTO opt_kw_table table_name:table LPAREN
-  opt_ident_list:col_perm RPAREN partition_clause:list opt_plan_hints:hints
-  opt_query_stmt:query
+  | opt_with_clause:w KW_INSERT opt_ignore:ignore KW_INTO
+  opt_kw_table table_name:table LPAREN opt_ident_list:col_perm RPAREN
+  partition_clause:list opt_plan_hints:hints opt_query_stmt:query
   {: RESULT = new InsertStmt(w, table, false, list, hints, query, col_perm, ignore); :}
   | opt_with_clause:w KW_INSERT
-  opt_ignore:ignore KW_INTO opt_kw_table table_name:table
-  partition_clause:list opt_plan_hints:hints query_stmt:query
+  opt_ignore:ignore KW_INTO opt_kw_table table_name:table partition_clause:list
+  opt_plan_hints:hints query_stmt:query
   {: RESULT = new InsertStmt(w, table, false, list, hints, query, null, ignore); :}
   ;
 
 // Update statements have an optional WHERE and optional FROM clause.
 update_stmt ::=
-  KW_UPDATE opt_ignore:ignore dotted_path:target_table
-  KW_SET update_set_expr_list:values
+  KW_UPDATE opt_ignore:ignore dotted_path:target_table KW_SET update_set_expr_list:values
   where_clause:where_predicate
   {:
     FromClause from_clause = new FromClause(
@@ -968,16 +965,15 @@ create_tbl_as_select_stmt ::=
   KW_CREATE external_val:external KW_TABLE if_not_exists_val:if_not_exists
   table_name:table comment_val:comment row_format_val:row_format
   serde_properties:serde_props file_format_create_table_val:file_format
-  location_val:location cache_op_val:cache_op
-  distribute_param_list:distribute tbl_properties:tbl_props
+  location_val:location cache_op_val:cache_op distribute_param_list:distribute
+  tbl_properties:tbl_props
   KW_AS query_stmt:query
   {:
     // Initialize with empty List of columns and partition columns. The
     // columns will be added from the query statement during analysis
     CreateTableStmt create_stmt = new CreateTableStmt(table, new ArrayList<ColumnDef>(),
-        new ArrayList<ColumnDef>(), external, comment, row_format,
-        file_format, location, cache_op, if_not_exists, tbl_props, serde_props,
-        distribute);
+        new ArrayList<ColumnDef>(), external, comment, row_format, file_format, location,
+        cache_op, if_not_exists, tbl_props, serde_props, distribute);
     RESULT = new CreateTableAsSelectStmt(create_stmt, query, null);
   :}
   // Create partitioned tables with CTAS statement. We need an own production
@@ -992,8 +988,8 @@ create_tbl_as_select_stmt ::=
   location_val:location cache_op_val:cache_op tbl_properties:tbl_props
   KW_AS query_stmt:query
   {:
-    // Initialize with empty List of columns and partition columns. The
-    // columns will be added by the query statement during analysis.
+    // Initialize with empty List of columns. The columns will be added by the query
+    // statement during analysis.
     CreateTableStmt create_stmt = new CreateTableStmt(table,
         new ArrayList<ColumnDef>(), new ArrayList<ColumnDef>(), external,
         comment, row_format, file_format, location, cache_op, if_not_exists, tbl_props,
@@ -1009,12 +1005,10 @@ create_tbl_as_select_stmt ::=
     // Initialize with empty List of columns and partition columns. The
     // columns will be added from the query statement during analysis
     CreateTableStmt create_stmt = new CreateTableStmt(table, new ArrayList<ColumnDef>(),
-      new ArrayList<ColumnDef>(), external, comment, row_format,
-      file_format, location, cache_op, if_not_exists, tbl_props, serde_props,
-      null);
+      new ArrayList<ColumnDef>(), external, comment, row_format, file_format, location,
+      cache_op, if_not_exists, tbl_props, serde_props,null);
     RESULT = new CreateTableAsSelectStmt(create_stmt, query, null);
   :}
-
   ;
 
 // Create unpartitioned tables with and without column definitions.
@@ -1093,18 +1087,18 @@ distribute_hash_param_list ::=
 distribute_hash_param ::=
   KW_HASH LPAREN ident_list:cols RPAREN KW_INTO
     INTEGER_LITERAL:buckets KW_BUCKETS
-  {: RESULT = DistributeParam.createHashParam(DistributeParam.Type.HASH, cols, buckets); :}
+  {: RESULT = DistributeParam.createHashParam(cols, buckets); :}
   | KW_HASH KW_INTO INTEGER_LITERAL:buckets KW_BUCKETS
-  {: RESULT = DistributeParam.createHashParam(DistributeParam.Type.HASH, null, buckets); :}
+  {: RESULT = DistributeParam.createHashParam(null, buckets); :}
   ;
 
 // The column list for a RANGE clause is optional.
 distribute_range_param ::=
   KW_RANGE LPAREN ident_list:cols RPAREN KW_SPLIT KW_ROWS
   LPAREN split_row_list:list RPAREN
-  {: RESULT = DistributeParam.createRangeParam(DistributeParam.Type.RANGE, cols, list); :}
+  {: RESULT = DistributeParam.createRangeParam(cols, list); :}
   | KW_RANGE KW_SPLIT KW_ROWS LPAREN split_row_list:list RPAREN
-  {: RESULT = DistributeParam.createRangeParam(DistributeParam.Type.RANGE, null, list); :}
+  {: RESULT = DistributeParam.createRangeParam(null, list); :}
   ;
 
 split_row_list ::=
@@ -2842,6 +2836,8 @@ ident_or_keyword ::=
   {: RESULT = r.toString(); :}
   | KW_BOOLEAN:r
   {: RESULT = r.toString(); :}
+  | KW_BUCKETS:r
+  {: RESULT = r.toString(); :}
   | KW_BY:r
   {: RESULT = r.toString(); :}
   | KW_CACHED:r
@@ -2886,6 +2882,8 @@ ident_or_keyword ::=
   {: RESULT = r.toString(); :}
   | KW_DECIMAL:r
   {: RESULT = r.toString(); :}
+  | KW_DELETE:r
+  {: RESULT = r.toString(); :}
   | KW_DELIMITED:r
   {: RESULT = r.toString(); :}
   | KW_DESC:r
@@ -2893,6 +2891,8 @@ ident_or_keyword ::=
   | KW_DESCRIBE:r
   {: RESULT = r.toString(); :}
   | KW_DISTINCT:r
+  {: RESULT = r.toString(); :}
+  | KW_DISTRIBUTE:r
   {: RESULT = r.toString(); :}
   | KW_DIV:r
   {: RESULT = r.toString(); :}
@@ -2950,7 +2950,11 @@ ident_or_keyword ::=
   {: RESULT = r.toString(); :}
   | KW_HAVING:r
   {: RESULT = r.toString(); :}
+  | KW_HASH:r
+  {: RESULT = r.toString(); :}
   | KW_IF:r
+  {: RESULT = r.toString(); :}
+  | KW_IGNORE:r
   {: RESULT = r.toString(); :}
   | KW_ILIKE:r
   {: RESULT = r.toString(); :}
@@ -3094,6 +3098,8 @@ ident_or_keyword ::=
   {: RESULT = r.toString(); :}
   | KW_SMALLINT:r
   {: RESULT = r.toString(); :}
+  | KW_SPLIT:r
+  {: RESULT = r.toString(); :}
   | KW_STORED:r
   {: RESULT = r.toString(); :}
   | KW_STRAIGHT_JOIN:r
@@ -3133,6 +3139,8 @@ ident_or_keyword ::=
   | KW_UNCACHED:r
   {: RESULT = r.toString(); :}
   | KW_UNION:r
+  {: RESULT = r.toString(); :}
+  | KW_UPDATE:r
   {: RESULT = r.toString(); :}
   | KW_UPDATE_FN:r
   {: RESULT = r.toString(); :}

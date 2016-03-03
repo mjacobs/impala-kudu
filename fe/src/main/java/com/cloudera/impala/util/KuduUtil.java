@@ -40,6 +40,7 @@ import org.kududb.Type;
 import org.kududb.client.KuduTable;
 import org.kududb.client.PartialRow;
 
+import static com.cloudera.impala.catalog.Type.parseColumnType;
 import static java.lang.String.format;
 
 public class KuduUtil {
@@ -50,22 +51,21 @@ public class KuduUtil {
    * Compare the schema of a HMS table and a Kudu table. Returns true if both tables have
    * a matching schema.
    */
-  public static boolean compareSchema(Table hiveTable, KuduTable kuduTable)
+  public static boolean compareSchema(Table msTable, KuduTable kuduTable)
       throws ImpalaRuntimeException {
-    List<FieldSchema> hiveFields = hiveTable.getSd().getCols();
+    List<FieldSchema> msFields = msTable.getSd().getCols();
     List<ColumnSchema> kuduFields = kuduTable.getSchema().getColumns();
-    if (hiveFields.size() != kuduFields.size()) return false;
+    if (msFields.size() != kuduFields.size()) return false;
 
     HashMap<String, ColumnSchema> kuduFieldMap = Maps.newHashMap();
     for (ColumnSchema kuduField : kuduFields) {
       kuduFieldMap.put(kuduField.getName().toUpperCase(), kuduField);
     }
 
-    for (FieldSchema hiveField : hiveFields) {
-      ColumnSchema kuduField = kuduFieldMap.get(hiveField.getName().toUpperCase());
-      if (kuduField == null || fromImpalaType(
-          com.cloudera.impala.catalog.Type.parseColumnType(hiveField.getType())) !=
-          kuduField.getType()) {
+    for (FieldSchema msField : msFields) {
+      ColumnSchema kuduField = kuduFieldMap.get(msField.getName().toUpperCase());
+      if (kuduField == null
+          || fromImpalaType(parseColumnType(msField.getType())) != kuduField.getType()) {
         return false;
       }
     }
@@ -139,6 +139,9 @@ public class KuduUtil {
     return splitRows.build();
   }
 
+  /**
+   * Sets the value in 'key' at 'pos', given the json representation.
+   */
   private static void setKey(PartialRow key, Type type, JsonArray array, int pos)
       throws ImpalaRuntimeException {
     switch (type) {
@@ -154,6 +157,9 @@ public class KuduUtil {
     }
   }
 
+  /**
+   * Sets the value in 'key' at 'pos', given the range literal.
+   */
   private static void setKey(PartialRow key, Type type, TRangeLiteral literal, int pos,
       String colName) throws ImpalaRuntimeException {
     switch (type) {
@@ -196,7 +202,7 @@ public class KuduUtil {
     if (correctType) return;
     throw new ImpalaRuntimeException(
         format("Expected %s literal for column '%s' got '%s'", t.getName(), colName,
-            ToString(literal)));
+            toString(literal)));
   }
 
   /**
@@ -250,7 +256,7 @@ public class KuduUtil {
   /**
    * Returns the string value of the RANGE literal.
    */
-  static String ToString(TRangeLiteral l) throws ImpalaRuntimeException {
+  static String toString(TRangeLiteral l) throws ImpalaRuntimeException {
     if (l.isSetBool_literal()) return String.valueOf(l.bool_literal);
     if (l.isSetString_literal()) return String.valueOf(l.string_literal);
     if (l.isSetInt_literal()) return String.valueOf(l.int_literal);

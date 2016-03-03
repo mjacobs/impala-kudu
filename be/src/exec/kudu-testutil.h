@@ -182,11 +182,6 @@ class KuduTestHelper {
     DCHECK_GE(num_cols_materialize, 0);
     DCHECK_LE(num_cols_materialize, test_schema_.num_columns());
 
-    desc_builder.DeclareTuple()
-        .AddSlot(TYPE_INT, num_cols_materialize > 0)
-        .AddSlot(TYPE_INT, num_cols_materialize > 1)
-        .AddSlot(TYPE_STRING, num_cols_materialize > 2);
-
     TKuduTable t_kudu_table;
     t_kudu_table.__set_table_name(table_name());
     t_kudu_table.__set_master_addresses(vector<string>(1, "0.0.0.0:7051"));
@@ -207,14 +202,6 @@ class KuduTestHelper {
     TColumnType int_col_type;
     int_col_type.__set_types(vector<TTypeNode>(1, int_type));
 
-    TColumnDescriptor key;
-    key.__set_name("key");
-    key.__set_type(int_col_type);
-
-    TColumnDescriptor int_val;
-    int_val.__set_name("int_val");
-    int_val.__set_type(int_col_type);
-
     TScalarType string_scalar_type;
     string_scalar_type.type = TPrimitiveType::STRING;
 
@@ -225,11 +212,32 @@ class KuduTestHelper {
     TColumnType string_col_type;
     string_col_type.__set_types(vector<TTypeNode>(1, string_type));
 
-    TColumnDescriptor string_val;
-    string_val.__set_name("string_val");
-    string_val.__set_type(string_col_type);
+    vector<TColumnDescriptor> column_descriptors;
 
-    t_tbl_desc.__set_columnDescriptors(boost::assign::list_of(key)(int_val)(string_val));
+    TupleDescBuilder& builder = desc_builder.DeclareTuple();
+    if (num_cols_materialize > 0) {
+      builder << TYPE_INT;
+      TColumnDescriptor key;
+      key.__set_name("key");
+      key.__set_type(int_col_type);
+      column_descriptors.push_back(key);
+    }
+    if (num_cols_materialize > 1) {
+      builder << TYPE_INT;
+      TColumnDescriptor int_val;
+      int_val.__set_name("int_val");
+      int_val.__set_type(int_col_type);
+      column_descriptors.push_back(int_val);
+    }
+    if (num_cols_materialize > 2) {
+      builder << TYPE_STRING;
+      TColumnDescriptor string_val;
+      string_val.__set_name("string_val");
+      string_val.__set_type(string_col_type);
+      column_descriptors.push_back(string_val);
+    }
+
+    t_tbl_desc.__set_columnDescriptors(column_descriptors);
     desc_builder.SetTableDescriptor(t_tbl_desc);
 
     *desc_tbl = desc_builder.Build();

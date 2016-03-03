@@ -389,6 +389,7 @@ public class AnalysisContext {
     Analyzer analyzer = getAnalyzer();
     // Process statements for which column-level privilege requests may be registered.
     if (analysisResult_.isQueryStmt() || analysisResult_.isInsertStmt() ||
+        analysisResult_.isUpdateStmt() || analysisResult_.isDeleteStmt() ||
         analysisResult_.isCreateTableAsSelectStmt() ||
         analysisResult_.isCreateViewStmt() || analysisResult_.isAlterViewStmt()) {
       // Map of table name to a list of privilege requests associated with that table.

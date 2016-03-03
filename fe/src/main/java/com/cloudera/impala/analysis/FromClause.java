@@ -70,8 +70,7 @@ public class FromClause implements ParseNode, Iterable<TableRef> {
       leftTblRef = tblRef;
     }
 
-    // All tableRefs have been analyzed, but at least one table was found missing.
-    // There is no reason to proceed with analysis past this point.
+    // All tableRefs have been analyzed, but at least one table is missing metadata.
     if (!analyzer.getMissingTbls().isEmpty()) {
       throw new AnalysisException("Found missing tables. Aborting analysis.");
     }

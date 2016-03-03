@@ -23,6 +23,7 @@
 #include "gen-cpp/PlanNodes_types.h"
 #include "gen-cpp/Types_types.h"
 #include "gutil/strings/split.h"
+#include "gutil/stl_util.h"
 #include "kudu/client/row_result.h"
 #include "runtime/descriptors.h"
 #include "runtime/row-batch.h"
@@ -62,10 +63,10 @@ class KuduTableSinkTest : public testing::Test {
   }
 
   void BuildRuntimeState(int num_cols_to_insert,
-      TTableSinkType::type sink_type) {
+      TSinkAction::type sink_action) {
     TTableSink table_sink;
     table_sink.__set_target_table_id(0);
-    table_sink.__set_type(sink_type);
+    table_sink.__set_action(sink_action);
 
     // For tests ignore not found keys in delete test. Other paths are exercised via
     // end-to-end tests.
@@ -209,36 +210,39 @@ class KuduTableSinkTest : public testing::Test {
         skip_val == 1 ? expected_num_rows : (expected_num_rows + 1) / skip_val);
   }
 
-  void WriteAndVerify(int num_columns, TTableSinkType::type type, int factor, string val,
+  void WriteAndVerify(int num_columns, TSinkAction::type type, int factor, string val,
       int skip_val) {
     const int kNumRowsPerBatch = 10;
     // For deletes only populate the key column, in other cases populate all columns
     int schema_cols = num_columns;
-    if (type == TTableSinkType::KUDU_DELETE) schema_cols = 1;
+    if (type == TSinkAction::DELETE) schema_cols = 1;
     BuildRuntimeState(schema_cols, type);
     vector<TExpr> exprs;
     CreateTExpr(schema_cols, &exprs);
     KuduTableSink sink(*row_desc_, exprs, data_sink_);
     ASSERT_OK(sink.Prepare(&runtime_state_));
     ASSERT_OK(sink.Open(&runtime_state_));
-    ASSERT_OK(sink.Send(&runtime_state_,
-        CreateRowBatch(0, kNumRowsPerBatch, factor, val, skip_val), false));
-    ASSERT_OK(sink.Send(&runtime_state_,
-        CreateRowBatch(kNumRowsPerBatch, kNumRowsPerBatch, factor, val, skip_val), true));
+    vector<RowBatch*> row_batches;
+    row_batches.push_back(CreateRowBatch(0, kNumRowsPerBatch, factor, val, skip_val));
+    ASSERT_OK(sink.Send(&runtime_state_, row_batches.front(), false));
+    row_batches.push_back(CreateRowBatch(kNumRowsPerBatch, kNumRowsPerBatch, factor, val,
+                                         skip_val));
+    ASSERT_OK(sink.Send(&runtime_state_,row_batches.back(), true));
+    STLDeleteElements(&row_batches);
     sink.Close(&runtime_state_);
     Verify(num_columns, 2 * kNumRowsPerBatch, factor, val, skip_val);
   }
 
   void InsertAndVerify(int num_columns) {
-    WriteAndVerify(num_columns, TTableSinkType::KUDU_INSERT, 2, "hello", 1);
+    WriteAndVerify(num_columns, TSinkAction::INSERT, 2, "hello", 1);
   }
 
   void UpdateAndVerify(int num_columns) {
-    WriteAndVerify(num_columns, TTableSinkType::KUDU_UPDATE, 3, "world", 1);
+    WriteAndVerify(num_columns, TSinkAction::UPDATE, 3, "world", 1);
   }
 
   void DeleteAndVerify(int num_columns, int skip_val) {
-    WriteAndVerify(num_columns, TTableSinkType::KUDU_DELETE, 2, "hello", skip_val);
+    WriteAndVerify(num_columns, TSinkAction::DELETE, 2, "hello", skip_val);
   }
 
   virtual void TearDown() {

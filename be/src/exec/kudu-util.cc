@@ -109,7 +109,7 @@ Status MapLowercaseKuduColumnNamesToIndexes(const kudu::client::KuduSchema& sche
       return Status(strings::Substitute("There was already a column with name: '$0' "
           "in the schema", lower_case_col_name));
     }
-    (*map)[to_lower_copy(schema.Column(i).name())] = i;
+    (*map)[lower_case_col_name] = i;
   }
   return Status::OK();
 }

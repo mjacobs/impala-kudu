@@ -49,7 +49,7 @@ namespace impala {
 
 static const char* BASE_TABLE_NAME = "TestScanNodeTable";
 // The id of the slot that contains the key, in the test schema.
-const int KEY_SLOT_ID = 2;
+const int KEY_SLOT_ID = 1;
 
 class KuduScanNodeTest : public testing::Test {
  public:
@@ -464,44 +464,6 @@ TEST_F(KuduScanNodeTest, TestPushStringLEPredicateOn3rdColumn) {
 
   ScanAndVerify(params, FIRST_ROW, EXPECTED_NUM_ROWS, MAT_COLS, MAT_COLS,
                 NO_LIMIT, VERIFY_ROWS);
-}
-
-TEST_F(KuduScanNodeTest, TestPushTwoPredicatesOnNonMaterializedColumn) {
-  kudu_test_helper_.CreateTable(BASE_TABLE_NAME);
-  const int NUM_ROWS_TO_INSERT = 1000;
-  const int SLOT_ID = 2;
-  const int MAT_COLS = 1;
-
-  const int FIRST_ROW = 251;
-
-  const int EXPECTED_NUM_ROWS = 500;
-
-  // Insert kNumRows rows for this test.
-  kudu_test_helper_.InsertTestRows(kudu_test_helper_.client().get(),
-                                   kudu_test_helper_.table().get(),
-                                   NUM_ROWS_TO_INSERT);
-
-
-  const int64_t PREDICATE_VAL_LOW = 501;
-  const int64_t PREDICATE_VAL_HIGH = 1500;
-
-  // Now test having a pushable predicate on the 2nd column, but materialize only the key
-  // (e.g. select key from test_table where int_val >= 250 and int_val <= 750).
-  TExpr conjunct_low;
-  AddExpressionNodesToExpression(&conjunct_low, SLOT_ID, KuduScanNode::GE_FN,
-      TExprNodeType::INT_LITERAL, &PREDICATE_VAL_LOW);
-
-  TExpr conjunct_high;
-  AddExpressionNodesToExpression(&conjunct_high, SLOT_ID, KuduScanNode::LE_FN,
-      TExprNodeType::INT_LITERAL, &PREDICATE_VAL_HIGH);
-
-  pushable_conjuncts_.push_back(conjunct_low);
-  pushable_conjuncts_.push_back(conjunct_high);
-
-  vector<TScanRangeParams> params;
-  AddScanRange(-1, -1, &params);
-
-  ScanAndVerify(params, FIRST_ROW, EXPECTED_NUM_ROWS, MAT_COLS);
 }
 
 // Test for a bug where we would mishandle getting an empty string from

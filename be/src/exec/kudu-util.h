@@ -39,7 +39,7 @@ typedef boost::unordered_map<std::string, int> IdxByLowerCaseColName;
 /// Returns an error Status if 'schema' had more than one column with the same lower
 /// case name.
 Status MapLowercaseKuduColumnNamesToIndexes(const kudu::client::KuduSchema& schema,
-       IdxByLowerCaseColName* map);
+    IdxByLowerCaseColName* map);
 
 /// Gets the projected columns from the TupleDescriptor.
 /// Translates Impala's lower case column names to the version used by Kudu.

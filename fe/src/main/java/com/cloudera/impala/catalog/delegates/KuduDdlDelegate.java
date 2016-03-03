@@ -122,11 +122,11 @@ public class KuduDdlDelegate extends DdlDelegate {
       // Handle auto-partitioning of the Kudu table
       if (distributeParams_ != null) {
         for (TDistributeParam dP : distributeParams_) {
-          if (dP.getType() == TDistributeType.HASH) {
+          if (dP.isSetBy_hash_param()) {
             cto.addHashPartitions(dP.getBy_hash_param().getColumns(),
-                dP.getBy_hash_param().getBuckets());
+                dP.getBy_hash_param().getNum_buckets());
           } else {
-            Preconditions.checkState(dP.getType() == TDistributeType.RANGE);
+            Preconditions.checkState(dP.isSetBy_range_param());
             cto.setRangePartitionColumns(dP.getBy_range_param().getColumns());
             for (PartialRow p : KuduUtil.parseSplits(schema, dP.getBy_range_param())) {
               cto.addSplitRow(p);

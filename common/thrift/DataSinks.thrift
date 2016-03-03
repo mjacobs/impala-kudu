@@ -25,12 +25,16 @@ enum TDataSinkType {
   TABLE_SINK
 }
 
+enum TSinkAction {
+  INSERT,
+  UPDATE,
+  DELETE
+}
+
 enum TTableSinkType {
   HDFS,
-  HBASE
-  KUDU_INSERT
-  KUDU_UPDATE
-  KUDU_DELETE
+  HBASE,
+  KUDU
 }
 
 // Sink which forwards data to a remote plan fragment,
@@ -68,8 +72,9 @@ struct TKuduTableSink {
 struct TTableSink {
   1: required Types.TTableId  target_table_id
   2: required TTableSinkType type
-  3: optional THdfsTableSink  hdfs_table_sink
-  4: optional TKuduTableSink kudu_table_sink
+  3: required TSinkAction action
+  4: optional THdfsTableSink  hdfs_table_sink
+  5: optional TKuduTableSink kudu_table_sink
 }
 
 struct TDataSink {

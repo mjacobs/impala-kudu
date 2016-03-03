@@ -95,8 +95,8 @@ class KuduTableSink : public DataSink {
   /// Allocated from runtime state's pool.
   RuntimeProfile* runtime_profile_;
 
-  /// Used to specialize the sink type for different write operations.
-  TTableSinkType::type sink_type_;
+  /// Used to specify the type of write operation (INSERT/UPDATE/DELETE).
+  TSinkAction::type sink_action_;
 
   /// Captures parameters passed down from the frontend
   TKuduTableSink kudu_table_sink_;

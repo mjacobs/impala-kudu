@@ -56,7 +56,7 @@ import org.kududb.client.LocatedTablet;
 public class KuduTable extends Table {
   private static final Logger LOG = Logger.getLogger(Table.class);
 
-  // Alias to the string key that identifies the storage handler for tables.
+  // Alias to the string key that identifies the storage handler for Kudu tables.
   public static final String KEY_STORAGE_HANDLER =
       hive_metastoreConstants.META_TABLE_STORAGE;
 
@@ -72,7 +72,8 @@ public class KuduTable extends Table {
   // TODO we should have something like KuduConfig.getDefaultConfig()
   public static final String KEY_MASTER_ADDRESSES = "kudu.master_addresses";
 
-  // Kudu specific value for the storage handler table property keyed by KEY_STORAGE_HANDLER.
+  // Kudu specific value for the storage handler table property keyed by
+  // KEY_STORAGE_HANDLER.
   public static final String KUDU_STORAGE_HANDLER =
       "com.cloudera.kudu.hive.KuduStorageHandler";
 
@@ -130,9 +131,7 @@ public class KuduTable extends Table {
   public ArrayList<Column> getColumnsInHiveOrder() { return getColumns(); }
 
   public static boolean isKuduTable(org.apache.hadoop.hive.metastore.api.Table mstbl) {
-    return TableType.valueOf(mstbl.getTableType()) != TableType.VIRTUAL_VIEW
-        && TableType.valueOf(mstbl.getTableType()) != TableType.INDEX_TABLE
-        && KUDU_STORAGE_HANDLER.equals(mstbl.getParameters().get(KEY_STORAGE_HANDLER));
+    return KUDU_STORAGE_HANDLER.equals(mstbl.getParameters().get(KEY_STORAGE_HANDLER));
   }
 
   /**
@@ -142,9 +141,9 @@ public class KuduTable extends Table {
       Set<String> keyColumns) throws TableLoadingException {
 
     if (keyColumns.size() == 0 || keyColumns.size() > schema.size()) {
-      throw new TableLoadingException(String.format("Kudu tables must have at least one key "
-          + "column (had %d), and no more key columns than there are table columns (had %d).",
-          keyColumns.size(), schema.size()));
+      throw new TableLoadingException(String.format("Kudu tables must have at least one"
+          + "key column (had %d), and no more key columns than there are table columns "
+          + "(had %d).", keyColumns.size(), schema.size()));
     }
 
     Set<String> columnNames = Sets.newHashSet();
@@ -160,7 +159,7 @@ public class KuduTable extends Table {
       ++pos;
     }
 
-    if (Sets.intersection(columnNames, keyColumns).size() < keyColumns.size()) {
+    if (!columnNames.containsAll(keyColumns)) {
       throw new TableLoadingException(String.format("Some key columns were not found in"
               + " the set of columns. List of column names: %s, List of key column names:"
               + " %s", Iterables.toString(columnNames), Iterables.toString(keyColumns)));
@@ -183,8 +182,8 @@ public class KuduTable extends Table {
     kuduTableName_ = msTbl.getParameters().get(KEY_TABLE_NAME);
     kuduMasters_ = msTbl.getParameters().get(KEY_MASTER_ADDRESSES);
 
-    String keyColumnsProp = Preconditions.checkNotNull(msTbl.getParameters().get(KEY_KEY_COLUMNS)
-        .toLowerCase(), "'kudu.key_columns' cannot be null.");
+    String keyColumnsProp = Preconditions.checkNotNull(msTbl.getParameters()
+        .get(KEY_KEY_COLUMNS).toLowerCase(), "'kudu.key_columns' cannot be null.");
     Set<String> keyColumns = KuduUtil.parseKeyColumns(keyColumnsProp);
 
     // Load the rest of the data from the table parameters directly
@@ -220,6 +219,7 @@ public class KuduTable extends Table {
   /**
    * Returns true if all required parameters are present in the given table properties
    * map.
+   * TODO Return a more specific error string.
    */
   public static boolean tableParamsAreValid(Map<String, String> params) {
     return params.get(KEY_TABLE_NAME) != null && params.get(KEY_TABLE_NAME).length() > 0

@@ -1133,7 +1133,7 @@ public class CatalogOpExecutor {
     TCatalogObject removedObject = new TCatalogObject();
     synchronized (metastoreDdlLock_) {
 
-      // Forward the DDL oeration to the specified storage backend.
+      // Forward the DDL operation to the specified storage backend.
       try {
         org.apache.hadoop.hive.metastore.api.Table msTbl = getExistingTable(
             tableName.getDb(), tableName.getTbl()).getMetaStoreTable();
@@ -1458,7 +1458,7 @@ public class CatalogOpExecutor {
         msClient.release();
       }
 
-      // Forward the opeation to a specific storage backend. If the operation fails,
+      // Forward the operation to a specific storage backend. If the operation fails,
       // delete the just created hive table to avoid inconsistencies.
       try {
         createDdlDelegate(newTable).setDistributeParams(distribute_by).createTable();

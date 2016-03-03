@@ -122,7 +122,7 @@ public class Planner {
       resultExprs = queryStmt.getResultExprs();
     }
     rootFragment.setOutputExprs(resultExprs);
-    
+
     LOG.debug("desctbl: " + ctx_.getRootAnalyzer().getDescTbl().debugString());
     LOG.debug("resultexprs: " + Expr.debugString(rootFragment.getOutputExprs()));
     LOG.debug("finalize plan fragments");

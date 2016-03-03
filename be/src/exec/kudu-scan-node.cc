@@ -252,6 +252,7 @@ void KuduScanNode::GetSlotRefColumnName(const TExprNode& node, string* col_name)
       return;
     }
   }
+
   DCHECK(false) << "Could not find a slot with slot id: " << slot_id;
 }
 

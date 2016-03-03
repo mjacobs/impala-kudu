@@ -19,6 +19,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
+import com.cloudera.impala.planner.TableSink;
+import com.google.common.collect.ImmutableList;
 import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -662,10 +664,15 @@ public class InsertStmt extends StatementBase {
   public Boolean isRepartition() { return isRepartition_; }
   public ArrayList<Expr> getResultExprs() { return resultExprs_; }
 
+  /**
+   * TODO Consider renaming this to create() and moving the createDataSink()
+   * logic from DataSink to TableSink.
+   */
   public DataSink createDataSink() {
     // analyze() must have been called before.
     Preconditions.checkState(table_ != null);
-    return DataSink.createDataSink(table_, partitionKeyExprs_, overwrite_,  ignoreDuplicates_);
+    return TableSink.create(table_, TableSink.Op.INSERT, partitionKeyExprs_,
+        ImmutableList.<Integer>of(), overwrite_, ignoreDuplicates_);
   }
 
   /**

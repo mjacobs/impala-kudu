@@ -113,18 +113,22 @@ class KuduScanNode : public ScanNode {
   // threads and consumed by the main thread.
   boost::scoped_ptr<RowBatchQueue> materialized_row_batches_;
 
-  /// Protects access to state accessed by scanner threads, such as 'status_' or 'done_'.
+  /// Protects access to state accessed by scanner threads, such as 'status_' or
+  /// 'num_active_scanners_'.
   boost::mutex lock_;
 
   /// The current status of the scan, set to non-OK if any problems occur, e.g. if an error
   /// occurs in a scanner.
+  /// Protected by lock_
   Status status_;
 
   /// Number of active running scanner threads.
+  /// Protected by lock_
   int num_active_scanners_;
 
   /// Set to true when the scan is complete (either because all ranges were scanned, the limit
   /// was reached or some error occurred).
+  /// Protected by lock_
   volatile bool done_;
 
   /// Maximum size of materialized_row_batches_.

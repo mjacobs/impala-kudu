@@ -61,9 +61,7 @@ Status DataSink::CreateDataSink(ObjectPool* pool,
           tmp_sink = new HBaseTableSink(row_desc, output_exprs, thrift_sink);
           sink->reset(tmp_sink);
           break;
-        case TTableSinkType::KUDU_INSERT:
-        case TTableSinkType::KUDU_UPDATE:
-        case TTableSinkType::KUDU_DELETE:
+        case TTableSinkType::KUDU:
           tmp_sink = new KuduTableSink(row_desc, output_exprs, thrift_sink);
           sink->reset(tmp_sink);
           break;

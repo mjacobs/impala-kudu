@@ -65,6 +65,7 @@ public class KuduScanNode extends ScanNode {
 
   private final KuduTable kuduTable_;
 
+  // Indexes for the set of hosts that will be used for the query.
   private final Set<Integer> hostIndexSet_ = Sets.newHashSet();
 
   // List of conjuncts that can be pushed down to Kudu
@@ -81,9 +82,9 @@ public class KuduScanNode extends ScanNode {
     assignConjuncts(analyzer);
     analyzer.createEquivConjuncts(tupleIds_.get(0), conjuncts_);
 
-    // Extract predicates that can evaluated by Kudu.
+    // Extract predicates that can be evaluated by Kudu.
     try {
-      kuduConjuncts_.addAll(extractKuduConjuncts(conjuncts_, analyzer));
+      kuduConjuncts_.addAll(extractKuduConjuncts(analyzer));
       // Mark these slots as materialized, otherwise the toThrift() of SlotRefs
       // referencing them will fail. These slots will never be filled with data though as
       // Kudu won't return these columns.
@@ -149,6 +150,9 @@ public class KuduScanNode extends ScanNode {
     }
   }
 
+  /**
+   * TODO IMPALA-3148 - Update selectivity computation.
+   */
   @Override
   protected double computeSelectivity() {
     double baseSelectivity = super.computeSelectivity();
@@ -171,7 +175,7 @@ public class KuduScanNode extends ScanNode {
     // Update the cardinality
     inputCardinality_ = cardinality_ = kuduTable_.getNumRows();
     cardinality_ *= computeSelectivity();
-    cardinality_ = Math.max(1, cardinality_);
+    cardinality_ = Math.max(Math.max(1, cardinality_), kuduTable_.getNumRows());
     cardinality_ = capAtLimit(cardinality_);
     LOG.debug("computeStats KuduScan: cardinality=" + Long.toString(cardinality_));
   }
@@ -215,31 +219,28 @@ public class KuduScanNode extends ScanNode {
   }
 
   /**
-   * Extracts predicates that can be pushed down to Kudu. Currently only binary predicates
-   * (<=, >=, ==) that have a constant expression on one side and a slot ref on the other
-   * can be evaluated by Kudu. Only looks at comparisons of constants (i.e., the bounds
-   * of the result can be evaluated with Expr::GetValue(NULL)).
+   * Extracts predicates from conjuncts_ that can be pushed down to Kudu. Currently only
+   * binary predicates (<=, >=, ==) that have a constant expression on one side and a slot
+   * ref on the other can be evaluated by Kudu. Only looks at comparisons of constants
+   * (i.e., the bounds of the result can be evaluated with Expr::GetValue(NULL)).
    */
-  private static List<Expr> extractKuduConjuncts(List<Expr> conjuncts, Analyzer analyzer)
+  private List<Expr> extractKuduConjuncts(Analyzer analyzer)
       throws InternalException, AnalysisException {
     ImmutableList.Builder<Expr> pushableConjunctsBuilder = ImmutableList.builder();
-    ListIterator<Expr> i = conjuncts.listIterator();
+    ListIterator<Expr> i = conjuncts_.listIterator();
     while (i.hasNext()) {
       Expr e = i.next();
       if (!(e instanceof BinaryPredicate)) continue;
       BinaryPredicate comparisonPred = (BinaryPredicate) e;
-      comparisonPred = BinaryPredicate.normalizeAndFoldConstants(comparisonPred,
-          analyzer);
-
-      // Make sure the expression on the left is a bare SlotRef.
       // TODO KUDU-931 look into handling implicit/explicit casts on the SlotRef.
-      Expr leftExpr = comparisonPred.getChild(0);
-      if (!(leftExpr instanceof SlotRef)) continue;
+      comparisonPred = BinaryPredicate.normalizeSlotRefComparison(comparisonPred,
+          analyzer);
+      if (comparisonPred == null) return null;
 
       // Needs to have a literal on the right.
       if (!comparisonPred.getChild(1).isLiteral()) continue;
 
-      comparisonPred = transformExclusiveIntLiteralPredicatesToInclusive(comparisonPred,
+      comparisonPred = normalizeIntLiteralComparison(comparisonPred,
           analyzer);
 
       Operator op = comparisonPred.getOp();
@@ -270,12 +271,14 @@ public class KuduScanNode extends ScanNode {
    * a new, analyzed predicate if it was.
    * TODO Remove this when KUDU-1148 (inclusive predicate support in Kudu) gets done
    */
-  private static BinaryPredicate transformExclusiveIntLiteralPredicatesToInclusive(
+  private static BinaryPredicate normalizeIntLiteralComparison(
       BinaryPredicate comparisonPred, Analyzer analyzer) {
     Expr constantExpr = comparisonPred.getChild(1);
     if (!(constantExpr instanceof NumericLiteral)) return comparisonPred;
     NumericLiteral numLiteral = (NumericLiteral) constantExpr;
     long intValue = numLiteral.getLongValue();
+    // TODO consider replacing the predicate with 'false' when the number overflows or
+    // underflows the specified column type.
     if (comparisonPred.getOp() == Operator.GT) {
       // Make sure we don't overflow the type, in which case the type would change and
       // the slot would get an implicit cast meaning we wouldn't push it anyway.

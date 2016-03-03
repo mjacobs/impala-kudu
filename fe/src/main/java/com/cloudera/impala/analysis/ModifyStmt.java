@@ -73,7 +73,7 @@ public abstract class ModifyStmt extends StatementBase {
 
   // Result of the analysis of the internal SelectStmt that produces the rows that
   // will be modified.
-  private SelectStmt sourceStmt_;
+  protected SelectStmt sourceStmt_;
 
   // Target Kudu table. Since currently only Kudu tables are supported, we use a
   // concrete table class. Result of analysis.
@@ -83,6 +83,9 @@ public abstract class ModifyStmt extends StatementBase {
   // target table. The i'th position in this list maps to the referencedColumns_[i]'th
   // position in the target table. Set in createSourceStmt() during analysis.
   protected ArrayList<Integer> referencedColumns_;
+
+  // END: Members that need to be reset()
+  /////////////////////////////////////////
 
   // On tables with a primary key, ignore key not found errors.
   protected final boolean ignoreNotFound_;
@@ -150,7 +153,21 @@ public abstract class ModifyStmt extends StatementBase {
         .allOf(Privilege.INSERT).toRequest());
 
     // Validates the assignments_ and creates the sourceStmt_.
-    createSourceStmt(analyzer);
+    if (sourceStmt_ == null) {
+      createSourceStmt(analyzer);
+    }
+    sourceStmt_.analyze(analyzer);
+  }
+
+  @Override
+  public void reset() {
+    super.reset();
+    fromClause_.reset();
+    if (sourceStmt_ != null) {
+      sourceStmt_.reset();
+    }
+    table_ = null;
+    referencedColumns_.clear();
   }
 
   /**
@@ -158,6 +175,9 @@ public abstract class ModifyStmt extends StatementBase {
    * first the SlotRefs for the key Columns, followed by the expressions representing the
    * assignments. This method sets the member variables for the sourceStmt_ and the
    * referencedColumns_.
+   *
+   * This is only run once, on the first analysis. Following analysis will reset() and
+   * reuse previously created statements.
    */
   private void createSourceStmt(Analyzer analyzer)
       throws AnalysisException {
@@ -167,33 +187,16 @@ public abstract class ModifyStmt extends StatementBase {
     buildAndValidateAssignmentExprs(analyzer, selectList, referencedColumns_);
 
     // Analyze the generated select statement.
-    SelectStmt srcStmt =
-        new SelectStmt(new SelectList(selectList), fromClause_, wherePredicate_,
-            null, null, null, null);
-    srcStmt.analyze(analyzer);
-
-    if (analyzer.containsSubquery()) {
-      StmtRewriter.rewriteQueryStatement(srcStmt, analyzer);
-      srcStmt = (SelectStmt) srcStmt.clone();
-
-      // After the clone, the state of all table refs is reset. Use a child analyzer
-      // to avoid clashing with registered table refs in 'analyzer'
-      // TODO(Kudu) After merge, clean this up by implementing proper reset() / clone()
-      srcStmt.analyze(new Analyzer(analyzer));
-
-      // Force no additional rewrite
-      // TODO(Kudu) Remove method after merge as rewrite is handled with reset() / clone()
-      analyzer.resetSubquery();
-    }
+    sourceStmt_ = new SelectStmt(new SelectList(selectList), fromClause_, wherePredicate_,
+        null, null, null, null);
 
     // cast result expressions to the correct type of the referenced slot of the
     // target table
     int keyColumnsOffset = table_.getKuduKeyColumnNames().size();
-    for(int i = keyColumnsOffset; i < srcStmt.resultExprs_.size(); ++i) {
-      srcStmt.resultExprs_.set(i, srcStmt.resultExprs_.get(i).castTo(
+    for (int i = keyColumnsOffset; i < sourceStmt_.resultExprs_.size(); ++i) {
+      sourceStmt_.resultExprs_.set(i, sourceStmt_.resultExprs_.get(i).castTo(
           assignments_.get(i - keyColumnsOffset).first.getType()));
     }
-    sourceStmt_ = srcStmt;
   }
 
   /**
@@ -237,21 +240,17 @@ public abstract class ModifyStmt extends StatementBase {
     // Assignments are only used in the context of updates.
     for (Pair<SlotRef, Expr> valueAssignment : assignments_) {
       Expr rhsExpr = valueAssignment.second;
-      SlotRef lhsSlotRef = valueAssignment.first;
-
       rhsExpr.analyze(analyzer);
+
+      SlotRef lhsSlotRef = valueAssignment.first;
       lhsSlotRef.analyze(analyzer);
 
       // Correct target table
       if (!lhsSlotRef.isBoundByTupleIds(targetTableRef_.getId().asList())) {
         throw new AnalysisException(
-            format(
-                "Left-hand side column '%s' in assignment expression '%s=%s' does not " +
-                    "belong to target table '%s'",
-                lhsSlotRef.toSql(),
-                lhsSlotRef.toSql(),
-                rhsExpr.toSql(),
-                targetTableRef_.getDesc().getTable().getFullName()));
+            format("Left-hand side column '%s' in assignment expression '%s=%s' does not " +
+                "belong to target table '%s'", lhsSlotRef.toSql(), lhsSlotRef.toSql(),
+                rhsExpr.toSql(), targetTableRef_.getDesc().getTable().getFullName()));
       }
 
       // No subqueries for rhs expression
@@ -266,7 +265,7 @@ public abstract class ModifyStmt extends StatementBase {
       if (c == null) {
         throw new AnalysisException(
             format("Left-hand side in assignment expression '%s=%s' must be a column " +
-                    "reference", lhsSlotRef.toSql(), rhsExpr.toSql()));
+                "reference", lhsSlotRef.toSql(), rhsExpr.toSql()));
       }
 
       if (keySlots.contains(lhsSlotRef.getSlotId())) {
@@ -276,17 +275,14 @@ public abstract class ModifyStmt extends StatementBase {
 
       if (uniqueSlots.contains(lhsSlotRef.getSlotId())) {
         throw new AnalysisException(
-            format("Duplicate value assignment to column: '%s'",
-                lhsSlotRef.toSql()));
+            format("Duplicate value assignment to column: '%s'", lhsSlotRef.toSql()));
       }
 
       // Check type of the expression
-      if (!Type.isImplicitlyCastable(rhsExpr.getType(), c.getType(), true)) {
+      if (!Type.isImplicitlyCastable(rhsExpr.getType(), c.getType(), false)) {
         throw new AnalysisException(format(
-            "Column '%s' of type %s is not compatible with the expression %s of type " +
-                "%s",
-            c.getName(), c.getType().toSql(), rhsExpr.toSql(),
-            rhsExpr.getType().toSql()));
+            "Column '%s' of type %s is not compatible with the expression %s of type %s",
+            c.getName(), c.getType().toSql(), rhsExpr.toSql(), rhsExpr.getType().toSql()));
       }
 
       uniqueSlots.add(lhsSlotRef.getSlotId());
@@ -296,9 +292,7 @@ public abstract class ModifyStmt extends StatementBase {
   }
 
   public QueryStmt getQueryStmt() { return sourceStmt_; }
-
   public abstract DataSink createDataSink();
-
   public abstract String toSql();
 
 
