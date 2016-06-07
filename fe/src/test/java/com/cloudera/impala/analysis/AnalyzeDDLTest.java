@@ -1667,7 +1667,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
   public void TestCreateKuduTable() {
     TestUtils.assumeKuduIsSupported();
     // Create Kudu Table with all required properties
-    AnalyzesOk("create table tab (x int) tblproperties (" +
+    AnalyzesOk("create table tab (x int) " +
+        "distribute by hash into 2 buckets tblproperties (" +
         "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler', " +
         "'kudu.table_name'='tab'," +
         "'kudu.master_addresses' = '127.0.0.1:8080, 127.0.0.1:8081', " +
@@ -1675,7 +1676,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         ")");
 
     // Check that all properties are present
-    AnalysisError("create table tab (x int) tblproperties (" +
+    AnalysisError("create table tab (x int) " +
+        "distribute by hash into 2 buckets tblproperties (" +
         "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler', " +
         "'kudu.master_addresses' = '127.0.0.1:8080', " +
         "'kudu.key_columns' = 'a,b,c'" +
@@ -1684,7 +1686,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "if kudu.table_name, kudu.master_addresses, and kudu.key_columns are " +
         "present and have valid values.");
 
-    AnalysisError("create table tab (x int) tblproperties (" +
+    AnalysisError("create table tab (x int) " +
+            "distribute by hash into 2 buckets tblproperties (" +
             "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler', " +
             "'kudu.table_name'='tab'," +
             "'kudu.key_columns' = 'a,b,c'"
@@ -1693,7 +1696,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
             "if kudu.table_name, kudu.master_addresses, and kudu.key_columns are " +
             "present and have valid values.");
 
-    AnalysisError("create table tab (x int) tblproperties (" +
+    AnalysisError("create table tab (x int) " +
+        "distribute by hash into 2 buckets tblproperties (" +
         "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler', " +
         "'kudu.table_name'='tab'," +
         "'kudu.master_addresses' = '127.0.0.1:8080'" +
@@ -1703,7 +1707,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "present and have valid values.");
 
     // Check that properties are not empty
-    AnalysisError("create table tab (x int) tblproperties (" +
+    AnalysisError("create table tab (x int) " +
+            "distribute by hash into 2 buckets tblproperties (" +
             "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler', " +
             "'kudu.table_name'=''," +
             "'kudu.master_addresses' = '127.0.0.1:8080', " +
@@ -1713,7 +1718,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
             "if kudu.table_name, kudu.master_addresses, and kudu.key_columns are " +
             "present and have valid values.");
 
-    AnalysisError("create table tab (x int) tblproperties (" +
+    AnalysisError("create table tab (x int) " +
+            "distribute by hash into 2 buckets tblproperties (" +
             "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler', " +
             "'kudu.table_name'='asd'," +
             "'kudu.master_addresses' = '', " +
@@ -1724,7 +1730,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
             "present and have valid values.");
 
     // Don't allow caching
-    AnalysisError("create table tab (x int) cached in 'testPool' tblproperties (" +
+    AnalysisError("create table tab (x int) cached in 'testPool' " +
+        "distribute by hash into 2 buckets tblproperties (" +
         "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler', " +
         "'kudu.table_name'='tab'," +
         "'kudu.master_addresses' = '127.0.0.1:8080', " +
@@ -1742,7 +1749,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         ")");
 
     AnalyzesOk("create table tab (a int, b int, c int, d int) " +
-        " distribute by hash into 8 buckets " +
+        "distribute by hash into 8 buckets " +
         "tblproperties (" +
         "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler', " +
         "'kudu.table_name'='tab'," +
@@ -1750,9 +1757,26 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "'kudu.key_columns' = 'a,b,c'" +
         ")");
 
+    // DISTRIBUTE BY is required for managed tables.
+    AnalysisError("create table tab (a int) tblproperties (" +
+        "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler', " +
+        "'kudu.table_name'='tab'," +
+        "'kudu.master_addresses' = '127.0.0.1:8080', " +
+        "'kudu.key_columns' = 'a'" +
+        ")",
+        "A data distribution must be specified using a DISTRIBUTE BY clause.");
+
+    // DISTRIBUTE BY is not required for external tables.
+    AnalyzesOk("create external table tab (a int) tblproperties (" +
+        "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler', " +
+        "'kudu.table_name'='tab'," +
+        "'kudu.master_addresses' = '127.0.0.1:8080', " +
+        "'kudu.key_columns' = 'a'" +
+        ")");
+
     // Number of buckets must be larger 1
     AnalysisError("create table tab (a int, b int, c int, d int) " +
-        " distribute by hash(a,b) into 8 buckets, hash(c) into 1 buckets " +
+        "distribute by hash(a,b) into 8 buckets, hash(c) into 1 buckets " +
         "tblproperties (" +
         "'storage_handler'='com.cloudera.kudu.hive.KuduStorageHandler', " +
         "'kudu.table_name'='tab'," +

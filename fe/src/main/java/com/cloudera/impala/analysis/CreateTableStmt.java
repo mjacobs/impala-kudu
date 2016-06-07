@@ -380,6 +380,9 @@ public class CreateTableStmt extends StatementBase {
         if (d.getColumns() == null) d.setColumns(keyColumns);
         d.analyze(analyzer);
       }
+    } else if (!isExternal_) {
+      throw new AnalysisException(
+          "A data distribution must be specified using a DISTRIBUTE BY clause.");
     }
   }
 
